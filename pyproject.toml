@@ -1,0 +1,26 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "gpu4dft"
+version = "0.0.1"
+description = "GPU-first density functional theory"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest", "pyscf"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+cmake.build-type = "Release"
+wheel.packages = ["python/gpu4dft"]
+
+[tool.scikit-build.cmake.define]
+GPU4DFT_BUILD_TESTS = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
