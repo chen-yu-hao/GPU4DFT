@@ -4,14 +4,17 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "gpu4dft"
-version = "0.0.1"
-description = "GPU-first density functional theory"
+version = "0.1.0"
+description = "GPU-native quantum chemistry and density functional theory"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-test = ["pytest", "pyscf"]
+pyscf = ["pyscf>=2.4"]
+ase = ["ase>=3.22"]
+test = ["pytest>=7.0", "pyscf>=2.4"]
+bench = ["pyscf>=2.4", "scipy"]
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"

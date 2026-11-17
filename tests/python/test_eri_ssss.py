@@ -74,9 +74,16 @@ def test_permutational_symmetry(system):
 
 
 def test_shells_beyond_s_not_implemented():
+    # 2p shells on O/sto-3g are now implemented up to g (l <= 4) and match PySCF;
+    # angular momentum beyond g (l = 5, h-shell) raises NotImplementedError.
     mol = gto.M(atom="O 0 0 0", basis="sto-3g", verbose=0)  # has a 2p shell
+    ref = mol.intor("int2e", aosym="s1")
+    eri = gpu4dft.eri_tensor(gpu4dft.basis_from_pyscf(mol))
+    np.testing.assert_allclose(eri, ref, rtol=0, atol=1e-13 * np.abs(ref).max())
+
+    h_basis = gpu4dft.Basis([gpu4dft.Shell(5, [0.0, 0.0, 0.0], [1.0], [1.0])])
     with pytest.raises(NotImplementedError):
-        gpu4dft.eri_tensor(gpu4dft.basis_from_pyscf(mol))
+        gpu4dft.eri_tensor(h_basis)
 
 
 def test_unknown_backend_name():

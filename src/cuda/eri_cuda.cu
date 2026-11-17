@@ -16,8 +16,6 @@ void check(cudaError_t status, const char* what) {
   }
 }
 
-// Owning device buffer. Placeholder for the pooled allocator the SCF driver
-// will need; per-call cudaMalloc is fine for validation-sized problems.
 template <typename T>
 class DeviceArray {
  public:
@@ -60,11 +58,44 @@ class DeviceShellPairs {
         Px_(pairs.Px),
         Py_(pairs.Py),
         Pz_(pairs.Pz),
-        prefactor_(pairs.prefactor) {}
+        prefactor_(pairs.prefactor),
+        Ax_(pairs.Ax),
+        Ay_(pairs.Ay),
+        Az_(pairs.Az),
+        Bx_(pairs.Bx),
+        By_(pairs.By),
+        Bz_(pairs.Bz),
+        alpha_a_(pairs.alpha_a),
+        alpha_b_(pairs.alpha_b),
+        schwarz_bound_(pairs.schwarz_bound),
+        ish_(pairs.ish),
+        jsh_(pairs.jsh),
+        ao_i_(pairs.ao_i),
+        ao_j_(pairs.ao_j) {}
 
   ShellPairView view() const {
-    return ShellPairView{npair_,       prim_offset_.data(), exponent_.data(),  Px_.data(),
-                         Py_.data(),   Pz_.data(),          prefactor_.data()};
+    return ShellPairView{
+        npair_,
+        prim_offset_.data(),
+        exponent_.data(),
+        Px_.data(),
+        Py_.data(),
+        Pz_.data(),
+        prefactor_.data(),
+        Ax_.data(),
+        Ay_.data(),
+        Az_.data(),
+        Bx_.data(),
+        By_.data(),
+        Bz_.data(),
+        alpha_a_.data(),
+        alpha_b_.data(),
+        schwarz_bound_.data(),
+        ish_.data(),
+        jsh_.data(),
+        ao_i_.data(),
+        ao_j_.data(),
+    };
   }
 
  private:
@@ -75,6 +106,19 @@ class DeviceShellPairs {
   DeviceArray<double> Py_;
   DeviceArray<double> Pz_;
   DeviceArray<double> prefactor_;
+  DeviceArray<double> Ax_;
+  DeviceArray<double> Ay_;
+  DeviceArray<double> Az_;
+  DeviceArray<double> Bx_;
+  DeviceArray<double> By_;
+  DeviceArray<double> Bz_;
+  DeviceArray<double> alpha_a_;
+  DeviceArray<double> alpha_b_;
+  DeviceArray<double> schwarz_bound_;
+  DeviceArray<int> ish_;
+  DeviceArray<int> jsh_;
+  DeviceArray<int> ao_i_;
+  DeviceArray<int> ao_j_;
 };
 
 }  // namespace
@@ -96,6 +140,18 @@ void run_eri_kernel_cuda(EriLaunchFn launch, const ShellPairData& bra, const She
   launch(device_bra.view(), device_ket.view(), device_out.data(), nullptr);
   check(cudaGetLastError(), "ERI kernel launch");
   check(cudaDeviceSynchronize(), "ERI kernel execution");
+  device_out.download(out);
+}
+
+void run_eri_general_cuda(GeneralEriLaunchFn launch, int la, int lb, int lc, int ld,
+                          const ShellPairData& bra, const ShellPairData& ket,
+                          std::vector<double>& out) {
+  const DeviceShellPairs device_bra(bra);
+  const DeviceShellPairs device_ket(ket);
+  DeviceArray<double> device_out(out.size());
+  launch(la, lb, lc, ld, device_bra.view(), device_ket.view(), device_out.data(), nullptr);
+  check(cudaGetLastError(), "ERI general kernel launch");
+  check(cudaDeviceSynchronize(), "ERI general kernel execution");
   device_out.download(out);
 }
 

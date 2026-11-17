@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(gpu4dft VERSION 0.0.1 LANGUAGES CXX)
+project(gpu4dft VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,10 +11,11 @@ endif()
 
 option(GPU4DFT_ENABLE_CUDA "Build the CUDA backend when a CUDA compiler is found" ON)
 option(GPU4DFT_REQUIRE_CUDA "Fail the configuration if the CUDA backend cannot be built" OFF)
+option(GPU4DFT_ENABLE_HIP "Build the ROCm HIP backend when hipcc is found" OFF)
 option(GPU4DFT_BUILD_PYTHON "Build the Python extension module" ON)
 option(GPU4DFT_BUILD_TESTS "Build and register tests" ON)
 
-# The interpreter runs the kernel generator; the development module is only
+# The interpreter runs the kernel generators; the development module is only
 # needed for the Python extension.
 if(GPU4DFT_BUILD_PYTHON)
   find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
@@ -24,7 +25,7 @@ endif()
 find_package(OpenMP COMPONENTS CXX)
 
 # ---------------------------------------------------------------------------
-# CUDA backend
+# CUDA & Optional ROCm HIP backends
 # ---------------------------------------------------------------------------
 set(GPU4DFT_HAVE_CUDA OFF)
 if(GPU4DFT_ENABLE_CUDA)
@@ -32,7 +33,7 @@ if(GPU4DFT_ENABLE_CUDA)
   check_language(CUDA)
   if(CMAKE_CUDA_COMPILER)
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-      # A100 and H100. Override with -DCMAKE_CUDA_ARCHITECTURES=native etc.
+      # A100 and H100 by default. Override with -DCMAKE_CUDA_ARCHITECTURES=native (e.g. Blackwell sm_120).
       set(CMAKE_CUDA_ARCHITECTURES 80 90)
     endif()
     enable_language(CUDA)
@@ -46,64 +47,148 @@ if(GPU4DFT_ENABLE_CUDA)
 endif()
 message(STATUS "GPU4DFT CUDA backend: ${GPU4DFT_HAVE_CUDA}")
 
+set(GPU4DFT_HAVE_HIP OFF)
+if(GPU4DFT_ENABLE_HIP)
+  include(CheckLanguage)
+  check_language(HIP)
+  if(CMAKE_HIP_COMPILER)
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    find_package(hip QUIET)
+    set(GPU4DFT_HAVE_HIP ON)
+  endif()
+endif()
+message(STATUS "GPU4DFT HIP backend: ${GPU4DFT_HAVE_HIP}")
+
 # ---------------------------------------------------------------------------
-# Kernel generation
+# Kernel generation (Integral Codegen + Symbolic XC Codegen)
 # ---------------------------------------------------------------------------
 set(GPU4DFT_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 set(GPU4DFT_GEN_BACKENDS host)
 if(GPU4DFT_HAVE_CUDA)
   list(APPEND GPU4DFT_GEN_BACKENDS cuda)
 endif()
+if(GPU4DFT_HAVE_HIP)
+  list(APPEND GPU4DFT_GEN_BACKENDS hip)
+endif()
 list(JOIN GPU4DFT_GEN_BACKENDS "," _gen_backends)
 
-set(_codegen_cmd
+# 1. Integral & Derivative Code Generator (`gpu4dft_codegen`)
+set(_eri_codegen_cmd
     ${CMAKE_COMMAND} -E env PYTHONPATH=${PROJECT_SOURCE_DIR}/codegen
     ${Python_EXECUTABLE} -m gpu4dft_codegen --backends ${_gen_backends})
 
-# Re-run the configuration whenever the generator changes, so the list of
-# generated files below stays in sync with it.
-file(GLOB_RECURSE _codegen_sources CONFIGURE_DEPENDS
+file(GLOB_RECURSE _eri_codegen_sources CONFIGURE_DEPENDS
      ${PROJECT_SOURCE_DIR}/codegen/gpu4dft_codegen/*.py)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_codegen_sources})
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_eri_codegen_sources})
 
 execute_process(
-  COMMAND ${_codegen_cmd} --list-outputs
-  OUTPUT_VARIABLE _gen_relpaths
+  COMMAND ${_eri_codegen_cmd} --list-outputs
+  OUTPUT_VARIABLE _eri_gen_relpaths
   OUTPUT_STRIP_TRAILING_WHITESPACE
   COMMAND_ERROR_IS_FATAL ANY)
-list(TRANSFORM _gen_relpaths PREPEND ${GPU4DFT_GEN_DIR}/ OUTPUT_VARIABLE GPU4DFT_GEN_FILES)
+list(TRANSFORM _eri_gen_relpaths PREPEND ${GPU4DFT_GEN_DIR}/ OUTPUT_VARIABLE GPU4DFT_ERI_GEN_FILES)
 
 add_custom_command(
-  OUTPUT ${GPU4DFT_GEN_FILES}
-  COMMAND ${_codegen_cmd} --out-dir ${GPU4DFT_GEN_DIR}
-  DEPENDS ${_codegen_sources}
-  COMMENT "Generating integral kernels (${_gen_backends})"
+  OUTPUT ${GPU4DFT_ERI_GEN_FILES}
+  COMMAND ${_eri_codegen_cmd} --out-dir ${GPU4DFT_GEN_DIR}
+  DEPENDS ${_eri_codegen_sources}
+  COMMENT "Generating integral & derivative kernels (${_gen_backends})"
+  VERBATIM)
+
+if(GPU4DFT_HAVE_HIP)
+  foreach(_gen_file IN LISTS GPU4DFT_ERI_GEN_FILES)
+    if(_gen_file MATCHES "\\.hip$")
+      set_source_files_properties(${_gen_file} PROPERTIES LANGUAGE HIP)
+    endif()
+  endforeach()
+endif()
+
+# 2. Symbolic Autodiff XC Functional Code Generator (`xc_codegen`)
+set(_xc_codegen_cmd
+    ${CMAKE_COMMAND} -E env PYTHONPATH=${PROJECT_SOURCE_DIR}/codegen
+    ${Python_EXECUTABLE} -m xc_codegen --backends ${_gen_backends})
+
+file(GLOB_RECURSE _xc_codegen_sources CONFIGURE_DEPENDS
+     ${PROJECT_SOURCE_DIR}/codegen/xc_codegen/*.py)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_xc_codegen_sources})
+
+execute_process(
+  COMMAND ${_xc_codegen_cmd} --list-outputs
+  OUTPUT_VARIABLE _xc_gen_relpaths
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  COMMAND_ERROR_IS_FATAL ANY)
+list(TRANSFORM _xc_gen_relpaths PREPEND ${GPU4DFT_GEN_DIR}/ OUTPUT_VARIABLE GPU4DFT_XC_GEN_FILES)
+
+add_custom_command(
+  OUTPUT ${GPU4DFT_XC_GEN_FILES}
+  COMMAND ${_xc_codegen_cmd} --out-dir ${GPU4DFT_GEN_DIR}
+  DEPENDS ${_xc_codegen_sources}
+  COMMENT "Generating symbolic XC functional kernels (${_gen_backends})"
   VERBATIM)
 
 # ---------------------------------------------------------------------------
-# Core library
+# Core shared library (`libgpu4dft_core.so`)
 # ---------------------------------------------------------------------------
-add_library(gpu4dft_core STATIC
+add_library(gpu4dft_core SHARED
   src/basis.cpp
   src/shell_pairs.cpp
   src/eri.cpp
-  ${GPU4DFT_GEN_FILES})
+  src/one_electron.cpp
+  src/jk_engine.cpp
+  src/xc_grid.cpp
+  src/xc_engine.cpp
+  src/snk.cpp
+  src/linalg.cpp
+  src/diis.cpp
+  src/multigpu.cpp
+  src/scf.cpp
+  src/workflow.cpp
+  ${GPU4DFT_ERI_GEN_FILES}
+  ${GPU4DFT_XC_GEN_FILES})
+
 if(GPU4DFT_HAVE_CUDA)
-  target_sources(gpu4dft_core PRIVATE src/cuda/eri_cuda.cu)
-  target_link_libraries(gpu4dft_core PUBLIC CUDA::cudart)
+  target_sources(gpu4dft_core PRIVATE
+    src/cuda/eri_cuda.cu
+    src/cuda/one_electron_cuda.cu
+    src/cuda/jk_cuda.cu
+    src/cuda/xc_cuda.cu
+    src/cuda/snk_cuda.cu
+    src/cuda/device_pool.cu
+    src/cuda/linalg_cuda.cu
+    src/cuda/diis_cuda.cu
+    src/cuda/multigpu_cuda.cu)
+  target_link_libraries(gpu4dft_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cusolver)
   target_compile_definitions(gpu4dft_core PUBLIC GPU4DFT_HAVE_CUDA=1)
 endif()
+
+if(GPU4DFT_HAVE_HIP)
+  if(TARGET hip::host)
+    target_link_libraries(gpu4dft_core PUBLIC hip::host)
+  endif()
+  target_compile_definitions(gpu4dft_core PUBLIC GPU4DFT_HAVE_HIP=1)
+endif()
+
 target_include_directories(gpu4dft_core
   PUBLIC ${PROJECT_SOURCE_DIR}/include ${GPU4DFT_GEN_DIR}/include
   PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_options(gpu4dft_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic>)
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(gpu4dft_core PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(gpu4dft_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
+if(APPLE)
+  set(_gpu4dft_rpath_origin "@loader_path")
+else()
+  set(_gpu4dft_rpath_origin "$ORIGIN")
+endif()
+set_target_properties(gpu4dft_core PROPERTIES
+  INSTALL_RPATH "${_gpu4dft_rpath_origin}")
+
 # ---------------------------------------------------------------------------
-# Python extension
+# Python extension (`gpu4dft._core`)
 # ---------------------------------------------------------------------------
 if(GPU4DFT_BUILD_PYTHON)
   execute_process(
@@ -117,7 +202,11 @@ if(GPU4DFT_BUILD_PYTHON)
 
   # Lay out an importable package in the build tree: build/python/gpu4dft.
   set(_pkg_dir ${CMAKE_BINARY_DIR}/python/gpu4dft)
-  set_target_properties(_core PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${_pkg_dir})
+  set_target_properties(_core PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${_pkg_dir}
+    BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>;${_gpu4dft_rpath_origin}"
+    INSTALL_RPATH "${_gpu4dft_rpath_origin}")
+
   file(GLOB _py_sources CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/python/gpu4dft/*.py)
   foreach(_src IN LISTS _py_sources)
     cmake_path(GET _src FILENAME _name)
@@ -125,24 +214,33 @@ if(GPU4DFT_BUILD_PYTHON)
   endforeach()
 
   if(SKBUILD)
-    install(TARGETS _core LIBRARY DESTINATION gpu4dft)
+    install(TARGETS gpu4dft_core _core
+            LIBRARY DESTINATION gpu4dft
+            RUNTIME DESTINATION gpu4dft)
   endif()
 endif()
 
 # ---------------------------------------------------------------------------
-# Tests
+# C++ & Python Tests (`ctest`)
 # ---------------------------------------------------------------------------
 if(GPU4DFT_BUILD_TESTS)
   enable_testing()
 
   add_executable(test_boys tests/cpp/test_boys.cpp)
   target_link_libraries(test_boys PRIVATE gpu4dft_core)
+  set_target_properties(test_boys PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
   add_test(NAME cpp.boys COMMAND test_boys)
+
+  add_executable(test_rys tests/cpp/test_rys.cpp)
+  target_link_libraries(test_rys PRIVATE gpu4dft_core)
+  set_target_properties(test_rys PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.rys COMMAND test_rys)
 
   if(GPU4DFT_BUILD_PYTHON)
     add_test(NAME python
              COMMAND ${Python_EXECUTABLE} -m pytest -q ${PROJECT_SOURCE_DIR}/tests/python)
     set_tests_properties(python PROPERTIES
-                         ENVIRONMENT "PYTHONPATH=${CMAKE_BINARY_DIR}/python")
+      ENVIRONMENT
+        "PYTHONPATH=${CMAKE_BINARY_DIR}/python;GPU4DFT_TEST_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_DRIVER_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_XC_LIB=$<TARGET_FILE:gpu4dft_core>")
   endif()
 endif()

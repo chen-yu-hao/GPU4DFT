@@ -18,6 +18,13 @@ def main(argv: list[str] | None = None) -> int:
         default="host",
         help=f"comma-separated backends to generate ({', '.join(BACKENDS)}); default: host",
     )
+    parser.add_argument(
+        "--deriv-order",
+        type=int,
+        default=1,
+        choices=(0, 1),
+        help="maximum nuclear derivative order to emit (0 or 1; default: 1)",
+    )
     action = parser.add_mutually_exclusive_group(required=True)
     action.add_argument("--out-dir", type=Path, help="directory to write generated files into")
     action.add_argument(
@@ -29,7 +36,7 @@ def main(argv: list[str] | None = None) -> int:
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     try:
-        files = generate(backends)
+        files = generate(backends, deriv_order=args.deriv_order)
     except ValueError as exc:
         parser.error(str(exc))
 
