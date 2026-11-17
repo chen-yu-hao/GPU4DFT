@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -81,7 +82,13 @@ struct GradientResult {
   double xc_time_s = 0.0;
 };
 
-// End-to-end C++20 molecular SCF & analytical nuclear gradient workflow.
+struct ResponseOptions;
+struct ResponseResult;
+struct HessianOptions;
+struct VibrationalResult;
+
+// End-to-end C++20 molecular SCF, excited-state TDDFT/TDA/CIS, analytical nuclear gradient,
+// and seminumerical nuclear Hessian workflow.
 //
 // Constructs all persistent GPU/Host engines (`DirectJKEngine`, `RIJKEngine`,
 // `SemiNumericalK`, `MolecularGrid`, `XcEngine`, and 1e matrices `S`, `H_core`)
@@ -121,6 +128,24 @@ class MolecularScf {
   GradientResult compute_gradient(const ScfResult& scf_res);
   GradientResult compute_gradient();
 
+  // Evaluates permanent molecular electric dipole moment (in atomic units e * Bohr)
+  // around `origin` (Bohr) from a converged SCF result (or the most recent `run()` result).
+  std::array<double, 3> compute_dipole(const ScfResult& scf_res,
+                                       std::array<double, 3> origin = {0.0, 0.0, 0.0});
+  std::array<double, 3> compute_dipole(std::array<double, 3> origin = {0.0, 0.0, 0.0});
+
+  // Solves closed-shell singlet excited states (CIS / TDA / TDHF / TDDFT) from the converged
+  // SCF ground state, reusing persistent GPU-resident DirectJKEngine / RIJKEngine / cached-AO
+  // XcEngine with zero-copy device-pointer ResponseCallbacks and transition dipoles / f_osc.
+  ResponseResult run_response(const ResponseOptions& resp_opts);
+  ResponseResult run_response();
+
+  // Evaluates molecular nuclear Hessian & harmonic vibrational frequencies via central 2-point
+  // differentiation of analytical nuclear gradients (`fixed_xc_grid = true` by default).
+  VibrationalResult run_hessian(const HessianOptions& hess_opts,
+                                std::span<const double> custom_masses_amu = {});
+  VibrationalResult run_hessian();
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
@@ -141,3 +166,5 @@ GradientResult run_grad(const Basis& basis, std::span<const Atom> atoms,
                         std::span<const double> external_grid_weights = {});
 
 }  // namespace gpu4dft
+
+#include "gpu4dft/response.hpp"

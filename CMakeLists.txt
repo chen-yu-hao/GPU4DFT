@@ -145,6 +145,8 @@ add_library(gpu4dft_core SHARED
   src/multigpu.cpp
   src/scf.cpp
   src/workflow.cpp
+  src/response.cpp
+  src/pw.cpp
   ${GPU4DFT_ERI_GEN_FILES}
   ${GPU4DFT_XC_GEN_FILES})
 
@@ -158,8 +160,10 @@ if(GPU4DFT_HAVE_CUDA)
     src/cuda/device_pool.cu
     src/cuda/linalg_cuda.cu
     src/cuda/diis_cuda.cu
-    src/cuda/multigpu_cuda.cu)
-  target_link_libraries(gpu4dft_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cusolver)
+    src/cuda/multigpu_cuda.cu
+    src/cuda/response_cuda.cu
+    src/cuda/pw_cuda.cu)
+  target_link_libraries(gpu4dft_core PUBLIC CUDA::cudart CUDA::cublas CUDA::cusolver CUDA::cufft)
   target_compile_definitions(gpu4dft_core PUBLIC GPU4DFT_HAVE_CUDA=1)
 endif()
 
@@ -241,6 +245,6 @@ if(GPU4DFT_BUILD_TESTS)
              COMMAND ${Python_EXECUTABLE} -m pytest -q ${PROJECT_SOURCE_DIR}/tests/python)
     set_tests_properties(python PROPERTIES
       ENVIRONMENT
-        "PYTHONPATH=${CMAKE_BINARY_DIR}/python;GPU4DFT_TEST_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_DRIVER_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_XC_LIB=$<TARGET_FILE:gpu4dft_core>")
+        "PYTHONPATH=${CMAKE_BINARY_DIR}/python;GPU4DFT_TEST_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_DRIVER_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_XC_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_RESP_LIB=$<TARGET_FILE:gpu4dft_core>;GPU4DFT_PW_LIB=$<TARGET_FILE:gpu4dft_core>")
   endif()
 endif()

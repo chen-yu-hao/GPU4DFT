@@ -13,6 +13,7 @@
 #include "gpu4dft/device_pool.hpp"
 #include "gpu4dft/eri.hpp"
 #include "gpu4dft/linalg.hpp"
+#include "gpu4dft/response.hpp"
 
 #if defined(GPU4DFT_HAVE_CUDA)
 #include <cuda_runtime.h>
@@ -84,81 +85,83 @@ double compute_active_ao_ratio(const MolecularGrid& grid) {
 }
 
 #if defined(GPU4DFT_HAVE_CUDA)
-// Persistent GPU-resident state for 3-center RI-J and RI-K contractions.
-// Uploads B_{P, uv} [naux x nao^2] (and B_perm [nao*naux x nao] when K is needed)
-// ONCE during setup and contracts directly on GPU device pointers via `gemm_device`
-// (supporting FP64, FP32 Tensor Core, and Ozaki INT8 Tensor Core modes).
+// Zero-copy GPU-resident state for OzakiInt8 Tensor Core RI-J and chunked RI-K contractions.
+// Borrows `RIJKEngine::device_b_ptr()` directly whenever `ri_jk.has_device_b()` is true,
+// completely avoiding any D2H `b_tensor()` download, duplicate `d_B` VRAM allocation, or
+// host-side `B_perm` permutation loop!
 struct GpuRIJKDeviceState {
   static constexpr int kAuxChunk = 192;
 
   int nao = 0;
   int naux = 0;
-  bool has_k = false;
   GpuLinalgContext ctx;
-  PooledBuffer<double> d_B;         // [naux * nao * nao]
-  PooledBuffer<double> d_v_aux;     // [naux]
-  PooledBuffer<double> d_B_chunks;  // [naux * nao * nao] packed in chunks of [nao, bc, nao]
-  PooledBuffer<double> d_T_chunk;   // [nao * min(naux, kAuxChunk) * nao] bounded workspace
+  const double* d_B_ptr = nullptr;   // Borrowed from RIJKEngine::device_b_ptr()
+  PooledBuffer<double> d_B_owned;    // Fallback only if RIJKEngine was built without device B
+  PooledBuffer<double> d_v_aux;      // [naux]
+  PooledBuffer<double> d_T_raw;      // [min(naux, kAuxChunk) * nao * nao]
+  PooledBuffer<double> d_Bp_chunk;   // [min(naux, kAuxChunk) * nao * nao]
+  PooledBuffer<double> d_Tp_chunk;   // [min(naux, kAuxChunk) * nao * nao]
 
-  GpuRIJKDeviceState(int nao_, int naux_, const std::vector<double>& h_B, bool need_k)
-      : nao(nao_),
-        naux(naux_),
-        has_k(need_k),
+  GpuRIJKDeviceState(const RIJKEngine& ri_jk, bool prealloc_k)
+      : nao(ri_jk.nao()),
+        naux(ri_jk.naux()),
         ctx(&default_device_pool()),
-        d_B(ctx.pool(), static_cast<std::size_t>(naux_) * nao_ * nao_),
-        d_v_aux(ctx.pool(), static_cast<std::size_t>(naux_)) {
-    copy_h2d_async(d_B.data(), h_B.data(), h_B.size() * sizeof(double));
-    if (has_k && naux_ > 0 && nao_ > 0) {
-      const std::size_t total = static_cast<std::size_t>(nao_) * naux_ * nao_;
-      std::vector<double> h_B_chunks(total, 0.0);
-      for (int p0 = 0; p0 < naux_; p0 += kAuxChunk) {
-        const int bc = std::min(kAuxChunk, naux_ - p0);
-        double* dst_chunk =
-            h_B_chunks.data() + static_cast<std::size_t>(p0) * nao_ * nao_;
-        for (int pl = 0; pl < bc; ++pl) {
-          const int p = p0 + pl;
-          for (int u = 0; u < nao_; ++u) {
-            for (int v = 0; v < nao_; ++v) {
-              dst_chunk[(static_cast<std::size_t>(u) * bc + pl) * nao_ + v] =
-                  h_B[(static_cast<std::size_t>(p) * nao_ + u) * nao_ + v];
-            }
-          }
-        }
-      }
-      const std::size_t max_chunk_elems =
-          static_cast<std::size_t>(nao_) * std::min(naux_, kAuxChunk) * nao_;
-      d_B_chunks = PooledBuffer<double>(ctx.pool(), total);
-      d_T_chunk = PooledBuffer<double>(ctx.pool(), max_chunk_elems);
-      copy_h2d_async(d_B_chunks.data(), h_B_chunks.data(), total * sizeof(double));
+        d_v_aux(ctx.pool(), static_cast<std::size_t>(std::max(1, ri_jk.naux()))) {
+    if (ri_jk.has_device_b()) {
+      d_B_ptr = ri_jk.device_b_ptr();
+    } else if (nao > 0 && naux > 0) {
+      const auto& h_B = ri_jk.b_tensor();
+      d_B_owned = PooledBuffer<double>(ctx.pool(), h_B.size());
+      copy_h2d_async(d_B_owned.data(), h_B.data(), h_B.size() * sizeof(double));
+      d_B_ptr = d_B_owned.data();
+    }
+    if (prealloc_k && naux > 0 && nao > 0) {
+      ensure_k_buffers(nullptr);
     }
     synchronize_stream(nullptr);
   }
 
+  void ensure_k_buffers(StreamHandle stream) {
+    if (d_T_raw.size() > 0 || naux <= 0 || nao <= 0) return;
+    const std::size_t max_chunk_elems =
+        static_cast<std::size_t>(std::min(naux, kAuxChunk)) * nao * nao;
+    d_T_raw = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
+    d_Bp_chunk = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
+    d_Tp_chunk = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
+  }
+
   void compute_j_device(const double* d_dm, double* d_vj, StreamHandle stream) {
+    if (d_vj == nullptr || nao == 0 || naux == 0 || d_B_ptr == nullptr) return;
     const int nao2 = nao * nao;
-    gemm_device(ctx, naux, 1, nao2, 1.0, d_B.data(), nao2, false, d_dm, 1, false, 0.0,
+    gemm_device(ctx, naux, 1, nao2, 1.0, d_B_ptr, nao2, false, d_dm, 1, false, 0.0,
                 d_v_aux.data(), 1, GemmMode::FP64, stream);
-    gemm_device(ctx, nao2, 1, naux, 1.0, d_B.data(), nao2, true, d_v_aux.data(), 1, false, 0.0,
-                d_vj, 1, GemmMode::FP64, stream);
+    gemm_device(ctx, nao2, 1, naux, 1.0, d_B_ptr, nao2, true, d_v_aux.data(), 1, false, 0.0, d_vj,
+                1, GemmMode::FP64, stream);
   }
 
   void compute_k_device(const double* d_dm, double* d_vk, GemmMode mode, int ozaki_slices,
-                        StreamHandle stream) {
-    if (!has_k || d_vk == nullptr) return;
+                        bool symmetrize_out, StreamHandle stream) {
+    if (d_vk == nullptr || nao == 0 || naux == 0 || d_B_ptr == nullptr) return;
+    ensure_k_buffers(stream);
+    const std::size_t nao2 = static_cast<std::size_t>(nao) * nao;
     for (int p0 = 0; p0 < naux; p0 += kAuxChunk) {
       const int bc = std::min(kAuxChunk, naux - p0);
-      const int k_chunk = nao * bc;
-      const double* d_Bc =
-          d_B_chunks.data() + static_cast<std::size_t>(p0) * nao * nao;
+      const int k_chunk = bc * nao;
+      const double* d_Bc = d_B_ptr + static_cast<std::size_t>(p0) * nao2;
       const double beta = (p0 == 0) ? 0.0 : 1.0;
-      // Step 1: T_chunk [(nao * bc) x nao] = B_chunk [(nao * bc) x nao] * D [nao x nao]
+      // Step 1: T_raw [(bc * nao) x nao] = B_c [(bc * nao) x nao] * d_dm [nao x nao]
       gemm_device(ctx, k_chunk, nao, nao, 1.0, d_Bc, nao, false, d_dm, nao, false, 0.0,
-                  d_T_chunk.data(), nao, mode, stream, ozaki_slices);
-      // Step 2: K [nao x nao] += T_chunk [nao x (bc * nao)] * B_chunk^T [(bc * nao) x nao]
-      gemm_device(ctx, nao, nao, k_chunk, 1.0, d_T_chunk.data(), k_chunk, false, d_Bc, k_chunk,
-                  true, beta, d_vk, nao, mode, stream, ozaki_slices);
+                  d_T_raw.data(), nao, mode, stream, ozaki_slices);
+      // Coalesced GPU permute [bc, nao, nao] -> [nao, bc, nao] for both B_c and T_raw
+      permute_ri_chunk_pair_device(bc, nao, d_Bc, d_T_raw.data(), d_Bp_chunk.data(),
+                                   d_Tp_chunk.data(), stream);
+      // Step 2: K [nao x nao] += T_perm [nao x (bc * nao)] * B_perm^T [(bc * nao) x nao]
+      gemm_device(ctx, nao, nao, k_chunk, 1.0, d_Tp_chunk.data(), k_chunk, false,
+                  d_Bp_chunk.data(), k_chunk, true, beta, d_vk, nao, mode, stream, ozaki_slices);
     }
-    symmetrize_matrix_device(nao, d_vk, stream);
+    if (symmetrize_out) {
+      symmetrize_matrix_device(nao, d_vk, stream);
+    }
   }
 };
 #endif
@@ -295,9 +298,10 @@ struct MolecularScf::Impl {
     } else if (opts.jk_mode == JKMode::RI) {
       ri_jk = std::make_unique<RIJKEngine>(basis, *aux_basis, be);
 #if defined(GPU4DFT_HAVE_CUDA)
-      if (be == Backend::Cuda) {
-        gpu_rijk = std::make_unique<GpuRIJKDeviceState>(basis.nao(), ri_jk->naux(),
-                                                        ri_jk->b_tensor(), need_k);
+      if (be == Backend::Cuda && need_k &&
+          (opts.scf.gemm_mode == GemmMode::OzakiInt8 ||
+           (opts.scf.dynamic_precision && opts.scf.early_gemm_mode == GemmMode::OzakiInt8))) {
+        gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*ri_jk, /*prealloc_k=*/true);
       }
 #endif
     } else if (opts.jk_mode == JKMode::SnK) {
@@ -307,12 +311,6 @@ struct MolecularScf::Impl {
       }
     } else if (opts.jk_mode == JKMode::RISnK) {
       ri_jk = std::make_unique<RIJKEngine>(basis, *aux_basis, be);
-#if defined(GPU4DFT_HAVE_CUDA)
-      if (be == Backend::Cuda) {
-        gpu_rijk = std::make_unique<GpuRIJKDeviceState>(basis.nao(), ri_jk->naux(),
-                                                        ri_jk->b_tensor(), /*need_k=*/false);
-      }
-#endif
       if (need_k) {
         snk_engine = std::make_unique<SemiNumericalK>(basis, grid, opts.snk_options);
       }
@@ -387,53 +385,96 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
     }
   }
 
-  // 2. Wire Two-Electron J/K Engine (`DirectJKEngine` / `RIJKEngine` / `SemiNumericalK`)
+  // 2. Wire Two-Electron J/K Engine (100% Zero-Copy Device-Resident on Backend::Cuda!)
   if (impl_->opts.jk_mode == JKMode::Direct) {
     DirectJKEngine* djk = impl_->direct_jk.get();
     const double s_cut = impl_->opts.schwarz_cutoff;
     const double fp32_thr = impl_->opts.fp32_threshold;
-    cb.device_resident = false;
-    cb.build_jk = [djk, be, s_cut, fp32_thr](const double* h_dm, bool /*is_inc*/, Precision prec,
-                                             double* h_vj, double* h_vk, void* /*stream*/) {
-      JKOptions jk_opts;
-      jk_opts.backend = be;
-      jk_opts.precision = prec;
-      jk_opts.schwarz_cutoff = s_cut;
-      jk_opts.fp32_threshold = fp32_thr;
-      jk_opts.compute_j = (h_vj != nullptr);
-      jk_opts.compute_k = (h_vk != nullptr);
-      jk_opts.k_scale = 1.0;
-      djk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
-    };
-  } else if (impl_->opts.jk_mode == JKMode::RI) {
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
-      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
+      cb.device_resident = true;
+      cb.build_jk = [djk, s_cut, fp32_thr](const double* d_dm, bool /*is_inc*/, Precision prec,
+                                           double* d_vj, double* d_vk, void* raw_stream) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Cuda;
+        jk_opts.precision = prec;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (d_vj != nullptr);
+        jk_opts.compute_k = (d_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = true;
+        djk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
+      };
+    } else
+#endif
+    {
+      cb.device_resident = false;
+      cb.build_jk = [djk, be, s_cut, fp32_thr](const double* h_dm, bool /*is_inc*/, Precision prec,
+                                               double* h_vj, double* h_vk, void* /*stream*/) {
+        JKOptions jk_opts;
+        jk_opts.backend = be;
+        jk_opts.precision = prec;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (h_vj != nullptr);
+        jk_opts.compute_k = (h_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = true;
+        djk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
+      };
+    }
+  } else if (impl_->opts.jk_mode == JKMode::RI) {
+    RIJKEngine* rijk = impl_->ri_jk.get();
+#if defined(GPU4DFT_HAVE_CUDA)
+    if (be == Backend::Cuda) {
       const GemmMode target_gemm = run_scf_opts.gemm_mode;
       const GemmMode early_gemm = run_scf_opts.early_gemm_mode;
       const int oz_slices = run_scf_opts.ozaki_slices;
+      if (need_k &&
+          (target_gemm == GemmMode::OzakiInt8 ||
+           (run_scf_opts.dynamic_precision && early_gemm == GemmMode::OzakiInt8)) &&
+          !impl_->gpu_rijk) {
+        impl_->gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*rijk, /*prealloc_k=*/true);
+      }
+      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
       cb.device_resident = true;
-      cb.build_jk = [g_ri, target_gemm, early_gemm, oz_slices](
+      cb.build_jk = [rijk, g_ri, target_gemm, early_gemm, oz_slices](
                         const double* d_dm, bool /*is_inc*/, Precision prec, double* d_vj,
                         double* d_vk, void* raw_stream) {
-        auto s = static_cast<StreamHandle>(raw_stream);
-        if (d_vj != nullptr) {
-          g_ri->compute_j_device(d_dm, d_vj, s);
+        GemmMode k_mode = target_gemm;
+        if (prec == Precision::FP32) {
+          k_mode = GemmMode::FP32;
+        } else if (prec == Precision::Mixed) {
+          k_mode = early_gemm;
         }
-        if (d_vk != nullptr) {
-          GemmMode k_mode = target_gemm;
-          if (prec == Precision::FP32) {
-            k_mode = GemmMode::FP32;
-          } else if (prec == Precision::Mixed) {
-            k_mode = early_gemm;
+
+        if (d_vk != nullptr && k_mode == GemmMode::OzakiInt8 && g_ri != nullptr) {
+          if (d_vj != nullptr) {
+            JKOptions j_opts;
+            j_opts.backend = Backend::Cuda;
+            j_opts.precision = Precision::FP64;
+            j_opts.compute_j = true;
+            j_opts.compute_k = false;
+            j_opts.symmetrize_dm = true;
+            rijk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
           }
-          g_ri->compute_k_device(d_dm, d_vk, k_mode, oz_slices, s);
+          g_ri->compute_k_device(d_dm, d_vk, GemmMode::OzakiInt8, oz_slices,
+                                 /*symmetrize_out=*/true, static_cast<StreamHandle>(raw_stream));
+        } else {
+          JKOptions jk_opts;
+          jk_opts.backend = Backend::Cuda;
+          jk_opts.precision = (k_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
+          jk_opts.compute_j = (d_vj != nullptr);
+          jk_opts.compute_k = (d_vk != nullptr);
+          jk_opts.k_scale = 1.0;
+          jk_opts.symmetrize_dm = true;
+          rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
         }
       };
     } else
 #endif
     {
-      RIJKEngine* rijk = impl_->ri_jk.get();
       cb.device_resident = false;
       cb.build_jk = [rijk, be](const double* h_dm, bool /*is_inc*/, Precision prec, double* h_vj,
                                double* h_vk, void* /*stream*/) {
@@ -443,6 +484,7 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
         jk_opts.compute_j = (h_vj != nullptr);
         jk_opts.compute_k = (h_vk != nullptr);
         jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = true;
         rijk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
       };
     }
@@ -453,17 +495,10 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
     const double fp32_thr = impl_->opts.fp32_threshold;
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
-      auto h_dm_stage = std::make_shared<std::vector<double>>(n2, 0.0);
-      auto h_vj_stage = std::make_shared<std::vector<double>>(n2, 0.0);
       cb.device_resident = true;
-      cb.build_jk = [djk, snk, n2, s_cut, fp32_thr, h_dm_stage, h_vj_stage](
-                        const double* d_dm, bool /*is_inc*/, Precision prec, double* d_vj,
-                        double* d_vk, void* raw_stream) {
-        auto s = static_cast<StreamHandle>(raw_stream);
+      cb.build_jk = [djk, snk, s_cut, fp32_thr](const double* d_dm, bool /*is_inc*/, Precision prec,
+                                                double* d_vj, double* d_vk, void* raw_stream) {
         if (d_vj != nullptr) {
-          copy_d2h_async(h_dm_stage->data(), d_dm, n2 * sizeof(double), s);
-          synchronize_stream(s);
-          std::fill(h_vj_stage->begin(), h_vj_stage->end(), 0.0);
           JKOptions j_opts;
           j_opts.backend = Backend::Cuda;
           j_opts.precision = prec;
@@ -471,8 +506,8 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           j_opts.fp32_threshold = fp32_thr;
           j_opts.compute_j = true;
           j_opts.compute_k = false;
-          djk->compute_jk(h_dm_stage->data(), h_vj_stage->data(), nullptr, j_opts);
-          copy_h2d_async(d_vj, h_vj_stage->data(), n2 * sizeof(double), s);
+          j_opts.symmetrize_dm = true;
+          djk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
         }
         if (d_vk != nullptr && snk != nullptr) {
           snk->compute_k_device(d_dm, d_vk, raw_stream);
@@ -493,6 +528,7 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           j_opts.fp32_threshold = fp32_thr;
           j_opts.compute_j = true;
           j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
           djk->compute_jk(h_dm, h_vj, nullptr, j_opts);
         }
         if (h_vk != nullptr && snk != nullptr) {
@@ -501,16 +537,21 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
       };
     }
   } else if (impl_->opts.jk_mode == JKMode::RISnK) {
+    RIJKEngine* rijk = impl_->ri_jk.get();
     SemiNumericalK* snk = impl_->snk_engine.get();
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
-      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
       cb.device_resident = true;
-      cb.build_jk = [g_ri, snk](const double* d_dm, bool /*is_inc*/, Precision /*prec*/,
+      cb.build_jk = [rijk, snk](const double* d_dm, bool /*is_inc*/, Precision /*prec*/,
                                 double* d_vj, double* d_vk, void* raw_stream) {
-        auto s = static_cast<StreamHandle>(raw_stream);
         if (d_vj != nullptr) {
-          g_ri->compute_j_device(d_dm, d_vj, s);
+          JKOptions j_opts;
+          j_opts.backend = Backend::Cuda;
+          j_opts.precision = Precision::FP64;
+          j_opts.compute_j = true;
+          j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
+          rijk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
         }
         if (d_vk != nullptr && snk != nullptr) {
           snk->compute_k_device(d_dm, d_vk, raw_stream);
@@ -519,7 +560,6 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
     } else
 #endif
     {
-      RIJKEngine* rijk = impl_->ri_jk.get();
       cb.device_resident = false;
       cb.build_jk = [rijk, snk, be](const double* h_dm, bool /*is_inc*/, Precision /*prec*/,
                                     double* h_vj, double* h_vk, void* /*stream*/) {
@@ -529,6 +569,7 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           j_opts.precision = Precision::FP64;
           j_opts.compute_j = true;
           j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
           rijk->compute_jk(h_dm, h_vj, nullptr, j_opts);
         }
         if (h_vk != nullptr && snk != nullptr) {
@@ -538,7 +579,6 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
     }
   }
 
-  (void)need_k;
   ScfDriver driver(run_scf_opts);
 
   sync_gpu_if_cuda(be);
@@ -629,6 +669,321 @@ GradientResult MolecularScf::compute_gradient() {
     throw std::runtime_error("MolecularScf::compute_gradient: run() has not been executed yet");
   }
   return compute_gradient(*impl_->last_scf);
+}
+
+std::array<double, 3> MolecularScf::compute_dipole(const ScfResult& scf_res,
+                                                   std::array<double, 3> origin) {
+  impl_->ensure_setup();
+  const std::size_t n2 = static_cast<std::size_t>(impl_->basis.nao()) * impl_->basis.nao();
+  if (scf_res.density_matrix.size() != n2) {
+    throw std::invalid_argument(
+        "MolecularScf::compute_dipole: scf_res.density_matrix size must equal nao^2");
+  }
+  return molecular_dipole_moment(impl_->basis, impl_->atoms, scf_res.density_matrix.data(), origin,
+                                 impl_->opts.scf.backend);
+}
+
+std::array<double, 3> MolecularScf::compute_dipole(std::array<double, 3> origin) {
+  if (!impl_->last_scf.has_value()) {
+    throw std::runtime_error("MolecularScf::compute_dipole: run() has not been executed yet");
+  }
+  return compute_dipole(*impl_->last_scf, origin);
+}
+
+ResponseResult MolecularScf::run_response(const ResponseOptions& resp_opts) {
+  impl_->ensure_setup();
+  if (!impl_->last_scf.has_value()) {
+    throw std::runtime_error("MolecularScf::run_response: run() has not been executed yet");
+  }
+
+  const ScfResult& scf_res = *impl_->last_scf;
+  const int n_ao = scf_res.nao;
+  const int n_occ = impl_->n_elec / 2;
+
+  ResponseOptions eff_opts = resp_opts;
+  eff_opts.exact_exchange_fraction = impl_->exx_fraction;
+  const Backend be = eff_opts.backend;
+  if (!backend_available(be)) {
+    throw std::runtime_error(std::string("MolecularScf::run_response: backend '") + to_string(be) +
+                             "' is not available");
+  }
+
+  sync_gpu_if_cuda(be);
+  const auto t_resp_start = SteadyClock::now();
+
+  // If SCF used SP2 purification without canonical MOs, extract canonical MOs from converged Fock.
+  std::vector<double> local_mo_e;
+  std::vector<double> local_mo_c;
+  int n_mo = scf_res.nmo;
+  const double* mo_e_ptr = scf_res.mo_energies.data();
+  const double* mo_c_ptr = scf_res.mo_coefficients.data();
+  if (scf_res.mo_energies.empty() || scf_res.mo_coefficients.empty()) {
+    const auto ortho =
+        canonical_orthogonalization(n_ao, impl_->S_mat.data(), impl_->opts.scf.lindep_tol, be);
+    n_mo = ortho.nmo;
+    auto diag = solve_fock_diag(n_ao, n_mo, n_occ, scf_res.fock_matrix.data(), ortho.X.data(), be,
+                                eff_opts.gemm_mode, eff_opts.ozaki_slices);
+    local_mo_e = std::move(diag.mo_energies);
+    local_mo_c = std::move(diag.mo_coeff);
+    mo_e_ptr = local_mo_e.data();
+    mo_c_ptr = local_mo_c.data();
+  }
+
+  const bool need_k = (std::abs(eff_opts.exact_exchange_fraction) > 0.0);
+  const bool use_ri =
+      (impl_->opts.jk_mode == JKMode::RI) || (impl_->opts.jk_mode == JKMode::RISnK && !need_k);
+
+  ResponseCallbacks cb;
+
+  // 1. Wire Zero-Copy Non-Symmetric J/K Response Callbacks (`symmetrize_dm = false`)
+  if (use_ri && impl_->ri_jk != nullptr) {
+    RIJKEngine* rijk = impl_->ri_jk.get();
+#if defined(GPU4DFT_HAVE_CUDA)
+    if (be == Backend::Cuda) {
+      const bool want_ozaki_k =
+          need_k &&
+          (eff_opts.gemm_mode == GemmMode::OzakiInt8 ||
+           (eff_opts.dynamic_precision && eff_opts.early_gemm_mode == GemmMode::OzakiInt8));
+      if (want_ozaki_k && !impl_->gpu_rijk) {
+        impl_->gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*rijk, /*prealloc_k=*/true);
+      }
+      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
+      const GemmMode final_mode = eff_opts.gemm_mode;
+      const int oz_slices = eff_opts.ozaki_slices;
+      cb.device_resident = true;
+      cb.build_jk = [rijk, g_ri, final_mode, oz_slices](const double* d_dm, double* d_vj,
+                                                        double* d_vk, void* raw_stream) {
+        if (d_vk != nullptr && final_mode == GemmMode::OzakiInt8 && g_ri != nullptr) {
+          if (d_vj != nullptr) {
+            JKOptions j_opts;
+            j_opts.backend = Backend::Cuda;
+            j_opts.precision = Precision::FP64;
+            j_opts.compute_j = true;
+            j_opts.compute_k = false;
+            j_opts.symmetrize_dm = false;
+            rijk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
+          }
+          g_ri->compute_k_device(d_dm, d_vk, GemmMode::OzakiInt8, oz_slices,
+                                 /*symmetrize_out=*/false, static_cast<StreamHandle>(raw_stream));
+        } else {
+          JKOptions jk_opts;
+          jk_opts.backend = Backend::Cuda;
+          jk_opts.precision =
+              (final_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
+          jk_opts.compute_j = (d_vj != nullptr);
+          jk_opts.compute_k = (d_vk != nullptr);
+          jk_opts.k_scale = 1.0;
+          jk_opts.symmetrize_dm = false;
+          rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
+        }
+      };
+    } else
+#endif
+    {
+      cb.device_resident = false;
+      cb.build_jk = [rijk](const double* h_dm, double* h_vj, double* h_vk, void* /*stream*/) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Host;
+        jk_opts.precision = Precision::FP64;
+        jk_opts.compute_j = (h_vj != nullptr);
+        jk_opts.compute_k = (h_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = false;
+        rijk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
+      };
+    }
+  } else {
+    if (!impl_->direct_jk) {
+      impl_->direct_jk = std::make_unique<DirectJKEngine>(impl_->basis, impl_->opts.prim_cutoff);
+    }
+    DirectJKEngine* djk = impl_->direct_jk.get();
+    const double s_cut = impl_->opts.schwarz_cutoff;
+    const double fp32_thr = impl_->opts.fp32_threshold;
+#if defined(GPU4DFT_HAVE_CUDA)
+    if (be == Backend::Cuda) {
+      cb.device_resident = true;
+      cb.build_jk = [djk, s_cut, fp32_thr](const double* d_dm, double* d_vj, double* d_vk,
+                                           void* raw_stream) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Cuda;
+        jk_opts.precision = Precision::FP64;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (d_vj != nullptr);
+        jk_opts.compute_k = (d_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = false;
+        djk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
+      };
+    } else
+#endif
+    {
+      cb.device_resident = false;
+      cb.build_jk = [djk, s_cut, fp32_thr](const double* h_dm, double* h_vj, double* h_vk,
+                                           void* /*stream*/) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Host;
+        jk_opts.precision = Precision::FP64;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (h_vj != nullptr);
+        jk_opts.compute_k = (h_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = false;
+        djk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
+      };
+    }
+  }
+
+  // 2. Wire Zero-Copy 2nd-Derivative XC Kernel Contraction (`eval_fxc_device` / `eval_fxc`)
+  std::shared_ptr<XcEngine> alt_xc;
+  if (impl_->is_dft_flag) {
+    XcEngine* xc_ptr = impl_->xc_engine.get();
+    if (xc_ptr == nullptr || xc_ptr->active_backend() != be) {
+      XcOptions xopts = impl_->opts.xc_options;
+      xopts.backend = be;
+      xopts.precision = Precision::FP64;
+      alt_xc = std::make_shared<XcEngine>(impl_->basis, impl_->grid, impl_->opts.xc, xopts);
+      xc_ptr = alt_xc.get();
+    }
+    xc_ptr->set_reference_density(scf_res.density_matrix);
+#if defined(GPU4DFT_HAVE_CUDA)
+    if (be == Backend::Cuda) {
+      cb.fxc_device_resident = true;
+      cb.build_fxc = [xc_ptr, alt_xc](const double* d_sym_dm, double* d_fxc_out, void* raw_stream) {
+        (void)alt_xc;
+        xc_ptr->eval_fxc_device(d_sym_dm, d_fxc_out, raw_stream);
+      };
+    } else
+#endif
+    {
+      cb.fxc_device_resident = false;
+      cb.build_fxc = [xc_ptr, alt_xc](const double* h_sym_dm, double* h_fxc_out, void* /*stream*/) {
+        (void)alt_xc;
+        xc_ptr->eval_fxc(h_sym_dm, h_fxc_out);
+      };
+    }
+  }
+
+  // 3. Evaluate AO electric dipole matrices & solve Block-Davidson linear response
+  const auto ao_dip = dipole_matrices(impl_->basis, {0.0, 0.0, 0.0}, be);
+  LinearResponseDriver drv(eff_opts);
+  ResponseResult res = drv.run(n_ao, n_mo, n_occ, mo_e_ptr, mo_c_ptr, cb, &ao_dip);
+  sync_gpu_if_cuda(be);
+  res.wall_time_s = elapsed_seconds(t_resp_start, SteadyClock::now());
+  return res;
+}
+
+ResponseResult MolecularScf::run_response() {
+  ResponseOptions opts;
+  opts.backend = impl_->opts.scf.backend;
+  opts.gemm_mode = impl_->opts.scf.gemm_mode;
+  opts.ozaki_slices = impl_->opts.scf.ozaki_slices;
+  return run_response(opts);
+}
+
+VibrationalResult MolecularScf::run_hessian(const HessianOptions& hess_opts,
+                                            std::span<const double> custom_masses_amu) {
+  impl_->ensure_setup();
+  if (!impl_->last_scf.has_value()) {
+    (void)this->run();
+  }
+
+  const Backend be = hess_opts.backend;
+  if (!backend_available(be)) {
+    throw std::runtime_error(std::string("MolecularScf::run_hessian: backend '") + to_string(be) +
+                             "' is not available");
+  }
+
+  const int n_atom = static_cast<int>(impl_->atoms.size());
+  std::vector<int> shell_parent(impl_->basis.nshell(), -1);
+  for (std::size_t s = 0; s < impl_->basis.nshell(); ++s) {
+    const auto& sc = impl_->basis.shell(s).center;
+    for (int a = 0; a < n_atom; ++a) {
+      const double dx = sc[0] - impl_->atoms[static_cast<std::size_t>(a)].center[0];
+      const double dy = sc[1] - impl_->atoms[static_cast<std::size_t>(a)].center[1];
+      const double dz = sc[2] - impl_->atoms[static_cast<std::size_t>(a)].center[2];
+      if (dx * dx + dy * dy + dz * dz < 1e-10) {
+        shell_parent[s] = a;
+        break;
+      }
+    }
+  }
+
+  // Recover unnormalized contraction coefficients so Basis(disp_shells) matches equilibrium radial norms
+  std::vector<Shell> raw_template_shells;
+  raw_template_shells.reserve(impl_->basis.nshell());
+  for (std::size_t s = 0; s < impl_->basis.nshell(); ++s) {
+    const Shell& sh = impl_->basis.shell(s);
+    Shell raw;
+    raw.l = sh.l;
+    raw.center = sh.center;
+    raw.exponents = sh.exponents;
+    raw.coefficients.resize(sh.coefficients.size());
+    for (std::size_t k = 0; k < sh.exponents.size(); ++k) {
+      Basis single({Shell{sh.l, {0.0, 0.0, 0.0}, {sh.exponents[k]}, {1.0}}});
+      raw.coefficients[k] = sh.coefficients[k] / single.shell(0).coefficients[0];
+    }
+    raw_template_shells.push_back(std::move(raw));
+  }
+
+  WorkflowOptions disp_opts = impl_->opts;
+  disp_opts.jk_mode = JKMode::Direct;
+  disp_opts.scf.backend = be;
+  disp_opts.scf.solver = DensitySolver::Diag;
+  disp_opts.scf.gemm_mode = GemmMode::FP64;
+  disp_opts.scf.conv_tol = std::min(disp_opts.scf.conv_tol, 1e-11);
+  disp_opts.scf.diis_tol = std::min(disp_opts.scf.diis_tol, 1e-8);
+  disp_opts.scf.dynamic_precision = false;
+  disp_opts.scf.incremental_fock = false;
+  disp_opts.grid.backend = be;
+  disp_opts.xc_options.backend = be;
+  disp_opts.xc_options.precision = Precision::FP64;
+
+  std::vector<double> fixed_coords;
+  std::vector<double> fixed_weights;
+  if (impl_->is_dft_flag && hess_opts.fixed_xc_grid) {
+    if (!impl_->ext_grid_weights.empty()) {
+      fixed_coords = impl_->ext_grid_coords;
+      fixed_weights = impl_->ext_grid_weights;
+    } else if (impl_->grid.npoints() > 0) {
+      fixed_coords = impl_->grid.coords();
+      fixed_weights = impl_->grid.weights();
+    }
+  }
+
+  const std::vector<double> eq_dm = impl_->last_scf->density_matrix;
+
+  auto grad_fn = [&](std::span<const Atom> disp_atoms) -> std::vector<double> {
+    std::vector<Shell> disp_shells = raw_template_shells;
+    for (std::size_t s = 0; s < disp_shells.size(); ++s) {
+      const int pa = shell_parent[s];
+      if (pa >= 0) {
+        const auto upa = static_cast<std::size_t>(pa);
+        for (int c = 0; c < 3; ++c) {
+          const double shift = disp_atoms[upa].center[c] - impl_->atoms[upa].center[c];
+          disp_shells[s].center[c] = raw_template_shells[s].center[c] + shift;
+        }
+      }
+    }
+    Basis disp_basis(std::move(disp_shells));
+    std::vector<Atom> at_vec(disp_atoms.begin(), disp_atoms.end());
+    MolecularScf mscf(std::move(disp_basis), std::move(at_vec), impl_->n_elec, disp_opts,
+                      std::nullopt, fixed_coords, fixed_weights);
+    const WorkflowResult wres = mscf.run(eq_dm);
+    if (!wres.scf.converged) {
+      throw std::runtime_error("MolecularScf::run_hessian: displaced SCF failed to converge");
+    }
+    return mscf.compute_gradient(wres.scf).total_grad;
+  };
+
+  return compute_nuclear_hessian(impl_->atoms, grad_fn, custom_masses_amu, hess_opts);
+}
+
+VibrationalResult MolecularScf::run_hessian() {
+  HessianOptions opts;
+  opts.backend = impl_->opts.scf.backend;
+  return run_hessian(opts);
 }
 
 WorkflowResult run_scf(const Basis& basis, std::span<const Atom> atoms, int n_elec,

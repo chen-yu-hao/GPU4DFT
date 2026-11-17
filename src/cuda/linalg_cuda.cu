@@ -1125,4 +1125,39 @@ void apply_level_shift_ao_device(GpuLinalgContext& ctx, int nao, double level_sh
   symmetrize_matrix_device(nao, d_F_inout, stream);
 }
 
+namespace {
+
+__global__ void permute_ri_chunk_pair_kernel(int bc, int nao, const double* __restrict__ src_a,
+                                             const double* __restrict__ src_b,
+                                             double* __restrict__ dst_a,
+                                             double* __restrict__ dst_b) {
+  const std::size_t total = static_cast<std::size_t>(bc) * nao * nao;
+  const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+  const std::size_t nao_u = static_cast<std::size_t>(nao);
+  const std::size_t nao2_u = nao_u * nao_u;
+
+  for (std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < total; idx += stride) {
+    const std::size_t pl = idx / nao2_u;
+    const std::size_t rem = idx - pl * nao2_u;
+    const std::size_t u = rem / nao_u;
+    const std::size_t s = rem - u * nao_u;
+    const std::size_t dst_idx = (u * static_cast<std::size_t>(bc) + pl) * nao_u + s;
+    dst_a[dst_idx] = src_a[idx];
+    dst_b[dst_idx] = src_b[idx];
+  }
+}
+
+}  // namespace
+
+void permute_ri_chunk_pair_device(int bc, int nao, const double* d_src_a, const double* d_src_b,
+                                  double* d_dst_a, double* d_dst_b, StreamHandle stream) {
+  const std::size_t total = static_cast<std::size_t>(bc) * nao * nao;
+  if (total == 0) return;
+  const int blocks = static_cast<int>(std::min<std::size_t>((total + 255) / 256, 4096));
+  permute_ri_chunk_pair_kernel<<<blocks, 256, 0, stream>>>(bc, nao, d_src_a, d_src_b, d_dst_a,
+                                                           d_dst_b);
+  check_cuda(cudaGetLastError(), "permute_ri_chunk_pair_kernel");
+}
+
 }  // namespace gpu4dft

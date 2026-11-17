@@ -1,6 +1,7 @@
 #pragma once
 
 #include <math.h>
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <memory>
@@ -20,6 +21,8 @@ struct SnkOptions {
   bool overlap_fitting = true;            // COSX overlap fitting Q = S_grid^+ * S_exact
   double pair_cutoff = 1e-13;             // Gaussian primitive-pair prefactor screening exp(-mu * R_AB^2)
   double lindep_tol = 1e-8;               // Pseudo-inverse threshold on S_grid eigenvalues
+  bool cache_ao_on_device = true;         // Cache compacted batch Phi and weighted w*Phi on GPU
+  std::size_t max_ao_cache_mb = 2048;     // Maximum GPU memory budget (MiB) for persistent AO cache
 };
 
 // Evaluates exact analytical 1e overlap matrix S_{uv} = \int chi_u(r) chi_v(r) dr
@@ -63,15 +66,30 @@ class SemiNumericalK {
   std::vector<double> s_exact_;  // [nao * nao]
   std::vector<double> q_fit_;    // [nao * nao] COSX overlap-fitting matrix Q
 
+  struct HostPairState;
+  std::unique_ptr<HostPairState> host_pairs_;
+
   struct CudaState;
   std::unique_ptr<CudaState> cuda_;
 };
 
 namespace snk_detail {
 
+GPU4DFT_HD inline double fast_inv_sqrt(double x) {
+#if defined(__CUDA_ARCH__)
+  return ::rsqrt(x);
+#else
+  return 1.0 / ::sqrt(x);
+#endif
+}
+
+GPU4DFT_HD constexpr double boys_asymp_threshold(int m_max) {
+  return (m_max == 0) ? 30.0 : (33.0 + 3.0 * static_cast<double>(m_max));
+}
+
 // Self-contained GPU4DFT_HD Boys function vector F_0(T) .. F_{m_max}(T) (0 <= m_max <= 16)
-// accurate to < 1e-15 across all T >= 0 (upward erf recurrence for large T; positive Kummer
-// series + exact downward recurrence for small/moderate T).
+// accurate to < 1e-14..1e-15 across all T >= 0. Uses zero-transcendental rsqrt(T) upward
+// recurrence in the asymptotic far field (avoids >85% of all exp/erf calls on GPU!).
 GPU4DFT_HD inline void boys_vec_hd(int m_max, double T, double* F) {
   constexpr double kSqrtPiOver2 = 0.88622692545275801365;  // sqrt(pi) / 2
   if (T <= 0.0) {
@@ -81,20 +99,33 @@ GPU4DFT_HD inline void boys_vec_hd(int m_max, double T, double* F) {
     return;
   }
 
-  const double limit = 30.0 + 2.0 * static_cast<double>(m_max);
+  // Zero-transcendental asymptotic fast path (erfc(sqrt(T)) == 0 and exp(-T) negligible)
+  if (T > boys_asymp_threshold(m_max)) {
+    const double inv_sqrt_t = fast_inv_sqrt(T);
+    F[0] = kSqrtPiOver2 * inv_sqrt_t;
+    if (m_max > 0) {
+      const double inv_2t = 0.5 * inv_sqrt_t * inv_sqrt_t;
+      for (int m = 0; m < m_max; ++m) {
+        F[m + 1] = static_cast<double>(2 * m + 1) * F[m] * inv_2t;
+      }
+    }
+    return;
+  }
+
+  const double limit = 26.0 + 2.0 * static_cast<double>(m_max);
   if (T > limit) {
-    const double sqrt_t = ::sqrt(T);
-    F[0] = kSqrtPiOver2 * ::erf(sqrt_t) / sqrt_t;
-    const double exp_mt = (T < 700.0) ? ::exp(-T) : 0.0;
-    const double inv_2t = 0.5 / T;
+    const double inv_sqrt_t = fast_inv_sqrt(T);
+    const double sqrt_t = T * inv_sqrt_t;
+    F[0] = kSqrtPiOver2 * ::erf(sqrt_t) * inv_sqrt_t;
+    const double exp_mt = ::exp(-T);
+    const double inv_2t = 0.5 * inv_sqrt_t * inv_sqrt_t;
     for (int m = 0; m < m_max; ++m) {
       F[m + 1] = (static_cast<double>(2 * m + 1) * F[m] - exp_mt) * inv_2t;
     }
     return;
   }
 
-  // Positive-term Kummer series for F_{m_max}(T):
-  //   F_M(T) = exp(-T) * sum_{k=0}^inf (2T)^k / ((2M+1)(2M+3)...(2M+2k+1))
+  // Positive-term Kummer series for F_{m_max}(T) + exact downward recurrence
   const double exp_mt = ::exp(-T);
   const double two_t = 2.0 * T;
   double denom = static_cast<double>(2 * m_max + 1);
@@ -108,14 +139,12 @@ GPU4DFT_HD inline void boys_vec_hd(int m_max, double T, double* F) {
   }
   F[m_max] = exp_mt * sum;
 
-  // Exact downward recurrence: F_{m-1}(T) = (2*T*F_m(T) + exp(-T)) / (2*m - 1)
   for (int m = m_max; m >= 1; --m) {
     F[m - 1] = (two_t * F[m] + exp_mt) / static_cast<double>(2 * m - 1);
   }
 }
 
 // 1D McMurchie-Davidson Hermite expansion coefficients E_t^{i, j} (0 <= i, j <= 4, 0 <= t <= i+j).
-// Stored in flat array `E[i][j][t]` with stride (5 * 9, 9, 1).
 GPU4DFT_HD inline void md_hermite_1d(int la, int lb, double pa, double pb, double inv_2p,
                                      double E[5][5][9]) {
   for (int i = 0; i <= la; ++i) {
@@ -148,77 +177,8 @@ GPU4DFT_HD inline void md_hermite_1d(int la, int lb, double pa, double pb, doubl
   }
 }
 
-// Auxiliary Hermite Coulomb integrals R^{(0)}_{t, u, v}(p, R_PC) for t + u + v <= L <= 8.
-// Indexed via R_idx(t, u, v).
-GPU4DFT_HD constexpr int r3_idx(int t, int u, int v) {
-  return (t * 10 + u) * 10 + v;
-}
-
-GPU4DFT_HD inline void md_hermite_coulomb(int L, double p,
-                                          double xpc, double ypc, double zpc,
-                                          double* R_out) {
-  double F[17];
-  const double rpc2 = xpc * xpc + ypc * ypc + zpc * zpc;
-  boys_vec_hd(L, p * rpc2, F);
-
-  // Two ping-pong workspaces of (L+1)^3 <= 9^3 = 729? Wait: 729 doubles is 5.8 KB on stack!
-  // Let's pack tetrahedral indices (t + u + v <= 8) into ONLY 165 doubles!!
-  // Tetrahedral index for t + u + v <= 8 has Binom(8 + 3, 3) = 165 entries (1.3 KB total)!
-  auto tet_offset = [](int deg_sum) -> int {
-    // Number of (t,u,v) with t+u+v < deg_sum is deg_sum*(deg_sum+1)*(deg_sum+2)/6
-    return deg_sum * (deg_sum + 1) * (deg_sum + 2) / 6;
-  };
-  auto tri_offset = [](int rem, int t) -> int {
-    // Within fixed s = t + u + v, t ranges 0..s, u ranges 0..s-t (size s - t + 1):
-    // sum_{k=0}^{t-1} (rem - k + 1) = t * (rem + 1) - t * (t - 1) / 2
-    return t * (rem + 1) - (t * (t - 1)) / 2;
-  };
-  auto idx_tet = [&](int t, int u, int v) -> int {
-    const int s = t + u + v;
-    return tet_offset(s) + tri_offset(s, t) + u;
-  };
-
-  double cur[165];
-  double nxt[165];
-
-  // Start at n = L: only (0,0,0) is needed, value = (-2*p)^L * F[L]
-  double m2p_pow = 1.0;
-  for (int k = 0; k < L; ++k) m2p_pow *= (-2.0 * p);
-  cur[0] = m2p_pow * F[L];
-
-  // Step n from L - 1 down to 0; at step n we populate t + u + v <= L - n
-  for (int n = L - 1; n >= 0; --n) {
-    double p_pow = 1.0;
-    for (int k = 0; k < n; ++k) p_pow *= (-2.0 * p);
-    nxt[0] = p_pow * F[n];
-
-    const int max_s = L - n;
-    for (int s = 1; s <= max_s; ++s) {
-      for (int t = 0; t <= s; ++t) {
-        for (int u = 0; u <= s - t; ++u) {
-          const int v = s - t - u;
-          double val = 0.0;
-          if (t > 0) {
-            val = xpc * cur[idx_tet(t - 1, u, v)];
-            if (t > 1) val += static_cast<double>(t - 1) * cur[idx_tet(t - 2, u, v)];
-          } else if (u > 0) {
-            val = ypc * cur[idx_tet(t, u - 1, v)];
-            if (u > 1) val += static_cast<double>(u - 1) * cur[idx_tet(t, u - 2, v)];
-          } else {
-            val = zpc * cur[idx_tet(t, u, v - 1)];
-            if (v > 1) val += static_cast<double>(v - 1) * cur[idx_tet(t, u, v - 2)];
-          }
-          nxt[idx_tet(t, u, v)] = val;
-        }
-      }
-    }
-
-    const int count = tet_offset(max_s + 1);
-    for (int k = 0; k < count; ++k) cur[k] = nxt[k];
-  }
-
-  const int total = tet_offset(L + 1);
-  for (int k = 0; k < total; ++k) R_out[k] = cur[k];
+GPU4DFT_HD constexpr int tet_count(int L) {
+  return (L + 1) * (L + 2) * (L + 3) / 6;
 }
 
 GPU4DFT_HD constexpr int tet_index(int t, int u, int v) {
@@ -226,6 +186,109 @@ GPU4DFT_HD constexpr int tet_index(int t, int u, int v) {
   const int base = s * (s + 1) * (s + 2) / 6;
   const int row = t * (s + 1) - (t * (t - 1)) / 2;
   return base + row + u;
+}
+
+// In-place Auxiliary Hermite Coulomb integrals R^{(0)}_{t, u, v}(p, R_PC) for t + u + v <= L <= 8
+// (eliminates the two 165-double ping-pong stack arrays!).
+GPU4DFT_HD inline void md_hermite_coulomb(int L, double p,
+                                          double xpc, double ypc, double zpc,
+                                          double* R_out) {
+  double F[17];
+  const double rpc2 = xpc * xpc + ypc * ypc + zpc * zpc;
+  boys_vec_hd(L, p * rpc2, F);
+
+  const double m2p = -2.0 * p;
+  double m2p_pow = 1.0;
+  for (int k = 0; k < L; ++k) m2p_pow *= m2p;
+  R_out[0] = m2p_pow * F[L];
+
+  for (int n = L - 1; n >= 0; --n) {
+    const int max_s = L - n;
+    for (int s = max_s; s >= 1; --s) {
+      for (int t = 0; t <= s; ++t) {
+        for (int u = 0; u <= s - t; ++u) {
+          const int v = s - t - u;
+          double val = 0.0;
+          if (t > 0) {
+            val = xpc * R_out[tet_index(t - 1, u, v)];
+            if (t > 1) val += static_cast<double>(t - 1) * R_out[tet_index(t - 2, u, v)];
+          } else if (u > 0) {
+            val = ypc * R_out[tet_index(t, u - 1, v)];
+            if (u > 1) val += static_cast<double>(u - 1) * R_out[tet_index(t, u - 2, v)];
+          } else {
+            val = zpc * R_out[tet_index(t, u, v - 1)];
+            if (v > 1) val += static_cast<double>(v - 1) * R_out[tet_index(t, u, v - 2)];
+          }
+          R_out[tet_index(t, u, v)] = val;
+        }
+      }
+    }
+    double p_pow = 1.0;
+    for (int k = 0; k < n; ++k) p_pow *= m2p;
+    R_out[0] = p_pow * F[n];
+  }
+}
+
+// Pure-register closed-form Hermite Coulomb evaluator for 0 <= L <= 4 (compile-time constant
+// subscripts keep R[] 100% in GPU registers with 0 bytes of local stack spill!).
+template <int L>
+GPU4DFT_HD inline void eval_hermite_coulomb_reg(const double* d,
+                                                double x, double y, double z,
+                                                double* R) {
+  R[tet_index(0, 0, 0)] = d[0];
+  if constexpr (L >= 1) {
+    const double d1 = d[1];
+    R[tet_index(1, 0, 0)] = x * d1;
+    R[tet_index(0, 1, 0)] = y * d1;
+    R[tet_index(0, 0, 1)] = z * d1;
+  }
+  if constexpr (L >= 2) {
+    const double d1 = d[1];
+    const double d2 = d[2];
+    const double xx = x * x, yy = y * y, zz = z * z;
+    R[tet_index(2, 0, 0)] = xx * d2 + d1;
+    R[tet_index(1, 1, 0)] = x * y * d2;
+    R[tet_index(1, 0, 1)] = x * z * d2;
+    R[tet_index(0, 2, 0)] = yy * d2 + d1;
+    R[tet_index(0, 1, 1)] = y * z * d2;
+    R[tet_index(0, 0, 2)] = zz * d2 + d1;
+  }
+  if constexpr (L >= 3) {
+    const double d2 = d[2];
+    const double d3 = d[3];
+    const double xx = x * x, yy = y * y, zz = z * z;
+    R[tet_index(3, 0, 0)] = x * (xx * d3 + 3.0 * d2);
+    R[tet_index(0, 3, 0)] = y * (yy * d3 + 3.0 * d2);
+    R[tet_index(0, 0, 3)] = z * (zz * d3 + 3.0 * d2);
+    R[tet_index(2, 1, 0)] = y * (xx * d3 + d2);
+    R[tet_index(2, 0, 1)] = z * (xx * d3 + d2);
+    R[tet_index(1, 2, 0)] = x * (yy * d3 + d2);
+    R[tet_index(0, 2, 1)] = z * (yy * d3 + d2);
+    R[tet_index(1, 0, 2)] = x * (zz * d3 + d2);
+    R[tet_index(0, 1, 2)] = y * (zz * d3 + d2);
+    R[tet_index(1, 1, 1)] = x * y * z * d3;
+  }
+  if constexpr (L >= 4) {
+    const double d2 = d[2];
+    const double d3 = d[3];
+    const double d4 = d[4];
+    const double xx = x * x, yy = y * y, zz = z * z;
+    R[tet_index(4, 0, 0)] = xx * (xx * d4 + 6.0 * d3) + 3.0 * d2;
+    R[tet_index(0, 4, 0)] = yy * (yy * d4 + 6.0 * d3) + 3.0 * d2;
+    R[tet_index(0, 0, 4)] = zz * (zz * d4 + 6.0 * d3) + 3.0 * d2;
+    R[tet_index(3, 1, 0)] = x * y * (xx * d4 + 3.0 * d3);
+    R[tet_index(3, 0, 1)] = x * z * (xx * d4 + 3.0 * d3);
+    R[tet_index(1, 3, 0)] = x * y * (yy * d4 + 3.0 * d3);
+    R[tet_index(0, 3, 1)] = y * z * (yy * d4 + 3.0 * d3);
+    R[tet_index(1, 0, 3)] = x * z * (zz * d4 + 3.0 * d3);
+    R[tet_index(0, 1, 3)] = y * z * (zz * d4 + 3.0 * d3);
+    R[tet_index(2, 2, 0)] = (xx * yy) * d4 + (xx + yy) * d3 + d2;
+    R[tet_index(2, 0, 2)] = (xx * zz) * d4 + (xx + zz) * d3 + d2;
+    R[tet_index(0, 2, 2)] = (yy * zz) * d4 + (yy + zz) * d3 + d2;
+    R[tet_index(2, 1, 1)] = y * z * (xx * d4 + d3);
+    R[tet_index(1, 2, 1)] = x * z * (yy * d4 + d3);
+    R[tet_index(1, 1, 2)] = x * y * (zz * d4 + d3);
+  }
 }
 
 struct SphCartTerm {
@@ -330,14 +393,43 @@ GPU4DFT_HD inline int sph_cart_terms(int l, SphCartTerm* out) {
   return 0;
 }
 
-// Evaluates spherical block V_{ma, mb}(r_g) = \int chi_{ia, ma}(r') chi_{ib, mb}(r') / |r' - r_g| dr'
-// into `v_sph[(2*la+1) * (2*lb+1)]` using Hermite J-engine intermediate D_{t,u,v}!
-// Notice: Building the contracted Hermite coefficients H_{ma, mb; t, u, v} -> or better yet:
-// summing `R_{t,u,v}` over primitives FIRST in Hermite basis? Wait: `R_{t,u,v}` depends on `p` and `P`
-// of each primitive pair! Summing `E_x * E_y * E_z * R_{t,u,v}` into Cartesian block `V_cart[ca, cb]`
-// or transforming `E` to spherical FIRST:
-// Let's check: for primitive pair (ka, kb), `V_sph[ma, mb]` via spherical-transformed 1D/3D Hermite
-// OR summing `(2*pi/p) * c_a * c_b * exp(-mu*R_AB^2) * R_{t,u,v}` with `E_x * E_y * E_z`:
+// Precomputed primitive-pair & shell-pair data for zero-redundant ESP evaluation (Host & CUDA).
+struct SnkPrimPair {
+  double px = 0.0;
+  double py = 0.0;
+  double pz = 0.0;
+  double p = 0.0;
+  double pre = 0.0;
+  int h_offset = -1;  // For L <= 4: offset into SnkPairTable::h_coeffs [nma * nmb * tet_count(L)]
+};
+
+struct SnkShellPair {
+  int ish_a = 0;
+  int ish_b = 0;          // Canonicalized so la >= lb (and ish_a >= ish_b when la == lb)
+  int la = 0;
+  int lb = 0;
+  int ao_a = 0;
+  int ao_b = 0;
+  int nma = 0;
+  int nmb = 0;
+  int prim_offset = 0;
+  int prim_count = 0;
+  int asymp_h_offset = -1;  // >= 0 for concentric pairs (rab2 < 1e-12) with L <= 4
+  double center[3] = {0.0, 0.0, 0.0};
+  double extent_radius = 0.0;
+  double p_min = 0.0;
+  double q_monopole = 0.0;  // Analytical monopole S_{ab} for s-s (Frobenius overlap norm for L > 0)
+  double v_max_near = 0.0;
+  double q_far_bound = 0.0;
+};
+
+struct SnkPairTable {
+  std::vector<SnkShellPair> pairs;
+  std::vector<SnkPrimPair> prims;
+  std::vector<double> h_coeffs;
+};
+
+// Standalone general evaluator (used for single-point `snk_esp_matrix` and diagonal bounds).
 GPU4DFT_HD inline void eval_shell_pair_esp(const detail::FlatBasisView& b,
                                            int ish_a, int ish_b,
                                            double gx, double gy, double gz,
@@ -393,20 +485,27 @@ GPU4DFT_HD inline void eval_shell_pair_esp(const detail::FlatBasisView& b,
       const double py = (alpha * ay + beta * by) * inv_p;
       const double pz = (alpha * az + beta * bz) * inv_p;
 
+      if (L == 0) {
+        const double xpc = px - gx, ypc = py - gy, zpc = pz - gz;
+        double f0 = 0.0;
+        boys_vec_hd(0, p * (xpc * xpc + ypc * ypc + zpc * zpc), &f0);
+        v_sph[0] += pre * ta[0].coeff * tb[0].coeff * f0;
+        continue;
+      }
+
       md_hermite_1d(la, lb, px - ax, px - bx, 0.5 * inv_p, Ex);
       md_hermite_1d(la, lb, py - ay, py - by, 0.5 * inv_p, Ey);
       md_hermite_1d(la, lb, pz - az, pz - bz, 0.5 * inv_p, Ez);
       md_hermite_coulomb(L, p, px - gx, py - gy, pz - gz, R_tet);
 
-      // Contract over sparse spherical monomials -> Hermite (t, u, v)!
-      // For L == 0 (ss), single multiply!
-      if (L == 0) {
-        v_sph[0] += pre * ta[0].coeff * tb[0].coeff * R_tet[0];
-        continue;
-      }
-
+#if defined(__CUDA_ARCH__)
+      #pragma unroll 1
+#endif
       for (int ia = 0; ia < nta; ++ia) {
         const SphCartTerm& sa = ta[ia];
+#if defined(__CUDA_ARCH__)
+        #pragma unroll 1
+#endif
         for (int ib = 0; ib < ntb; ++ib) {
           const SphCartTerm& sb = tb[ib];
           const int mx = sa.ix + sb.ix;

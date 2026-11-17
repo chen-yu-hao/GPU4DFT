@@ -446,3 +446,229 @@ def test_host_cuda_hip_codegen_cli(tmp_path):
     assert (tmp_path / "src/eri_ssss_cuda.cu").is_file()
     assert (tmp_path / "src/eri_ssss_hip.hip").is_file()
     assert (tmp_path / "src/eri_general_hip.hip").is_file()
+
+
+# ---------------------------------------------------------------------------
+# 7. Permanent Dipole Moment & End-to-End CIS / TDA / TDHF / TDDFT (Direct & RI)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("backend", BACKENDS)
+def test_dipole_moment_and_dipole_matrices_vs_pyscf(backend: str):
+    mol = _h2o_mol(basis="def2-svp")
+    mf_ref = dft.RKS(mol, xc="b3lyp")
+    mf_ref.grids.level = 3
+    mf_ref.grids.build()
+    mf_ref.conv_tol = 1e-12
+    mf_ref.kernel()
+    dip_debye_ref = mf_ref.dip_moment(unit="Debye", verbose=0)
+    dip_au_ref = mf_ref.dip_moment(unit="AU", verbose=0)
+
+    basis = gpu4dft.basis_from_pyscf(mol)
+    dip_mats = gpu4dft.dipole_matrices(basis, origin=(0.0, 0.0, 0.0), backend=backend)
+    with mol.with_common_orig((0.0, 0.0, 0.0)):
+        np.testing.assert_allclose(dip_mats, -mol.intor("int1e_r"), rtol=0.0, atol=1e-12)
+
+    mf = gpu4dft.RKS(
+        mol, xc="b3lyp", backend=backend, grids=mf_ref.grids, conv_tol=1e-11, diis_tol=1e-8
+    ).run()
+    np.testing.assert_allclose(mf.dipole_moment(unit="Debye"), dip_debye_ref, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(mf.dipole_moment(unit="AU"), dip_au_ref, rtol=0.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("with_df", [False, True])
+@pytest.mark.parametrize("resp_kind", ["tda", "tddft"])
+@pytest.mark.parametrize("xc_name", ["rhf", "pbe", "b3lyp"])
+def test_end_to_end_tda_and_tddft_direct_and_ri_vs_pyscf(
+    xc_name: str, resp_kind: str, with_df: bool
+):
+    from pyscf import tdscf
+
+    backend = "cuda" if gpu4dft.backend_available("cuda") else "host"
+    mol = gto.M(
+        atom="C 0.0 0.0 0.0; O 0.0 0.0 1.203; H 0.0 0.942 -0.587; H 0.0 -0.942 -0.587",
+        basis="def2-svp",
+        unit="Angstrom",
+        cart=False,
+        verbose=0,
+    )
+
+    if xc_name == "rhf":
+        mf_ref = scf.RHF(mol)
+        if with_df:
+            mf_ref = mf_ref.density_fit(auxbasis="def2-universal-jkfit")
+        mf_ref.conv_tol = 1e-12
+        mf_ref.conv_tol_grad = 1e-9
+        mf_ref.kernel()
+        mf = gpu4dft.RHF(mol, backend=backend, conv_tol=1e-11, diis_tol=1e-8)
+    else:
+        mf_ref = dft.RKS(mol, xc=xc_name)
+        mf_ref.grids.level = 3
+        mf_ref.grids.build()
+        if with_df:
+            mf_ref = mf_ref.density_fit(auxbasis="def2-universal-jkfit")
+        mf_ref.conv_tol = 1e-12
+        mf_ref.conv_tol_grad = 1e-9
+        mf_ref.kernel()
+        mf = gpu4dft.RKS(
+            mol, xc=xc_name, backend=backend, grids=mf_ref.grids, conv_tol=1e-11, diis_tol=1e-8
+        )
+
+    if with_df:
+        mf.density_fit(auxbasis="def2-universal-jkfit")
+    mf.run()
+    assert abs(mf.e_tot - mf_ref.e_tot) <= 1e-10
+
+    td_ref = tdscf.TDA(mf_ref) if resp_kind == "tda" else tdscf.TDDFT(mf_ref)
+    td_ref.nstates = 5
+    td_ref.conv_tol = 1e-10
+    td_ref.kernel()
+    f_ref = td_ref.oscillator_strength()
+
+    if xc_name == "rhf":
+        td = mf.CIS(nstates=5, conv_tol=1e-8) if resp_kind == "tda" else mf.TDHF(nstates=5, conv_tol=1e-8)
+    else:
+        td = mf.TDA(nstates=5, conv_tol=1e-8) if resp_kind == "tda" else mf.TDDFT(nstates=5, conv_tol=1e-8)
+    e_got, xy_got = td.kernel()
+
+    assert td.converged
+    assert len(xy_got) == 5
+    np.testing.assert_allclose(e_got, td_ref.e, rtol=0.0, atol=5e-7)
+    np.testing.assert_allclose(td.oscillator_strength(), f_ref, rtol=0.0, atol=5e-6)
+
+
+@pytest.mark.parametrize("with_df", [False, True])
+def test_end_to_end_tddft_ozaki_int8_and_sp2_scf(with_df: bool):
+    from pyscf import tdscf
+
+    backend = "cuda" if gpu4dft.backend_available("cuda") else "host"
+    mol = _h2o_mol(basis="def2-svp")
+
+    mf_ref = dft.RKS(mol, xc="b3lyp")
+    mf_ref.grids.level = 3
+    mf_ref.grids.build()
+    if with_df:
+        mf_ref = mf_ref.density_fit(auxbasis="def2-universal-jkfit")
+    mf_ref.conv_tol = 1e-12
+    mf_ref.kernel()
+    td_ref = tdscf.TDDFT(mf_ref)
+    td_ref.nstates = 4
+    td_ref.conv_tol = 1e-10
+    td_ref.kernel()
+
+    mf = gpu4dft.RKS(
+        mol,
+        xc="b3lyp",
+        backend=backend,
+        solver="sp2",
+        gemm_mode="ozaki_int8",
+        grids=mf_ref.grids,
+        conv_tol=1e-11,
+        diis_tol=1e-8,
+    )
+    if with_df:
+        mf.density_fit(auxbasis="def2-universal-jkfit")
+    mf.run()
+
+    td = mf.TDDFT(nstates=4, gemm_mode="ozaki_int8", conv_tol=1e-8).run()
+    assert td.converged
+    np.testing.assert_allclose(td.e, td_ref.e, rtol=0.0, atol=1e-6)
+    np.testing.assert_allclose(td.oscillator_strength(), td_ref.oscillator_strength(), rtol=0.0, atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# 8. End-to-End Molecular Nuclear Hessian & Harmonic Vibrational Frequencies
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", ["rhf", "b3lyp"])
+def test_end_to_end_hessian_and_frequencies_vs_pyscf(method: str):
+    from pyscf.hessian import thermo as pyscf_thermo
+
+    backend = "cuda" if gpu4dft.backend_available("cuda") else "host"
+    mol = _h2o_mol(basis="6-31g*")
+
+    if method == "rhf":
+        mf_ref = scf.RHF(mol)
+        mf_ref.conv_tol = 1e-12
+        mf_ref.conv_tol_grad = 1e-9
+        mf_ref.kernel()
+        h_ref = mf_ref.Hessian().kernel()
+        mf = gpu4dft.RHF(mol, backend=backend, conv_tol=1e-12, diis_tol=1e-9).run()
+    else:
+        mf_ref = dft.RKS(mol, xc=method)
+        mf_ref.grids.level = 4
+        mf_ref.grids.build()
+        mf_ref.conv_tol = 1e-12
+        mf_ref.conv_tol_grad = 1e-9
+        mf_ref.kernel()
+        hobj_ref = mf_ref.Hessian()
+        hobj_ref.grid_response = False
+        h_ref = hobj_ref.kernel()
+        mf = gpu4dft.RKS(
+            mol, xc=method, backend=backend, grids=mf_ref.grids, conv_tol=1e-12, diis_tol=1e-9
+        ).run()
+
+    harm_ref = pyscf_thermo.harmonic_analysis(mol, h_ref)
+    freqs_ref = np.asarray(np.real(harm_ref["freq_wavenumber"]), dtype=np.float64)
+
+    hess_drv = mf.Hessian()
+    h_got = hess_drv.kernel()
+    harm_got = hess_drv.harmonic_analysis()
+
+    assert h_got.shape == (mol.natm, mol.natm, 3, 3)
+    np.testing.assert_allclose(h_got, h_ref, rtol=0.0, atol=1e-5)
+    np.testing.assert_allclose(harm_got["freq_wavenumber"], freqs_ref, rtol=0.0, atol=0.5)
+    assert harm_got["zpe_hartree"] > 0.01
+
+
+# ---------------------------------------------------------------------------
+# 9. End-to-End Plane-Wave Kohn-Sham & ACE Hybrid DFT (`gpu4dft.pw`)
+# ---------------------------------------------------------------------------
+
+
+def test_end_to_end_pw_submodule_rks_krks_and_ace_pbe0():
+    from pyscf.pbc import gto as pbc_gto
+
+    backend = "cuda" if gpu4dft.pw.cuda_pw_available() else "host"
+    a_b = 5.43 * 1.8897259885789233
+    a_bohr = np.array(
+        [[0.0, 0.5 * a_b, 0.5 * a_b], [0.5 * a_b, 0.0, 0.5 * a_b], [0.5 * a_b, 0.5 * a_b, 0.0]],
+        dtype=np.float64,
+    )
+    coords_bohr = np.array(
+        [[0.0, 0.0, 0.0], [0.25 * a_b, 0.25 * a_b, 0.25 * a_b]], dtype=np.float64
+    )
+
+    pcell = pbc_gto.M(
+        a=a_bohr,
+        atom=[("Si", coords_bohr[0].tolist()), ("Si", coords_bohr[1].tolist())],
+        unit="B",
+        pseudo="gth-pbe",
+        verbose=0,
+    )
+    cell = gpu4dft.pw.cell_from_pyscf(pcell)
+    assert abs(cell.ewald_energy() - float(pcell.ewald())) < 1e-11
+
+    # Batched 3D FFT check via gpu4dft.pw.fft3d_batch
+    rng = np.random.default_rng(7)
+    arr = rng.standard_normal((3, 12, 12, 12)) + 1j * rng.standard_normal((3, 12, 12, 12))
+    fwd = gpu4dft.pw.fft3d_batch(arr, direction=-1, backend=backend)
+    np.testing.assert_allclose(fwd, np.fft.fftn(arr, axes=(1, 2, 3)), rtol=0.0, atol=1e-12)
+
+    # Gamma-point PBE0 ACE vs Uncompressed EXX via gpu4dft.pw.RKS
+    mf_ace = gpu4dft.pw.RKS(
+        cell, xc="pbe0", ecut_wfc=8.0, backend=backend, use_ace=True, conv_tol=1e-9
+    ).run()
+    mf_exx = gpu4dft.pw.RKS(
+        cell, xc="pbe0", ecut_wfc=8.0, backend=backend, use_ace=False, conv_tol=1e-9
+    ).run()
+    assert mf_ace.converged and mf_exx.converged
+    assert abs(mf_ace.e_tot - mf_exx.e_tot) < 1e-8
+    assert mf_ace.result.total_poisson_ffts * 4 < mf_exx.result.total_poisson_ffts
+
+    # 2x2x2 Monkhorst-Pack k-point PBE via gpu4dft.pw.KRKS
+    kmf = gpu4dft.pw.KRKS(cell, xc="pbe", ecut_wfc=8.0, kmesh=(2, 2, 2), backend=backend).run()
+    assert kmf.converged
+    assert len(kmf.mo_energy) == 8
+

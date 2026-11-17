@@ -1039,6 +1039,8 @@ void assemble_fock_and_traces_device(int, const double*, const double*, const do
                                      StreamHandle) {}
 void apply_level_shift_ao_device(GpuLinalgContext&, int, double, const double*, const double*,
                                  double*, GemmMode, StreamHandle) {}
+void permute_ri_chunk_pair_device(int, int, const double*, const double*, double*, double*,
+                                  StreamHandle) {}
 
 #endif
 

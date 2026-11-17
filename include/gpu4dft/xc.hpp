@@ -1,8 +1,10 @@
 #pragma once
 
 #include <math.h>
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <iterator>
 #include <memory>
 #include <span>
 #include <string>
@@ -34,7 +36,7 @@ struct GridOptions {
   PartitionScheme partition = PartitionScheme::Stratmann;
   bool becke_radii_adjust = true;
   double weight_cutoff = 1e-14;
-  int max_batch_points = 256;
+  int max_batch_points = 2048;
   double ao_cutoff = 1e-12;
   Backend backend = Backend::Cuda;  // GPU Becke/SSF weights when Cuda is available, else Host OpenMP
 };
@@ -63,7 +65,7 @@ class MolecularGrid {
   static MolecularGrid from_points(std::span<const double> coords_xyz,
                                    std::span<const double> weights,
                                    const Basis& basis,
-                                   int max_batch_points = 256,
+                                   int max_batch_points = 2048,
                                    double ao_cutoff = 1e-12);
 
   // Returns unit-sphere Lebedev quadrature (coords_xyz [n_ang * 3], weights [n_ang]
@@ -132,6 +134,8 @@ struct XcOptions {
   Backend backend = Backend::Cuda;
   Precision precision = Precision::FP64;  // FP64: cublasDgemm; FP32: Tensor Core cublasSgemm half-transforms + FP64 accum
   double rho_cutoff = 1e-15;
+  bool cache_ao_on_device = true;         // Cache compacted active-AO Phi across batches on GPU when within VRAM cap
+  std::size_t max_ao_cache_mb = 2048;     // Maximum GPU memory budget (MiB) for persistent active-AO Phi cache
 };
 
 struct XcResult {
@@ -165,6 +169,23 @@ class XcEngine {
   // (writes symmetric V_xc on GPU without host matrix transfers) and returns E_xc.
   double eval_vxc_device(const double* d_dm, double* d_vxc, void* cuda_stream = nullptr) const;
 
+  // Second-Derivative XC Linear Response (TDDFT / CPHF Hessian contraction f_xc[rho_0]):
+  // Precomputes and caches ground-state (rho_0, grad_rho_0, tau_0) and 1st+2nd XC functional
+  // derivatives across all grid points on Host or GPU.
+  void set_reference_density(const double* h_dm);
+  void set_reference_density(std::span<const double> h_dm);
+  void set_reference_density_device(const double* d_dm, void* cuda_stream = nullptr);
+  bool has_reference_density() const noexcept;
+
+  // Contracts a symmetric (or general real, automatically symmetrized via 0.5*(dD + dD^T))
+  // perturbation/transition density delta_D [nao x nao] with the cached ground-state f_xc[rho_0]
+  // kernel via batched GEMMs, returning [nao x nao] F_xc[delta_D] matching pyscf.dft.numint.nr_rks_fxc.
+  std::vector<double> eval_fxc(const double* h_delta_dm) const;
+  std::vector<double> eval_fxc(std::span<const double> h_delta_dm) const;
+  void eval_fxc(const double* h_delta_dm, double* h_fxc_out) const;
+  void eval_fxc_device(const double* d_delta_dm, double* d_fxc_out,
+                       void* cuda_stream = nullptr) const;
+
   // Analytical XC nuclear gradient AO-derivative term [natom * 3] matching PySCF rks.Gradients().
   std::vector<double> nuclear_grad(std::span<const XcAtom> atoms,
                                    std::span<const double> dm) const;
@@ -178,6 +199,9 @@ class XcEngine {
   int xc_func_id_ = 0;
   int xc_family_ = 0;  // 0=LDA, 1=GGA, 2=MGGA
   double exx_fraction_ = 0.0;
+
+  struct HostFxcState;
+  std::unique_ptr<HostFxcState> host_fxc_;
 
   struct CudaState;
   std::unique_ptr<CudaState> cuda_;
@@ -253,6 +277,100 @@ struct FlatBasisData {
     };
   }
 };
+
+struct SuperBatch {
+  std::size_t point_offset = 0;
+  std::size_t npoints = 0;
+  std::vector<int> active_shells;
+  std::vector<int> active_aos;
+};
+
+// Coalesces consecutive Morton-ordered SpatialBatches into high-occupancy GPU super-batches
+// up to `target_max_points` whenever points are contiguous and active-AO union remains tight.
+inline std::vector<SuperBatch> build_super_batches(
+    const MolecularGrid& grid,
+    const FlatBasisData& flat_b,
+    std::size_t target_max_points = 2048,
+    double max_work_expansion = 1.40) {
+  std::vector<SuperBatch> out;
+  const auto& src = grid.batches();
+  if (src.empty()) return out;
+
+  auto count_aos_for_shells = [&](const std::vector<int>& shells) -> std::size_t {
+    std::size_t n = 0;
+    for (int is : shells) {
+      n += static_cast<std::size_t>(2 * flat_b.shell_l[static_cast<std::size_t>(is)] + 1);
+    }
+    return n;
+  };
+
+  auto populate_aos = [&](SuperBatch& sb) {
+    sb.active_aos.clear();
+    for (int is : sb.active_shells) {
+      const int ao0 = flat_b.shell_ao_offset[static_cast<std::size_t>(is)];
+      const int nm = 2 * flat_b.shell_l[static_cast<std::size_t>(is)] + 1;
+      for (int m = 0; m < nm; ++m) sb.active_aos.push_back(ao0 + m);
+    }
+  };
+
+  SuperBatch cur;
+  double cur_leaf_work = 0.0;
+  bool has_cur = false;
+  std::vector<int> merged_shells;
+
+  for (const SpatialBatch& b : src) {
+    if (b.npoints == 0 || b.active_shells.empty()) continue;
+    const double leaf_work =
+        static_cast<double>(b.active_aos.size()) * static_cast<double>(b.npoints);
+
+    if (!has_cur) {
+      cur.point_offset = b.point_offset;
+      cur.npoints = b.npoints;
+      cur.active_shells = b.active_shells;
+      cur_leaf_work = leaf_work;
+      has_cur = true;
+      continue;
+    }
+
+    const bool contiguous = (b.point_offset == cur.point_offset + cur.npoints);
+    const std::size_t cand_ng = cur.npoints + b.npoints;
+    bool do_merge = false;
+    if (contiguous && cand_ng <= target_max_points) {
+      merged_shells.clear();
+      merged_shells.reserve(cur.active_shells.size() + b.active_shells.size());
+      std::set_union(cur.active_shells.begin(), cur.active_shells.end(),
+                     b.active_shells.begin(), b.active_shells.end(),
+                     std::back_inserter(merged_shells));
+      const std::size_t cand_na = count_aos_for_shells(merged_shells);
+      const double cand_work = static_cast<double>(cand_na) * static_cast<double>(cand_ng);
+      const double base_work = cur_leaf_work + leaf_work;
+      if (cand_work <= max_work_expansion * base_work ||
+          (cur.npoints < 256 && cand_ng <= 768 && cand_work <= 1.80 * base_work)) {
+        do_merge = true;
+      }
+    }
+
+    if (do_merge) {
+      cur.npoints = cand_ng;
+      cur.active_shells.swap(merged_shells);
+      cur_leaf_work += leaf_work;
+    } else {
+      populate_aos(cur);
+      out.push_back(std::move(cur));
+      cur = SuperBatch{};
+      cur.point_offset = b.point_offset;
+      cur.npoints = b.npoints;
+      cur.active_shells = b.active_shells;
+      cur_leaf_work = leaf_work;
+    }
+  }
+
+  if (has_cur) {
+    populate_aos(cur);
+    out.push_back(std::move(cur));
+  }
+  return out;
+}
 
 // Second-order forward-mode Jet over (x, y, z) for exact solid-harmonic derivatives (0 <= l <= 7).
 struct Jet3D2 {

@@ -8,16 +8,20 @@ from __future__ import annotations
 import numpy as np
 
 from . import _core
+from . import pw
 from ._core import (
     Atom,
     Backend,
     Basis,
+    DavidsonIterationLog,
     DensitySolver,
     DirectJKEngine,
+    ExcitedState,
     GemmBenchmarkResult,
     GemmMode,
     GradientResult,
     GridOptions,
+    HessianOptions,
     JKMode,
     JKOptions,
     MolecularGrid,
@@ -25,6 +29,9 @@ from ._core import (
     PartitionScheme,
     Precision,
     RIJKEngine,
+    ResponseMethod,
+    ResponseOptions,
+    ResponseResult,
     ScfIterationLog,
     ScfOptions,
     ScfResult,
@@ -32,16 +39,21 @@ from ._core import (
     Shell,
     SnkOptions,
     Sp2Options,
+    VibrationalResult,
     WorkflowOptions,
     WorkflowResult,
     XcEngine,
     XcOptions,
     XcResult,
+    analyze_hessian,
+    compute_molecular_hessian,
     kernel_names,
     nuclear_repulsion_energy,
     nuclear_repulsion_grad,
     run_grad,
+    run_linear_response,
     run_scf,
+    standard_atomic_mass_amu,
     xc_exact_exchange_fraction,
 )
 from .ase_calculator import GPU4DFTCalculator, SimpleAtoms
@@ -51,31 +63,47 @@ from .pyscf_interface import (
     basis_from_pyscf,
     minao_init_guess,
 )
-from .scf import GridsConfig, MoleculeSpec, NuclearGradients, RHF, RKS
+from .scf import (
+    GridsConfig,
+    LinearResponseSCF,
+    MoleculeSpec,
+    NuclearGradients,
+    NuclearHessian,
+    RHF,
+    RKS,
+)
 
 __all__ = [
     "Atom",
     "Backend",
     "Basis",
+    "DavidsonIterationLog",
     "DensitySolver",
     "DirectJKEngine",
+    "ExcitedState",
     "GPU4DFTCalculator",
     "GemmBenchmarkResult",
     "GemmMode",
     "GradientResult",
     "GridOptions",
     "GridsConfig",
+    "HessianOptions",
     "JKMode",
     "JKOptions",
+    "LinearResponseSCF",
     "MolecularGrid",
     "MolecularScf",
     "MoleculeSpec",
     "NuclearGradients",
+    "NuclearHessian",
     "PartitionScheme",
     "Precision",
     "RHF",
     "RIJKEngine",
     "RKS",
+    "ResponseMethod",
+    "ResponseOptions",
+    "ResponseResult",
     "ScfIterationLog",
     "ScfOptions",
     "ScfResult",
@@ -84,16 +112,20 @@ __all__ = [
     "SimpleAtoms",
     "SnkOptions",
     "Sp2Options",
+    "VibrationalResult",
     "WorkflowOptions",
     "WorkflowResult",
     "XcEngine",
     "XcOptions",
     "XcResult",
+    "analyze_hessian",
     "atoms_from_pyscf",
     "aux_basis_from_pyscf",
     "backend_available",
     "basis_from_pyscf",
     "benchmark_gemm",
+    "compute_molecular_hessian",
+    "dipole_matrices",
     "eri_tensor",
     "eval_ao_grid",
     "gemm",
@@ -101,13 +133,17 @@ __all__ = [
     "kernel_names",
     "kinetic_matrix",
     "minao_init_guess",
+    "molecular_dipole_moment",
     "nuclear_attraction_matrix",
     "nuclear_repulsion_energy",
     "nuclear_repulsion_grad",
     "one_electron_grad",
     "overlap_matrix",
+    "pw",
     "run_grad",
+    "run_linear_response",
     "run_scf",
+    "standard_atomic_mass_amu",
     "xc_exact_exchange_fraction",
 ]
 
@@ -159,6 +195,29 @@ def nuclear_attraction_matrix(
 ) -> np.ndarray:
     """Analytical 1e nuclear attraction matrix V_{uv}, shape (nao, nao)."""
     return _core.nuclear_attraction_matrix(basis, atoms, _as_enum(Backend, backend))
+
+
+def dipole_matrices(
+    basis: Basis,
+    origin: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+    backend: Backend | str = "host",
+) -> np.ndarray:
+    """AO electric dipole integral matrices -<u | r - O | v>, shape (3, nao, nao)."""
+    orig = (float(origin[0]), float(origin[1]), float(origin[2]))
+    return _core.dipole_matrices(basis, orig, _as_enum(Backend, backend))
+
+
+def molecular_dipole_moment(
+    basis: Basis,
+    atoms: list[Atom],
+    dm: np.ndarray,
+    origin: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+    backend: Backend | str = "host",
+) -> np.ndarray:
+    """Permanent molecular dipole moment in atomic units (e * Bohr), shape (3,)."""
+    dm_c = np.ascontiguousarray(dm, dtype=np.float64)
+    orig = (float(origin[0]), float(origin[1]), float(origin[2]))
+    return _core.molecular_dipole_moment(basis, atoms, dm_c, orig, _as_enum(Backend, backend))
 
 
 def one_electron_grad(

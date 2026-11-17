@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstddef>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -640,11 +641,13 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
   std::vector<std::size_t> order(npts);
   std::iota(order.begin(), order.end(), std::size_t{0});
 
-  std::vector<std::pair<std::size_t, std::size_t>> leaves;
-  build_octree_leaves(raw_coords, order, 0, npts,
-                      static_cast<std::size_t>(max_batch_points), leaves);
+  const std::size_t max_pts = static_cast<std::size_t>(max_batch_points);
+  const std::size_t fine_leaf = std::min<std::size_t>(max_pts, 256);
 
-  // Reorder coords & weights contiguously per spatial octree leaf
+  std::vector<std::pair<std::size_t, std::size_t>> leaves;
+  build_octree_leaves(raw_coords, order, 0, npts, fine_leaf, leaves);
+
+  // Reorder coords & weights contiguously per spatial octree leaf (Morton Z-order)
   for (std::size_t new_i = 0; new_i < npts; ++new_i) {
     const std::size_t old_i = order[new_i];
     coords_[3 * new_i + 0] = raw_coords[3 * old_i + 0];
@@ -654,7 +657,8 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
   }
 
   const std::vector<double> shell_radii = compute_shell_radii(basis, ao_cutoff);
-  batches_.reserve(leaves.size());
+  std::vector<SpatialBatch> fine_batches;
+  fine_batches.reserve(leaves.size());
 
   for (const auto& [beg, end] : leaves) {
     if (beg >= end) continue;
@@ -699,8 +703,86 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
       }
     }
 
-    batches_.push_back(std::move(batch));
+    fine_batches.push_back(std::move(batch));
   }
+
+  if (max_pts <= fine_leaf || fine_batches.size() <= 1) {
+    batches_ = std::move(fine_batches);
+    return;
+  }
+
+  // Coalesce adjacent Morton-ordered fine leaves up to `max_batch_points` when their
+  // bounding box stays localized and active-AO union remains tight (preserving sparse
+  // outer radial screening while creating high-occupancy 2048-pt core/valence batches!).
+  auto rebuild_aos = [&](SpatialBatch& sb) {
+    sb.active_aos.clear();
+    for (int is : sb.active_shells) {
+      const int ao0 = basis.ao_offset(static_cast<std::size_t>(is));
+      const int n_m = 2 * basis.shell(static_cast<std::size_t>(is)).l + 1;
+      for (int m = 0; m < n_m; ++m) {
+        sb.active_aos.push_back(ao0 + m);
+      }
+    }
+  };
+  auto count_shell_aos = [&](const std::vector<int>& shells) -> std::size_t {
+    std::size_t c = 0;
+    for (int is : shells) {
+      c += static_cast<std::size_t>(2 * basis.shell(static_cast<std::size_t>(is)).l + 1);
+    }
+    return c;
+  };
+
+  batches_.reserve(fine_batches.size());
+  SpatialBatch cur = std::move(fine_batches[0]);
+  double cur_leaf_work =
+      static_cast<double>(cur.active_aos.size()) * static_cast<double>(cur.npoints);
+  std::vector<int> union_shells;
+
+  for (std::size_t i = 1; i < fine_batches.size(); ++i) {
+    SpatialBatch& nxt = fine_batches[i];
+    const double nxt_work =
+        static_cast<double>(nxt.active_aos.size()) * static_cast<double>(nxt.npoints);
+    const std::size_t cand_ng = cur.npoints + nxt.npoints;
+
+    bool do_merge = false;
+    std::array<double, 3> cand_min{};
+    std::array<double, 3> cand_max{};
+    if (nxt.point_offset == cur.point_offset + cur.npoints && cand_ng <= max_pts) {
+      double max_ext = 0.0;
+      for (int d = 0; d < 3; ++d) {
+        cand_min[d] = std::min(cur.box_min[d], nxt.box_min[d]);
+        cand_max[d] = std::max(cur.box_max[d], nxt.box_max[d]);
+        max_ext = std::max(max_ext, cand_max[d] - cand_min[d]);
+      }
+      if (max_ext <= 6.5) {
+        union_shells.clear();
+        union_shells.reserve(cur.active_shells.size() + nxt.active_shells.size());
+        std::set_union(cur.active_shells.begin(), cur.active_shells.end(),
+                       nxt.active_shells.begin(), nxt.active_shells.end(),
+                       std::back_inserter(union_shells));
+        const std::size_t cand_na = count_shell_aos(union_shells);
+        const double cand_work = static_cast<double>(cand_na) * static_cast<double>(cand_ng);
+        if (cand_work <= 1.22 * (cur_leaf_work + nxt_work)) {
+          do_merge = true;
+        }
+      }
+    }
+
+    if (do_merge) {
+      cur.npoints = cand_ng;
+      cur.box_min = cand_min;
+      cur.box_max = cand_max;
+      cur.active_shells.swap(union_shells);
+      cur_leaf_work += nxt_work;
+    } else {
+      rebuild_aos(cur);
+      batches_.push_back(std::move(cur));
+      cur = std::move(nxt);
+      cur_leaf_work = nxt_work;
+    }
+  }
+  rebuild_aos(cur);
+  batches_.push_back(std::move(cur));
 }
 
 }  // namespace gpu4dft

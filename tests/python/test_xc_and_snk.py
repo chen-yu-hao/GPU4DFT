@@ -157,6 +157,27 @@ def _bind_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.gpu4dft_xc_c_eval_vxc.restype = ctypes.c_int
 
+    lib.gpu4dft_xc_c_eval_fxc.argtypes = [
+        ctypes.c_int,
+        _I32_P,
+        _F64_P,
+        _I32_P,
+        _F64_P,
+        _F64_P,
+        ctypes.c_int,
+        _F64_P,
+        _F64_P,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        _F64_P,
+        ctypes.c_int,
+        _F64_P,
+        _F64_P,
+    ]
+    lib.gpu4dft_xc_c_eval_fxc.restype = ctypes.c_int
+
     lib.gpu4dft_xc_c_nuclear_grad.argtypes = [
         ctypes.c_int,
         _I32_P,
@@ -701,3 +722,140 @@ def test_snk_esp_and_cosx_exchange_host_and_cuda():
             == 0
         )
         np.testing.assert_allclose(vk_32, vk_exact, rtol=0, atol=5e-5)
+
+
+@pytest.mark.parametrize("xc_name", ["lda", "svwn", "pbe", "b3lyp", "pbe0", "tpss"])
+def test_fxc_matches_pyscf_nr_rks_fxc_host_and_cuda(xc_name):
+    lib = _find_xc_shared_lib()
+    mol = gto.M(
+        atom="O 0.0 0.0 0.1173; H 0.0 0.7572 -0.4692; H 0.04 -0.7520 -0.4660",
+        basis="def2-svp",
+        verbose=0,
+    )
+    pyscf_xc = "svwn" if xc_name == "lda" else xc_name
+    mf = dft.RKS(mol, xc=pyscf_xc)
+    mf.grids.level = 2
+    mf.conv_tol = 1e-10
+    mf.kernel()
+    dm0 = np.ascontiguousarray(mf.make_rdm1(), dtype=np.float64)
+
+    nocc = mol.nelectron // 2
+    co = mf.mo_coeff[:, :nocc]
+    cv = mf.mo_coeff[:, nocc:]
+    rng = np.random.default_rng(20261117)
+
+    # Test 3 perturbations in one cached f_xc session:
+    #   0: symmetric MO transition density C_o X C_v^T + C_v X^T C_o^T
+    #   1: non-symmetric MO transition density C_o Y C_v^T (hermi=0 in PySCF)
+    #   2: general random symmetric AO density perturbation
+    x_ov = rng.standard_normal((co.shape[1], cv.shape[1])) * 0.1
+    y_ov = rng.standard_normal((co.shape[1], cv.shape[1])) * 0.1
+    z_ao = rng.standard_normal((mol.nao, mol.nao)) * 0.05
+    ddm_0 = co @ x_ov @ cv.T + cv @ x_ov.T @ co.T
+    ddm_1 = co @ y_ov @ cv.T
+    ddm_2 = 0.5 * (z_ao + z_ao.T)
+    delta_dms = np.ascontiguousarray(np.stack([ddm_0, ddm_1, ddm_2], axis=0), dtype=np.float64)
+
+    fxc_ref = np.asarray(
+        mf._numint.nr_rks_fxc(mol, mf.grids, pyscf_xc, dm0, delta_dms, hermi=0),
+        dtype=np.float64,
+    )
+
+    b_args = _pack_mol_basis(mol)
+    g_coords = np.ascontiguousarray(mf.grids.coords, dtype=np.float64).ravel()
+    g_weights = np.ascontiguousarray(mf.grids.weights, dtype=np.float64)
+    npts = len(g_weights)
+
+    backends = [0] + ([1] if lib.gpu4dft_xc_c_cuda_available() else [])
+    for bk in backends:
+        fxc_out = np.zeros_like(delta_dms)
+        rc = lib.gpu4dft_xc_c_eval_fxc(
+            *b_args, npts, g_coords, g_weights, xc_name.encode(),
+            bk, 0, 0, dm0.ravel(), len(delta_dms), delta_dms.ravel(), fxc_out.ravel(),
+        )
+        assert rc == 0
+        np.testing.assert_allclose(fxc_out, np.swapaxes(fxc_out, 1, 2), rtol=0, atol=1e-14)
+        np.testing.assert_allclose(fxc_out, fxc_ref, rtol=1e-10, atol=1e-11)
+
+    if lib.gpu4dft_xc_c_cuda_available():
+        # Verify GPU device-pointer API (`set_reference_density_device` + `eval_fxc_device`)
+        fxc_dev = np.zeros_like(delta_dms)
+        rc_dev = lib.gpu4dft_xc_c_eval_fxc(
+            *b_args, npts, g_coords, g_weights, xc_name.encode(),
+            1, 0, 1, dm0.ravel(), len(delta_dms), delta_dms.ravel(), fxc_dev.ravel(),
+        )
+        assert rc_dev == 0
+        np.testing.assert_allclose(fxc_dev, fxc_ref, rtol=1e-10, atol=1e-11)
+
+
+def test_multistream_superbatch_xc_and_snk_water_cluster():
+    lib = _find_xc_shared_lib()
+    if not lib.gpu4dft_xc_c_cuda_available():
+        pytest.skip("CUDA device required")
+
+    # 4-water cluster (>25,000 grid points -> exercises multi-stream 2048-pt super-batches & ESP chunks)
+    mol = gto.M(
+        atom=(
+            "O 0.0 0.0 0.0; H 0.0 0.757 0.586; H 0.0 -0.757 0.586; "
+            "O 2.9 0.1 0.2; H 2.9 0.857 0.786; H 2.9 -0.657 0.786; "
+            "O 0.1 2.9 -0.1; H 0.1 3.657 0.486; H 0.1 2.143 0.486; "
+            "O 3.0 3.0 0.1; H 3.0 3.757 0.686; H 3.0 2.243 0.686"
+        ),
+        basis="def2-svp",
+        verbose=0,
+    )
+    mf = dft.RKS(mol, xc="b3lyp")
+    mf.grids.level = 2
+    mf.grids.build()
+    dm = np.ascontiguousarray(mf.get_init_guess(), dtype=np.float64)
+
+    nelec_ref, exc_ref, vxc_ref = mf._numint.nr_rks(mol, mf.grids, "b3lyp", dm)
+    rng = np.random.default_rng(99)
+    ddm = rng.standard_normal((mol.nao, mol.nao)) * 0.05
+    ddm = np.ascontiguousarray(0.5 * (ddm + ddm.T), dtype=np.float64)
+    fxc_ref = mf._numint.nr_rks_fxc(mol, mf.grids, "b3lyp", dm, ddm)
+
+    b_args = _pack_mol_basis(mol)
+    g_coords = np.ascontiguousarray(mf.grids.coords, dtype=np.float64).ravel()
+    g_weights = np.ascontiguousarray(mf.grids.weights, dtype=np.float64)
+    npts = len(g_weights)
+    assert npts > 15000
+
+    exc_d = ctypes.c_double(0.0)
+    nelec_d = ctypes.c_double(0.0)
+    vxc_d = np.zeros((mol.nao, mol.nao), dtype=np.float64)
+    assert (
+        lib.gpu4dft_xc_c_eval_vxc(
+            *b_args, npts, g_coords, g_weights, b"b3lyp",
+            1, 0, 1, dm.ravel(), ctypes.byref(exc_d), ctypes.byref(nelec_d), vxc_d.ravel(),
+        )
+        == 0
+    )
+    np.testing.assert_allclose(exc_d.value, exc_ref, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(vxc_d, vxc_ref, rtol=1e-12, atol=1e-12)
+
+    fxc_d = np.zeros((mol.nao, mol.nao), dtype=np.float64)
+    assert (
+        lib.gpu4dft_xc_c_eval_fxc(
+            *b_args, npts, g_coords, g_weights, b"b3lyp",
+            1, 0, 1, dm.ravel(), 1, ddm.ravel(), fxc_d.ravel(),
+        )
+        == 0
+    )
+    np.testing.assert_allclose(fxc_d, fxc_ref, rtol=1e-10, atol=1e-11)
+
+    vk_h = np.zeros((mol.nao, mol.nao), dtype=np.float64)
+    vk_d = np.zeros((mol.nao, mol.nao), dtype=np.float64)
+    assert (
+        lib.gpu4dft_xc_c_snk_compute_k(
+            *b_args, npts, g_coords, g_weights, 0, 0, 1, 0, dm.ravel(), vk_h.ravel()
+        )
+        == 0
+    )
+    assert (
+        lib.gpu4dft_xc_c_snk_compute_k(
+            *b_args, npts, g_coords, g_weights, 1, 0, 1, 1, dm.ravel(), vk_d.ravel()
+        )
+        == 0
+    )
+    np.testing.assert_allclose(vk_d, vk_h, rtol=0, atol=1e-12)

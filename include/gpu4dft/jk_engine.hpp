@@ -24,6 +24,7 @@ struct JKOptions {
   bool compute_j = true;
   bool compute_k = true;
   double k_scale = 1.0;
+  bool symmetrize_dm = true;
 };
 
 namespace detail {
@@ -32,10 +33,11 @@ struct RIJKCudaCache;
 }  // namespace detail
 
 // Direct on-the-fly Coulomb (J) and Exchange (K) engine without O(nao^4) ERI storage.
-// Prebuilds and caches SoA shell pairs + Schwarz upper bounds on Host and GPU,
-// supports Hermite J-engine contraction, Schwarz + density-weighted screening,
-// incremental Fock updates, GPU atomic dynamic work-queue load balancing, and
-// dynamic per-quartet FP64/FP32 mixed precision (Precision::Mixed).
+// Prebuilds and caches SoA shell pairs + Schwarz-sorted 2D tiles + Spherical<->Cartesian
+// transforms on Host and GPU, supports Hermite J-engine contraction, Schwarz +
+// density-weighted screening, incremental Fock updates, persistent GPU atomic work-stealing
+// with thread-private J_ab tile accumulation, dynamic per-quartet FP64/FP32 mixed precision,
+// and both symmetric SCF densities and non-symmetric TDDFT transition densities.
 class DirectJKEngine {
  public:
   explicit DirectJKEngine(const Basis& basis, double prim_cutoff = 1e-14);
@@ -51,9 +53,15 @@ class DirectJKEngine {
   const std::vector<ShellPairData>& shell_pair_lists() const { return pair_lists_; }
 
   // Evaluates J and/or K (scaled by `opts.k_scale`) into row-major [nao x nao]
-  // buffers `vj_out` and `vk_out` (either pointer may be nullptr when disabled).
+  // host buffers `vj_out` and `vk_out` (either pointer may be nullptr when disabled).
   void compute_jk(const double* dm, double* vj_out, double* vk_out,
                   const JKOptions& opts = {}) const;
+
+  // Device-resident Direct J/K contraction on CUDA device pointers [nao x nao]
+  // (`d_vj` and/or `d_vk` may be nullptr when disabled). Runs 100% on GPU with
+  // persistent pre-allocated buffers and zero per-call cudaMalloc.
+  void compute_jk_device(const double* d_dm, double* d_vj, double* d_vk,
+                         const JKOptions& opts = {}, void* stream = nullptr) const;
 
   // Incremental Fock helper: evaluates Delta J(dm_new - dm_old) and
   // Delta K(dm_new - dm_old) using density-weighted Schwarz screening and
@@ -70,8 +78,9 @@ class DirectJKEngine {
 };
 
 // Resolution-of-the-Identity (Density Fitting) J/K engine using 3-center (ab|P)
-// and 2-center (P|Q) Coulomb integrals, Cholesky / symmetric inverse metric
-// factorization B_{P, ab} = L^{-1} (ab|P), and dense cuBLAS / OpenMP GEMMs.
+// and 2-center (P|Q) Coulomb integrals, GPU cusolverDnDpotrf + cublasDtrsm (with
+// cusolverDnDsyevd inverse-sqrt fallback) metric factorization B_{P, ab} = L^{-1} (ab|P),
+// and device-resident cuBLAS / OpenMP contractions.
 class RIJKEngine {
  public:
   RIJKEngine(const Basis& basis, const Basis& aux_basis, Backend backend = Backend::Cuda);
@@ -84,16 +93,27 @@ class RIJKEngine {
 
   int nao() const { return basis_.nao(); }
   int naux() const { return aux_basis_.nao(); }
-  const std::vector<double>& b_tensor() const { return b_tensor_; }
+
+  bool has_device_b() const noexcept;
+  const double* device_b_ptr() const noexcept;
+
+  // Returns host [naux * nao * nao] B tensor (lazily downloaded from GPU if
+  // constructed on Backend::Cuda).
+  const std::vector<double>& b_tensor() const;
 
   void compute_jk(const double* dm, double* vj_out, double* vk_out,
                   const JKOptions& opts = {}) const;
 
+  // Device-resident RI-J and chunked RI-K contraction on CUDA device pointers [nao x nao]
+  // directly from GPU-resident `d_B` without needing a duplicate full `d_B_perm` buffer.
+  void compute_jk_device(const double* d_dm, double* d_vj, double* d_vk,
+                         const JKOptions& opts = {}, void* stream = nullptr) const;
+
  private:
   Basis basis_;
   Basis aux_basis_;
-  std::vector<double> b_tensor_;       // [naux * nao * nao]
-  std::vector<double> b_perm_tensor_;  // [nao * naux * nao] for 2-GEMM RI-K
+  mutable std::vector<double> b_tensor_;       // [naux * nao * nao], lazy on CUDA
+  mutable std::vector<double> b_perm_tensor_;  // [nao * naux * nao], lazy for Host RI-K only
   mutable detail::RIJKCudaCache* cuda_cache_ = nullptr;
 };
 
@@ -122,6 +142,17 @@ struct JKTaskTile {
   int Q_end;    // end ket pair index (exclusive)
 };
 
+// Prebuilt GPU 2D tile (bra pair P, Schwarz-sorted ket slice Q_begin..Q_end)
+// sorted in descending `max_schwarz = Q_ab * Q_cd[Q_begin]` order.
+struct GpuJKTile {
+  int bp;
+  int P;
+  int kp;
+  int Q_begin;
+  int Q_end;
+  double max_schwarz;
+};
+
 struct GradQuartetTask {
   int bp;
   int P;
@@ -130,9 +161,9 @@ struct GradQuartetTask {
   double w_sym;
 };
 
-template <typename R>
-GPU4DFT_HD inline void jk_hermite_1d(int max_a, int max_b, R inv_2p, R PA, R PB,
-                                     R E[5][5][9], bool negate_odd) {
+template <int Dim, int Deg, typename R>
+GPU4DFT_HD inline void jk_hermite_1d_tiered(int max_a, int max_b, R inv_2p, R PA, R PB,
+                                            R E[Dim][Dim][Deg], bool negate_odd) {
   const int max_t = max_a + max_b;
   for (int i = 0; i <= max_a; ++i)
     for (int j = 0; j <= max_b; ++j)
@@ -164,32 +195,49 @@ GPU4DFT_HD inline void jk_hermite_1d(int max_a, int max_b, R inv_2p, R PA, R PB,
   }
 }
 
-// Hermite J-engine path for pure Coulomb (J only) when L = la+lb+lc+ld <= 4.
-// Contracts D_cart -> Hermite density -> R_{t+tp,u+up,v+vp} -> Hermite potential -> J_cart
-// without forming 4-center Cartesian integrals.
-template <typename R, typename AccumFn>
-GPU4DFT_HD inline void eval_hermite_j_quartet(
+template <typename R>
+GPU4DFT_HD inline void jk_hermite_1d(int max_a, int max_b, R inv_2p, R PA, R PB,
+                                     R E[5][5][9], bool negate_odd) {
+  jk_hermite_1d_tiered<5, 9, R>(max_a, max_b, inv_2p, PA, PB, E, negate_odd);
+}
+
+// Tier-specialized Hermite J-engine path for pure Coulomb (J only) when L = la+lb+lc+ld <= 4.
+template <int MaxL, typename R, bool SymmetrizeDM, typename AccumJBraFn, typename AccumJKetFn>
+GPU4DFT_HD inline void eval_hermite_j_quartet_tiered(
     int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
-    int ik, bool same_PQ, double w_J, const double* D_cart, int ncart_tot, int off_a, int off_b,
-    int off_c, int off_d, AccumFn accum_j) {
-  const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
+    int ik, bool same_PQ, double w_J, const double* __restrict__ D_cart, int ncart_tot, int off_a,
+    int off_b, int off_c, int off_d, AccumJBraFn accum_j_bra, AccumJKetFn accum_j_ket) {
+  constexpr int kMaxCart = (MaxL + 1) * (MaxL + 2) / 2;
+  constexpr int kMaxCart2 = kMaxCart * kMaxCart;
+  constexpr int kDim = MaxL + 1;
+  constexpr int kPairDeg = (2 * MaxL < 4 ? 2 * MaxL : 4) + 1;
+
+  if (la < 0 || la > MaxL || lb < 0 || lb > MaxL || lc < 0 || lc > MaxL || ld < 0 || ld > MaxL) {
+    return;
+  }
   const int lab = la + lb;
   const int lcd = lc + ld;
   const int L = lab + lcd;
+  if (L > 4 || lab >= kPairDeg || lcd >= kPairDeg) return;
+  const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
 
-  CartTriple ta[15], tb[15], tc[15], td[15];
+  CartTriple ta[kMaxCart], tb[kMaxCart], tc[kMaxCart], td[kMaxCart];
   for (int ia = 0; ia < nca; ++ia) ta[ia] = cart_triple(la, ia);
   for (int ib_c = 0; ib_c < ncb; ++ib_c) tb[ib_c] = cart_triple(lb, ib_c);
   for (int ic = 0; ic < ncc; ++ic) tc[ic] = cart_triple(lc, ic);
   for (int id = 0; id < ncd; ++id) td[id] = cart_triple(ld, id);
 
-  double j_ab[225] = {0.0};
-  double j_cd[225] = {0.0};
+  double j_ab[kMaxCart2] = {0.0};
+  double j_cd[kMaxCart2] = {0.0};
 
-  const R Ax = static_cast<R>(bra.Ax[ib]), Ay = static_cast<R>(bra.Ay[ib]), Az = static_cast<R>(bra.Az[ib]);
-  const R Bx = static_cast<R>(bra.Bx[ib]), By = static_cast<R>(bra.By[ib]), Bz = static_cast<R>(bra.Bz[ib]);
-  const R Cx = static_cast<R>(ket.Ax[ik]), Cy = static_cast<R>(ket.Ay[ik]), Cz = static_cast<R>(ket.Az[ik]);
-  const R Dx = static_cast<R>(ket.Bx[ik]), Dy = static_cast<R>(ket.By[ik]), Dz = static_cast<R>(ket.Bz[ik]);
+  const R Ax = static_cast<R>(bra.Ax[ib]), Ay = static_cast<R>(bra.Ay[ib]),
+          Az = static_cast<R>(bra.Az[ib]);
+  const R Bx = static_cast<R>(bra.Bx[ib]), By = static_cast<R>(bra.By[ib]),
+          Bz = static_cast<R>(bra.Bz[ib]);
+  const R Cx = static_cast<R>(ket.Ax[ik]), Cy = static_cast<R>(ket.Ay[ik]),
+          Cz = static_cast<R>(ket.Az[ik]);
+  const R Dx = static_cast<R>(ket.Bx[ik]), Dy = static_cast<R>(ket.By[ik]),
+          Dz = static_cast<R>(ket.Bz[ik]);
 
   const int bra_begin = bra.prim_offset[ib], bra_end = bra.prim_offset[ib + 1];
   const int ket_begin = ket.prim_offset[ik], ket_end = ket.prim_offset[ik + 1];
@@ -202,13 +250,13 @@ GPU4DFT_HD inline void eval_hermite_j_quartet(
     const R Cab = static_cast<R>(bra.prefactor[ip]);
     const R inv_2p = R(0.5) / p;
 
-    R Ex_ab[5][5][9], Ey_ab[5][5][9], Ez_ab[5][5][9];
-    jk_hermite_1d<R>(la, lb, inv_2p, Px - Ax, Px - Bx, Ex_ab, false);
-    jk_hermite_1d<R>(la, lb, inv_2p, Py - Ay, Py - By, Ey_ab, false);
-    jk_hermite_1d<R>(la, lb, inv_2p, Pz - Az, Pz - Bz, Ez_ab, false);
+    R Ex_ab[kDim][kDim][kPairDeg], Ey_ab[kDim][kDim][kPairDeg], Ez_ab[kDim][kDim][kPairDeg];
+    jk_hermite_1d_tiered<kDim, kPairDeg, R>(la, lb, inv_2p, Px - Ax, Px - Bx, Ex_ab, false);
+    jk_hermite_1d_tiered<kDim, kPairDeg, R>(la, lb, inv_2p, Py - Ay, Py - By, Ey_ab, false);
+    jk_hermite_1d_tiered<kDim, kPairDeg, R>(la, lb, inv_2p, Pz - Az, Pz - Bz, Ez_ab, false);
 
-    R D_bra_h[5][5][5];
-    R V_bra_h[5][5][5];
+    R D_bra_h[kPairDeg][kPairDeg][kPairDeg];
+    R V_bra_h[kPairDeg][kPairDeg][kPairDeg];
     for (int t = 0; t <= lab; ++t)
       for (int u = 0; u <= lab - t; ++u)
         for (int v = 0; v <= lab - t - u; ++v) {
@@ -218,8 +266,14 @@ GPU4DFT_HD inline void eval_hermite_j_quartet(
 
     if (!same_PQ) {
       for (int ia = 0; ia < nca; ++ia) {
+        const int ra = off_a + ia;
         for (int ib_c = 0; ib_c < ncb; ++ib_c) {
-          const R dab = static_cast<R>(D_cart[(off_a + ia) * ncart_tot + (off_b + ib_c)]);
+          const int rb = off_b + ib_c;
+          const double d_ab_val =
+              SymmetrizeDM
+                  ? D_cart[ra * ncart_tot + rb]
+                  : 0.5 * (D_cart[ra * ncart_tot + rb] + D_cart[rb * ncart_tot + ra]);
+          const R dab = static_cast<R>(d_ab_val);
           for (int t = 0; t <= ta[ia].lx + tb[ib_c].lx; ++t) {
             const R ex = dab * Ex_ab[ta[ia].lx][tb[ib_c].lx][t];
             for (int u = 0; u <= ta[ia].ly + tb[ib_c].ly; ++u) {
@@ -241,19 +295,25 @@ GPU4DFT_HD inline void eval_hermite_j_quartet(
       const R Ccd = static_cast<R>(ket.prefactor[kp]);
       const R inv_2q = R(0.5) / q;
 
-      R Ex_cd[5][5][9], Ey_cd[5][5][9], Ez_cd[5][5][9];
-      jk_hermite_1d<R>(lc, ld, inv_2q, Qx - Cx, Qx - Dx, Ex_cd, true);
-      jk_hermite_1d<R>(lc, ld, inv_2q, Qy - Cy, Qy - Dy, Ey_cd, true);
-      jk_hermite_1d<R>(lc, ld, inv_2q, Qz - Cz, Qz - Dz, Ez_cd, true);
+      R Ex_cd[kDim][kDim][kPairDeg], Ey_cd[kDim][kDim][kPairDeg], Ez_cd[kDim][kDim][kPairDeg];
+      jk_hermite_1d_tiered<kDim, kPairDeg, R>(lc, ld, inv_2q, Qx - Cx, Qx - Dx, Ex_cd, true);
+      jk_hermite_1d_tiered<kDim, kPairDeg, R>(lc, ld, inv_2q, Qy - Cy, Qy - Dy, Ey_cd, true);
+      jk_hermite_1d_tiered<kDim, kPairDeg, R>(lc, ld, inv_2q, Qz - Cz, Qz - Dz, Ez_cd, true);
 
-      R D_ket_h[5][5][5];
+      R D_ket_h[kPairDeg][kPairDeg][kPairDeg];
       for (int tp = 0; tp <= lcd; ++tp)
         for (int up = 0; up <= lcd - tp; ++up)
           for (int vp = 0; vp <= lcd - tp - up; ++vp) D_ket_h[tp][up][vp] = R(0);
 
       for (int ic = 0; ic < ncc; ++ic) {
+        const int rc = off_c + ic;
         for (int id = 0; id < ncd; ++id) {
-          const R dcd = static_cast<R>(D_cart[(off_c + ic) * ncart_tot + (off_d + id)]);
+          const int rd = off_d + id;
+          const double d_cd_val =
+              SymmetrizeDM
+                  ? D_cart[rc * ncart_tot + rd]
+                  : 0.5 * (D_cart[rc * ncart_tot + rd] + D_cart[rd * ncart_tot + rc]);
+          const R dcd = static_cast<R>(d_cd_val);
           for (int tp = 0; tp <= tc[ic].lx + td[id].lx; ++tp) {
             const R ex = dcd * Ex_cd[tc[ic].lx][td[id].lx][tp];
             for (int up = 0; up <= tc[ic].ly + td[id].ly; ++up) {
@@ -311,7 +371,7 @@ GPU4DFT_HD inline void eval_hermite_j_quartet(
             }
       }
 
-      R V_ket_h[5][5][5];
+      R V_ket_h[kPairDeg][kPairDeg][kPairDeg];
       if (!same_PQ) {
         for (int tp = 0; tp <= lcd; ++tp)
           for (int up = 0; up <= lcd - tp; ++up)
@@ -377,24 +437,41 @@ GPU4DFT_HD inline void eval_hermite_j_quartet(
 
   for (int ia = 0; ia < nca; ++ia) {
     for (int ib_c = 0; ib_c < ncb; ++ib_c) {
-      accum_j(off_a + ia, off_b + ib_c, w_J * j_ab[ia * ncb + ib_c]);
+      accum_j_bra(ia, ib_c, w_J * j_ab[ia * ncb + ib_c]);
     }
   }
   if (!same_PQ) {
     for (int ic = 0; ic < ncc; ++ic) {
       for (int id = 0; id < ncd; ++id) {
-        accum_j(off_c + ic, off_d + id, w_J * j_cd[ic * ncd + id]);
+        accum_j_ket(off_c + ic, off_d + id, w_J * j_cd[ic * ncd + id]);
       }
     }
   }
 }
 
-template <typename R>
-GPU4DFT_HD inline void jk_rys_1d(int la, int lb, int lc, int ld, R C00, R D00, R B10, R B01,
-                                 R B00, R AB, R CD, R I[5][5][5][5]) {
+template <typename R, typename AccumFn>
+GPU4DFT_HD inline void eval_hermite_j_quartet(
+    int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
+    int ik, bool same_PQ, double w_J, const double* D_cart, int ncart_tot, int off_a, int off_b,
+    int off_c, int off_d, AccumFn accum_j) {
+  auto accum_bra = [&](int ia, int ib_c, double val) { accum_j(off_a + ia, off_b + ib_c, val); };
+  eval_hermite_j_quartet_tiered<4, R, true>(la, lb, lc, ld, bra, ib, ket, ik, same_PQ, w_J, D_cart,
+                                            ncart_tot, off_a, off_b, off_c, off_d, accum_bra,
+                                            accum_j);
+}
+
+template <int MaxL, typename R>
+GPU4DFT_HD inline void jk_rys_1d_tiered(int la, int lb, int lc, int ld, R C00, R D00, R B10, R B01,
+                                        R B00, R AB, R CD,
+                                        R I[MaxL + 1][MaxL + 1][MaxL + 1][MaxL + 1]) {
+  constexpr int kDim = MaxL + 1;
+  constexpr int kDeg = 2 * MaxL + 1;
+  if (la < 0 || la > MaxL || lb < 0 || lb > MaxL || lc < 0 || lc > MaxL || ld < 0 || ld > MaxL) {
+    return;
+  }
   const int lab = la + lb;
   const int lcd = lc + ld;
-  R G[9][9];
+  R G[kDeg][kDeg];
   G[0][0] = R(1);
   for (int n = 0; n < lab; ++n) {
     G[n + 1][0] = C00 * G[n][0] + (n > 0 ? R(n) * B10 * G[n - 1][0] : R(0));
@@ -408,8 +485,8 @@ GPU4DFT_HD inline void jk_rys_1d(int la, int lb, int lc, int ld, R C00, R D00, R
     }
   }
 
-  R H[5][5][9];
-  R cur[9][9];
+  R H[kDim][kDim][kDeg];
+  R cur[kDeg][kDeg];
   for (int n = 0; n <= lab; ++n)
     for (int m = 0; m <= lcd; ++m) cur[n][m] = G[n][m];
   for (int j = 0; j <= lb; ++j) {
@@ -423,7 +500,7 @@ GPU4DFT_HD inline void jk_rys_1d(int la, int lb, int lc, int ld, R C00, R D00, R
 
   for (int i = 0; i <= la; ++i) {
     for (int j = 0; j <= lb; ++j) {
-      R kcur[9];
+      R kcur[kDeg];
       for (int m = 0; m <= lcd; ++m) kcur[m] = H[i][j][m];
       for (int l = 0; l <= ld; ++l) {
         for (int k = 0; k <= lc; ++k) I[i][j][k][l] = kcur[k];
@@ -435,32 +512,34 @@ GPU4DFT_HD inline void jk_rys_1d(int la, int lb, int lc, int ld, R C00, R D00, R
   }
 }
 
-// General Direct J + K quartet contraction for any 0 <= la, lb, lc, ld <= 4,
-// parameterized on primitive evaluation precision `R` (`double` or `float`)
-// with `double` accumulation and bounded stack memory.
-template <typename R, typename AccumJFn, typename AccumKFn>
-GPU4DFT_HD inline void eval_direct_jk_quartet(
+template <typename R>
+GPU4DFT_HD inline void jk_rys_1d(int la, int lb, int lc, int ld, R C00, R D00, R B10, R B01,
+                                 R B00, R AB, R CD, R I[5][5][5][5]) {
+  jk_rys_1d_tiered<4, R>(la, lb, lc, ld, C00, D00, B10, B01, B00, AB, CD, I);
+}
+
+// Pure Rys Direct J + K quartet contraction (NO Hermite J branch inside, keeping
+// CUDA kernel register and stack-frame footprints minimal and spill-free!).
+template <int MaxL, typename R, bool SymmetrizeDM, typename AccumJBraFn, typename AccumJKetFn,
+          typename AccumKFn>
+GPU4DFT_HD inline void eval_rys_jk_quartet_tiered(
     int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
-    int ik, bool same_PQ, bool do_j, bool do_k, double w_J, double w_K, const double* D_cart,
-    int ncart_tot, int off_a, int off_b, int off_c, int off_d, AccumJFn accum_j,
-    AccumKFn accum_k) {
-  if (do_j && !do_k && (la + lb + lc + ld) <= 4) {
-    eval_hermite_j_quartet<R>(la, lb, lc, ld, bra, ib, ket, ik, same_PQ, w_J, D_cart, ncart_tot,
-                              off_a, off_b, off_c, off_d, accum_j);
+    int ik, bool same_PQ, bool do_j, bool do_k, double w_J, double w_K,
+    const double* __restrict__ D_cart, int ncart_tot, int off_a, int off_b, int off_c, int off_d,
+    AccumJBraFn accum_j_bra, AccumJKetFn accum_j_ket, AccumKFn accum_k) {
+  if (la < 0 || la > MaxL || lb < 0 || lb > MaxL || lc < 0 || lc > MaxL || ld < 0 || ld > MaxL) {
     return;
   }
 
-  const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
-  double j_ab[225] = {0.0};
-  double j_cd[225] = {0.0};
-  double k_ac[225] = {0.0};
-  double k_bc[225] = {0.0};
-  double k_ad[225] = {0.0};
-  double k_bd[225] = {0.0};
+  constexpr int kMaxCart = (MaxL + 1) * (MaxL + 2) / 2;
+  constexpr int kMaxCart2 = kMaxCart * kMaxCart;
+  constexpr int kDim = MaxL + 1;
+  constexpr int kMaxRoots = 2 * MaxL + 1;
 
   const int bra_begin = bra.prim_offset[ib], bra_end = bra.prim_offset[ib + 1];
   const int ket_begin = ket.prim_offset[ik], ket_end = ket.prim_offset[ik + 1];
 
+  // 1. Dedicated (ss|ss) scalar fast path.
   if (la == 0 && lb == 0 && lc == 0 && ld == 0) {
     double val = 0.0;
     for (int ip = bra_begin; ip < bra_end; ++ip) {
@@ -481,8 +560,18 @@ GPU4DFT_HD inline void eval_direct_jk_quartet(
       }
     }
     if (do_j) {
-      accum_j(off_a, off_b, w_J * val * D_cart[off_c * ncart_tot + off_d]);
-      if (!same_PQ) accum_j(off_c, off_d, w_J * val * D_cart[off_a * ncart_tot + off_b]);
+      const double d_cd =
+          SymmetrizeDM
+              ? D_cart[off_c * ncart_tot + off_d]
+              : 0.5 * (D_cart[off_c * ncart_tot + off_d] + D_cart[off_d * ncart_tot + off_c]);
+      accum_j_bra(0, 0, w_J * val * d_cd);
+      if (!same_PQ) {
+        const double d_ab =
+            SymmetrizeDM
+                ? D_cart[off_a * ncart_tot + off_b]
+                : 0.5 * (D_cart[off_a * ncart_tot + off_b] + D_cart[off_b * ncart_tot + off_a]);
+        accum_j_ket(off_c, off_d, w_J * val * d_ab);
+      }
     }
     if (do_k) {
       const double wk = w_K * val;
@@ -490,23 +579,234 @@ GPU4DFT_HD inline void eval_direct_jk_quartet(
       accum_k(off_b, off_c, wk * D_cart[off_a * ncart_tot + off_d]);
       accum_k(off_a, off_d, wk * D_cart[off_b * ncart_tot + off_c]);
       accum_k(off_b, off_d, wk * D_cart[off_a * ncart_tot + off_c]);
+      if constexpr (!SymmetrizeDM) {
+        if (!same_PQ) {
+          accum_k(off_c, off_a, wk * D_cart[off_d * ncart_tot + off_b]);
+          accum_k(off_c, off_b, wk * D_cart[off_d * ncart_tot + off_a]);
+          accum_k(off_d, off_a, wk * D_cart[off_c * ncart_tot + off_b]);
+          accum_k(off_d, off_b, wk * D_cart[off_c * ncart_tot + off_a]);
+        }
+      }
     }
     return;
   }
 
+  const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
   const int n_roots = (la + lb + lc + ld) / 2 + 1;
   const double Ax = bra.Ax[ib], Ay = bra.Ay[ib], Az = bra.Az[ib];
   const double Bx = bra.Bx[ib], By = bra.By[ib], Bz = bra.Bz[ib];
   const double Cx = ket.Ax[ik], Cy = ket.Ay[ik], Cz = ket.Az[ik];
   const double Dx = ket.Bx[ik], Dy = ket.By[ik], Dz = ket.Bz[ik];
-  const R ABx = static_cast<R>(Ax - Bx), ABy = static_cast<R>(Ay - By), ABz = static_cast<R>(Az - Bz);
-  const R CDx = static_cast<R>(Cx - Dx), CDy = static_cast<R>(Cy - Dy), CDz = static_cast<R>(Cz - Dz);
+  const R ABx = static_cast<R>(Ax - Bx), ABy = static_cast<R>(Ay - By),
+          ABz = static_cast<R>(Az - Bz);
+  const R CDx = static_cast<R>(Cx - Dx), CDy = static_cast<R>(Cy - Dy),
+          CDz = static_cast<R>(Cz - Dz);
 
-  CartTriple ta[15], tb[15], tc[15], td[15];
+  CartTriple ta[kMaxCart], tb[kMaxCart], tc[kMaxCart], td[kMaxCart];
   for (int ia = 0; ia < nca; ++ia) ta[ia] = cart_triple(la, ia);
   for (int ib_c = 0; ib_c < ncb; ++ib_c) tb[ib_c] = cart_triple(lb, ib_c);
   for (int ic = 0; ic < ncc; ++ic) tc[ic] = cart_triple(lc, ic);
   for (int id = 0; id < ncd; ++id) td[id] = cart_triple(ld, id);
+
+  // 2. Contracted-ERI-first fast path ONLY for `sp` (MaxL == 1, <= 81 scalars,
+  //    covering >70% of all quartets with zero fallback code bloat!).
+  if constexpr (MaxL == 1) {
+    R eri_cart[81];
+    const int n_comp = nca * ncb * ncc * ncd;
+    for (int idx = 0; idx < n_comp; ++idx) eri_cart[idx] = R(0);
+
+    for (int ip = bra_begin; ip < bra_end; ++ip) {
+      const R p = static_cast<R>(bra.exponent[ip]);
+      const R Px = static_cast<R>(bra.Px[ip]);
+      const R Py = static_cast<R>(bra.Py[ip]);
+      const R Pz = static_cast<R>(bra.Pz[ip]);
+      const R Cab = static_cast<R>(bra.prefactor[ip]);
+      const R PAx = Px - static_cast<R>(Ax);
+      const R PAy = Py - static_cast<R>(Ay);
+      const R PAz = Pz - static_cast<R>(Az);
+      const R inv_2p = R(0.5) / p;
+
+      for (int kp = ket_begin; kp < ket_end; ++kp) {
+        const R q = static_cast<R>(ket.exponent[kp]);
+        const R Qx = static_cast<R>(ket.Px[kp]);
+        const R Qy = static_cast<R>(ket.Py[kp]);
+        const R Qz = static_cast<R>(ket.Pz[kp]);
+        const R Ccd = static_cast<R>(ket.prefactor[kp]);
+        const R PQx = Px - Qx, PQy = Py - Qy, PQz = Pz - Qz;
+        const R pq_sum = p + q;
+        const R rho = p * q / pq_sum;
+        const R T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
+        const R scale = Cab * Ccd * R(kJKTwoOverSqrtPi) * math::sqrt(rho);
+
+        R u_roots[kMaxRoots];
+        R w_weights[kMaxRoots];
+        rys_roots_weights<R>(n_roots, T, u_roots, w_weights);
+
+        const R inv_2q = R(0.5) / q;
+        const R inv_2pq = R(0.5) / pq_sum;
+        const R rho_over_p = rho / p;
+        const R rho_over_q = rho / q;
+        const R QCx = Qx - static_cast<R>(Cx);
+        const R QCy = Qy - static_cast<R>(Cy);
+        const R QCz = Qz - static_cast<R>(Cz);
+
+        for (int r = 0; r < n_roots; ++r) {
+          const R u = u_roots[r];
+          const R Wr = scale * w_weights[r];
+          const R B00 = inv_2pq * u;
+          const R B10 = inv_2p * (R(1) - rho_over_p * u);
+          const R B01 = inv_2q * (R(1) - rho_over_q * u);
+
+          R Ix[kDim][kDim][kDim][kDim], Iy[kDim][kDim][kDim][kDim], Iz[kDim][kDim][kDim][kDim];
+          jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAx - rho_over_p * u * PQx,
+                                    QCx + rho_over_q * u * PQx, B10, B01, B00, ABx, CDx, Ix);
+          jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAy - rho_over_p * u * PQy,
+                                    QCy + rho_over_q * u * PQy, B10, B01, B00, ABy, CDy, Iy);
+          jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAz - rho_over_p * u * PQz,
+                                    QCz + rho_over_q * u * PQz, B10, B01, B00, ABz, CDz, Iz);
+
+          int out_idx = 0;
+          for (int ia = 0; ia < nca; ++ia) {
+            for (int ib_c = 0; ib_c < ncb; ++ib_c) {
+              for (int ic = 0; ic < ncc; ++ic) {
+                for (int id = 0; id < ncd; ++id) {
+                  eri_cart[out_idx++] +=
+                      Wr * Ix[ta[ia].lx][tb[ib_c].lx][tc[ic].lx][td[id].lx] *
+                      Iy[ta[ia].ly][tb[ib_c].ly][tc[ic].ly][td[id].ly] *
+                      Iz[ta[ia].lz][tb[ib_c].lz][tc[ic].lz][td[id].lz];
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const int ncd_blk = ncc * ncd;
+    if (do_j) {
+      R d_cd_sym[kMaxCart2];
+      for (int ic = 0; ic < ncc; ++ic) {
+        const int rc = off_c + ic;
+        for (int id = 0; id < ncd; ++id) {
+          const int rd = off_d + id;
+          d_cd_sym[ic * ncd + id] = static_cast<R>(
+              SymmetrizeDM
+                  ? D_cart[rc * ncart_tot + rd]
+                  : 0.5 * (D_cart[rc * ncart_tot + rd] + D_cart[rd * ncart_tot + rc]));
+        }
+      }
+      R j_cd_loc[kMaxCart2] = {R(0)};
+      for (int ia = 0; ia < nca; ++ia) {
+        const int ra = off_a + ia;
+        for (int ib_c = 0; ib_c < ncb; ++ib_c) {
+          const int rb = off_b + ib_c;
+          const R dab_sym = static_cast<R>(
+              SymmetrizeDM
+                  ? D_cart[ra * ncart_tot + rb]
+                  : 0.5 * (D_cart[ra * ncart_tot + rb] + D_cart[rb * ncart_tot + ra]));
+          const R* e_ab = eri_cart + (ia * ncb + ib_c) * ncd_blk;
+          R sum_jab = R(0);
+          for (int icd = 0; icd < ncd_blk; ++icd) {
+            const R v = e_ab[icd];
+            sum_jab += v * d_cd_sym[icd];
+            if (!same_PQ) j_cd_loc[icd] += v * dab_sym;
+          }
+          accum_j_bra(ia, ib_c, w_J * static_cast<double>(sum_jab));
+        }
+      }
+      if (!same_PQ) {
+        for (int ic = 0; ic < ncc; ++ic)
+          for (int id = 0; id < ncd; ++id)
+            accum_j_ket(off_c + ic, off_d + id, w_J * static_cast<double>(j_cd_loc[ic * ncd + id]));
+      }
+    }
+
+    if (do_k) {
+      R k_ac[kMaxCart2] = {R(0)};
+      R k_bc[kMaxCart2] = {R(0)};
+      R k_ad[kMaxCart2] = {R(0)};
+      R k_bd[kMaxCart2] = {R(0)};
+      R k_ca[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+      R k_cb[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+      R k_da[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+      R k_db[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+
+      for (int ia = 0; ia < nca; ++ia) {
+        const int ra = off_a + ia;
+        for (int ib_c = 0; ib_c < ncb; ++ib_c) {
+          const int rb = off_b + ib_c;
+          const R* e_ab = eri_cart + (ia * ncb + ib_c) * ncd_blk;
+          for (int ic = 0; ic < ncc; ++ic) {
+            const int rc = off_c + ic;
+            const R d_ac = static_cast<R>(D_cart[ra * ncart_tot + rc]);
+            const R d_bc = static_cast<R>(D_cart[rb * ncart_tot + rc]);
+            const R d_ca = SymmetrizeDM ? R(0) : static_cast<R>(D_cart[rc * ncart_tot + ra]);
+            const R d_cb = SymmetrizeDM ? R(0) : static_cast<R>(D_cart[rc * ncart_tot + rb]);
+            for (int id = 0; id < ncd; ++id) {
+              const int rd = off_d + id;
+              const R v = e_ab[ic * ncd + id];
+              k_ac[ia * ncc + ic] += v * static_cast<R>(D_cart[rb * ncart_tot + rd]);
+              k_bc[ib_c * ncc + ic] += v * static_cast<R>(D_cart[ra * ncart_tot + rd]);
+              k_ad[ia * ncd + id] += v * d_bc;
+              k_bd[ib_c * ncd + id] += v * d_ac;
+              if constexpr (!SymmetrizeDM) {
+                if (!same_PQ) {
+                  k_ca[ic * nca + ia] += v * static_cast<R>(D_cart[rd * ncart_tot + rb]);
+                  k_cb[ic * ncb + ib_c] += v * static_cast<R>(D_cart[rd * ncart_tot + ra]);
+                  k_da[id * nca + ia] += v * d_cb;
+                  k_db[id * ncb + ib_c] += v * d_ca;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      for (int ia = 0; ia < nca; ++ia)
+        for (int ic = 0; ic < ncc; ++ic)
+          accum_k(off_a + ia, off_c + ic, w_K * static_cast<double>(k_ac[ia * ncc + ic]));
+      for (int ib_c = 0; ib_c < ncb; ++ib_c)
+        for (int ic = 0; ic < ncc; ++ic)
+          accum_k(off_b + ib_c, off_c + ic, w_K * static_cast<double>(k_bc[ib_c * ncc + ic]));
+      for (int ia = 0; ia < nca; ++ia)
+        for (int id = 0; id < ncd; ++id)
+          accum_k(off_a + ia, off_d + id, w_K * static_cast<double>(k_ad[ia * ncd + id]));
+      for (int ib_c = 0; ib_c < ncb; ++ib_c)
+        for (int id = 0; id < ncd; ++id)
+          accum_k(off_b + ib_c, off_d + id, w_K * static_cast<double>(k_bd[ib_c * ncd + id]));
+
+      if constexpr (!SymmetrizeDM) {
+        if (!same_PQ) {
+          for (int ic = 0; ic < ncc; ++ic)
+            for (int ia = 0; ia < nca; ++ia)
+              accum_k(off_c + ic, off_a + ia, w_K * static_cast<double>(k_ca[ic * nca + ia]));
+          for (int ic = 0; ic < ncc; ++ic)
+            for (int ib_c = 0; ib_c < ncb; ++ib_c)
+              accum_k(off_c + ic, off_b + ib_c, w_K * static_cast<double>(k_cb[ic * ncb + ib_c]));
+          for (int id = 0; id < ncd; ++id)
+            for (int ia = 0; ia < nca; ++ia)
+              accum_k(off_d + id, off_a + ia, w_K * static_cast<double>(k_da[id * nca + ia]));
+          for (int id = 0; id < ncd; ++id)
+            for (int ib_c = 0; ib_c < ncb; ++ib_c)
+              accum_k(off_d + id, off_b + ib_c, w_K * static_cast<double>(k_db[id * ncb + ib_c]));
+        }
+      }
+    }
+    return;
+  }
+
+  // 3. Single lean direct contraction path for MaxL >= 2 (d, f, g): uses `R` (`float` in FP32/Mixed
+  //    tail, `double` in FP64), casting to `double` on global accumulation!
+  R j_ab[kMaxCart2] = {R(0)};
+  R j_cd[kMaxCart2] = {R(0)};
+  R k_ac[kMaxCart2] = {R(0)};
+  R k_bc[kMaxCart2] = {R(0)};
+  R k_ad[kMaxCart2] = {R(0)};
+  R k_bd[kMaxCart2] = {R(0)};
+  R k_ca[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+  R k_cb[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+  R k_da[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
+  R k_db[SymmetrizeDM ? 1 : kMaxCart2] = {R(0)};
 
   for (int ip = bra_begin; ip < bra_end; ++ip) {
     const R p = static_cast<R>(bra.exponent[ip]);
@@ -531,8 +831,8 @@ GPU4DFT_HD inline void eval_direct_jk_quartet(
       const R T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
       const R scale = Cab * Ccd * R(kJKTwoOverSqrtPi) * math::sqrt(rho);
 
-      R u_roots[9];
-      R w_weights[9];
+      R u_roots[kMaxRoots];
+      R w_weights[kMaxRoots];
       rys_roots_weights<R>(n_roots, T, u_roots, w_weights);
 
       const R inv_2q = R(0.5) / q;
@@ -550,35 +850,55 @@ GPU4DFT_HD inline void eval_direct_jk_quartet(
         const R B10 = inv_2p * (R(1) - rho_over_p * u);
         const R B01 = inv_2q * (R(1) - rho_over_q * u);
 
-        R Ix[5][5][5][5], Iy[5][5][5][5], Iz[5][5][5][5];
-        jk_rys_1d<R>(la, lb, lc, ld, PAx - rho_over_p * u * PQx, QCx + rho_over_q * u * PQx, B10,
-                     B01, B00, ABx, CDx, Ix);
-        jk_rys_1d<R>(la, lb, lc, ld, PAy - rho_over_p * u * PQy, QCy + rho_over_q * u * PQy, B10,
-                     B01, B00, ABy, CDy, Iy);
-        jk_rys_1d<R>(la, lb, lc, ld, PAz - rho_over_p * u * PQz, QCz + rho_over_q * u * PQz, B10,
-                     B01, B00, ABz, CDz, Iz);
+        R Ix[kDim][kDim][kDim][kDim], Iy[kDim][kDim][kDim][kDim], Iz[kDim][kDim][kDim][kDim];
+        jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAx - rho_over_p * u * PQx,
+                                  QCx + rho_over_q * u * PQx, B10, B01, B00, ABx, CDx, Ix);
+        jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAy - rho_over_p * u * PQy,
+                                  QCy + rho_over_q * u * PQy, B10, B01, B00, ABy, CDy, Iy);
+        jk_rys_1d_tiered<MaxL, R>(la, lb, lc, ld, PAz - rho_over_p * u * PQz,
+                                  QCz + rho_over_q * u * PQz, B10, B01, B00, ABz, CDz, Iz);
 
         for (int ia = 0; ia < nca; ++ia) {
+          const int ra = off_a + ia;
           for (int ib_c = 0; ib_c < ncb; ++ib_c) {
-            const double dab = D_cart[(off_a + ia) * ncart_tot + (off_b + ib_c)];
-            double sum_jab = 0.0;
+            const int rb = off_b + ib_c;
+            const R dab = static_cast<R>(
+                SymmetrizeDM
+                    ? D_cart[ra * ncart_tot + rb]
+                    : 0.5 * (D_cart[ra * ncart_tot + rb] + D_cart[rb * ncart_tot + ra]));
+            R sum_jab = R(0);
             for (int ic = 0; ic < ncc; ++ic) {
-              const double dac = D_cart[(off_a + ia) * ncart_tot + (off_c + ic)];
-              const double dbc = D_cart[(off_b + ib_c) * ncart_tot + (off_c + ic)];
+              const int rc = off_c + ic;
+              const R dac = static_cast<R>(D_cart[ra * ncart_tot + rc]);
+              const R dbc = static_cast<R>(D_cart[rb * ncart_tot + rc]);
+              const R dca = SymmetrizeDM ? R(0) : static_cast<R>(D_cart[rc * ncart_tot + ra]);
+              const R dcb = SymmetrizeDM ? R(0) : static_cast<R>(D_cart[rc * ncart_tot + rb]);
               for (int id = 0; id < ncd; ++id) {
-                const double v = static_cast<double>(
-                    Wr * Ix[ta[ia].lx][tb[ib_c].lx][tc[ic].lx][td[id].lx] *
-                    Iy[ta[ia].ly][tb[ib_c].ly][tc[ic].ly][td[id].ly] *
-                    Iz[ta[ia].lz][tb[ib_c].lz][tc[ic].lz][td[id].lz]);
+                const int rd = off_d + id;
+                const R v = Wr * Ix[ta[ia].lx][tb[ib_c].lx][tc[ic].lx][td[id].lx] *
+                            Iy[ta[ia].ly][tb[ib_c].ly][tc[ic].ly][td[id].ly] *
+                            Iz[ta[ia].lz][tb[ib_c].lz][tc[ic].lz][td[id].lz];
                 if (do_j) {
-                  sum_jab += v * D_cart[(off_c + ic) * ncart_tot + (off_d + id)];
+                  const R dcd_s = static_cast<R>(
+                      SymmetrizeDM
+                          ? D_cart[rc * ncart_tot + rd]
+                          : 0.5 * (D_cart[rc * ncart_tot + rd] + D_cart[rd * ncart_tot + rc]));
+                  sum_jab += v * dcd_s;
                   if (!same_PQ) j_cd[ic * ncd + id] += v * dab;
                 }
                 if (do_k) {
-                  k_ac[ia * ncc + ic] += v * D_cart[(off_b + ib_c) * ncart_tot + (off_d + id)];
-                  k_bc[ib_c * ncc + ic] += v * D_cart[(off_a + ia) * ncart_tot + (off_d + id)];
+                  k_ac[ia * ncc + ic] += v * static_cast<R>(D_cart[rb * ncart_tot + rd]);
+                  k_bc[ib_c * ncc + ic] += v * static_cast<R>(D_cart[ra * ncart_tot + rd]);
                   k_ad[ia * ncd + id] += v * dbc;
                   k_bd[ib_c * ncd + id] += v * dac;
+                  if constexpr (!SymmetrizeDM) {
+                    if (!same_PQ) {
+                      k_ca[ic * nca + ia] += v * static_cast<R>(D_cart[rd * ncart_tot + rb]);
+                      k_cb[ic * ncb + ib_c] += v * static_cast<R>(D_cart[rd * ncart_tot + ra]);
+                      k_da[id * nca + ia] += v * dcb;
+                      k_db[id * ncb + ib_c] += v * dca;
+                    }
+                  }
                 }
               }
             }
@@ -592,27 +912,78 @@ GPU4DFT_HD inline void eval_direct_jk_quartet(
   if (do_j) {
     for (int ia = 0; ia < nca; ++ia)
       for (int ib_c = 0; ib_c < ncb; ++ib_c)
-        accum_j(off_a + ia, off_b + ib_c, w_J * j_ab[ia * ncb + ib_c]);
+        accum_j_bra(ia, ib_c, w_J * static_cast<double>(j_ab[ia * ncb + ib_c]));
     if (!same_PQ) {
       for (int ic = 0; ic < ncc; ++ic)
         for (int id = 0; id < ncd; ++id)
-          accum_j(off_c + ic, off_d + id, w_J * j_cd[ic * ncd + id]);
+          accum_j_ket(off_c + ic, off_d + id, w_J * static_cast<double>(j_cd[ic * ncd + id]));
     }
   }
   if (do_k) {
     for (int ia = 0; ia < nca; ++ia)
       for (int ic = 0; ic < ncc; ++ic)
-        accum_k(off_a + ia, off_c + ic, w_K * k_ac[ia * ncc + ic]);
+        accum_k(off_a + ia, off_c + ic, w_K * static_cast<double>(k_ac[ia * ncc + ic]));
     for (int ib_c = 0; ib_c < ncb; ++ib_c)
       for (int ic = 0; ic < ncc; ++ic)
-        accum_k(off_b + ib_c, off_c + ic, w_K * k_bc[ib_c * ncc + ic]);
+        accum_k(off_b + ib_c, off_c + ic, w_K * static_cast<double>(k_bc[ib_c * ncc + ic]));
     for (int ia = 0; ia < nca; ++ia)
       for (int id = 0; id < ncd; ++id)
-        accum_k(off_a + ia, off_d + id, w_K * k_ad[ia * ncd + id]);
+        accum_k(off_a + ia, off_d + id, w_K * static_cast<double>(k_ad[ia * ncd + id]));
     for (int ib_c = 0; ib_c < ncb; ++ib_c)
       for (int id = 0; id < ncd; ++id)
-        accum_k(off_b + ib_c, off_d + id, w_K * k_bd[ib_c * ncd + id]);
+        accum_k(off_b + ib_c, off_d + id, w_K * static_cast<double>(k_bd[ib_c * ncd + id]));
+
+    if constexpr (!SymmetrizeDM) {
+      if (!same_PQ) {
+        for (int ic = 0; ic < ncc; ++ic)
+          for (int ia = 0; ia < nca; ++ia)
+            accum_k(off_c + ic, off_a + ia, w_K * static_cast<double>(k_ca[ic * nca + ia]));
+        for (int ic = 0; ic < ncc; ++ic)
+          for (int ib_c = 0; ib_c < ncb; ++ib_c)
+            accum_k(off_c + ic, off_b + ib_c, w_K * static_cast<double>(k_cb[ic * ncb + ib_c]));
+        for (int id = 0; id < ncd; ++id)
+          for (int ia = 0; ia < nca; ++ia)
+            accum_k(off_d + id, off_a + ia, w_K * static_cast<double>(k_da[id * nca + ia]));
+        for (int id = 0; id < ncd; ++id)
+          for (int ib_c = 0; ib_c < ncb; ++ib_c)
+            accum_k(off_d + id, off_b + ib_c, w_K * static_cast<double>(k_db[id * ncb + ib_c]));
+      }
+    }
   }
+}
+
+// Host/general Direct J + K quartet contraction (dispatches pure-J L<=4 to Hermite, else Rys).
+template <int MaxL, typename R, bool SymmetrizeDM, typename AccumJBraFn, typename AccumJKetFn,
+          typename AccumKFn>
+GPU4DFT_HD inline void eval_direct_jk_quartet_tiered(
+    int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
+    int ik, bool same_PQ, bool do_j, bool do_k, double w_J, double w_K,
+    const double* __restrict__ D_cart, int ncart_tot, int off_a, int off_b, int off_c, int off_d,
+    AccumJBraFn accum_j_bra, AccumJKetFn accum_j_ket, AccumKFn accum_k) {
+  if (la < 0 || la > MaxL || lb < 0 || lb > MaxL || lc < 0 || lc > MaxL || ld < 0 || ld > MaxL) {
+    return;
+  }
+  if (do_j && !do_k && (la + lb + lc + ld) <= 4) {
+    eval_hermite_j_quartet_tiered<MaxL, R, SymmetrizeDM>(
+        la, lb, lc, ld, bra, ib, ket, ik, same_PQ, w_J, D_cart, ncart_tot, off_a, off_b, off_c,
+        off_d, accum_j_bra, accum_j_ket);
+    return;
+  }
+  eval_rys_jk_quartet_tiered<MaxL, R, SymmetrizeDM>(
+      la, lb, lc, ld, bra, ib, ket, ik, same_PQ, do_j, do_k, w_J, w_K, D_cart, ncart_tot, off_a,
+      off_b, off_c, off_d, accum_j_bra, accum_j_ket, accum_k);
+}
+
+template <typename R, typename AccumJFn, typename AccumKFn>
+GPU4DFT_HD inline void eval_direct_jk_quartet(
+    int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
+    int ik, bool same_PQ, bool do_j, bool do_k, double w_J, double w_K, const double* D_cart,
+    int ncart_tot, int off_a, int off_b, int off_c, int off_d, AccumJFn accum_j,
+    AccumKFn accum_k) {
+  auto accum_bra = [&](int ia, int ib_c, double val) { accum_j(off_a + ia, off_b + ib_c, val); };
+  eval_direct_jk_quartet_tiered<4, R, true>(la, lb, lc, ld, bra, ib, ket, ik, same_PQ, do_j, do_k,
+                                            w_J, w_K, D_cart, ncart_tot, off_a, off_b, off_c, off_d,
+                                            accum_bra, accum_j, accum_k);
 }
 
 #if defined(GPU4DFT_HAVE_CUDA)
@@ -621,16 +992,23 @@ DirectJKCudaCache* create_direct_jk_cuda_cache(
     const std::vector<int>& shell_cart_offset, int ncart_total);
 void destroy_direct_jk_cuda_cache(DirectJKCudaCache* p);
 
-void run_direct_jk_cuda(DirectJKCudaCache& cache, const std::vector<JKTaskTile>& tasks,
-                        const std::vector<double>& d_cart_host,
-                        const std::vector<double>& d_shell_max_host, double global_d_max,
-                        int nshell, int ncart_total, const JKOptions& opts,
-                        std::vector<double>& j_cart_out, std::vector<double>& k_cart_out);
+void run_direct_jk_cuda_device(DirectJKCudaCache& cache, const double* d_dm, double* d_vj,
+                               double* d_vk, const JKOptions& opts, void* stream);
+void run_direct_jk_cuda_host(DirectJKCudaCache& cache, const double* h_dm, double* h_vj,
+                             double* h_vk, const JKOptions& opts);
 
-RIJKCudaCache* create_rijk_cuda_cache(int nao, int naux, const std::vector<double>& b_tensor,
-                                      const std::vector<double>& b_perm_tensor);
+RIJKCudaCache* build_rijk_cuda_cache_native(int nao, int naux,
+                                            const std::vector<ShellPairData>& orb_lists,
+                                            const std::vector<ShellPairData>& aux_lists);
+RIJKCudaCache* create_rijk_cuda_cache_from_host(int nao, int naux,
+                                                const std::vector<double>& b_tensor);
 void destroy_rijk_cuda_cache(RIJKCudaCache* p);
-void run_rijk_cuda(RIJKCudaCache& cache, const double* dm, double* vj_out, double* vk_out,
+const double* rijk_cuda_device_b_ptr(const RIJKCudaCache& cache) noexcept;
+void download_rijk_b_tensor(const RIJKCudaCache& cache, std::vector<double>& b_out);
+
+void run_rijk_cuda_device(RIJKCudaCache& cache, const double* d_dm, double* d_vj, double* d_vk,
+                          const JKOptions& opts, void* stream);
+void run_rijk_cuda(RIJKCudaCache& cache, const double* h_dm, double* h_vj, double* h_vk,
                    const JKOptions& opts);
 
 void run_jk_nuclear_grad_cuda(const std::vector<ShellPairData>& pair_lists,

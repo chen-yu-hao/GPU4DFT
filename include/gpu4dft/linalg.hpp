@@ -185,4 +185,9 @@ void apply_level_shift_ao_device(GpuLinalgContext& ctx, int nao, double level_sh
                                  GemmMode gemm_mode = GemmMode::FP64,
                                  StreamHandle stream = nullptr);
 
+// Coalesced [bc, nao, nao] -> [nao, bc, nao] outer-axis permutation for chunked GPU RI-K.
+void permute_ri_chunk_pair_device(int bc, int nao, const double* d_src_a, const double* d_src_b,
+                                  double* d_dst_a, double* d_dst_b,
+                                  StreamHandle stream = nullptr);
+
 }  // namespace gpu4dft

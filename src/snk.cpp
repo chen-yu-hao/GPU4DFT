@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -12,44 +13,316 @@ namespace gpu4dft {
 
 namespace snk_detail {
 
-struct SnkShellPair {
-  int ish_a = 0;
-  int ish_b = 0;  // ish_a >= ish_b
-};
-
-inline std::vector<SnkShellPair> build_snk_shell_pairs(const Basis& basis, double pair_cutoff) {
+inline SnkPairTable build_snk_pair_table(const Basis& basis,
+                                         const detail::FlatBasisData& flat_b,
+                                         const std::vector<double>& s_exact,
+                                         double pair_cutoff) {
   constexpr double kTwoPi = 6.283185307179586476925286766559;
-  std::vector<SnkShellPair> pairs;
-  const int nsh = static_cast<int>(basis.nshell());
-  for (int ia = 0; ia < nsh; ++ia) {
-    const Shell& sa = basis.shell(ia);
-    for (int ib = 0; ib <= ia; ++ib) {
-      const Shell& sb = basis.shell(ib);
-      const double dx = sa.center[0] - sb.center[0];
-      const double dy = sa.center[1] - sb.center[1];
-      const double dz = sa.center[2] - sb.center[2];
-      const double rab2 = dx * dx + dy * dy + dz * dz;
+  constexpr double kSqrtPiOver2 = 0.88622692545275801365;
 
-      double max_pre = 0.0;
-      for (std::size_t ka = 0; ka < sa.exponents.size(); ++ka) {
-        const double a = sa.exponents[ka];
-        const double ca = sa.coefficients[ka];
-        for (std::size_t kb = 0; kb < sb.exponents.size(); ++kb) {
-          const double b = sb.exponents[kb];
-          const double cb = sb.coefficients[kb];
-          const double p = a + b;
-          const double mu = a * b / p;
+  SnkPairTable tbl;
+  const int nsh = flat_b.nshell;
+  const std::size_t nao = static_cast<std::size_t>(flat_b.nao);
+  if (nsh == 0 || nao == 0) return tbl;
+
+  const detail::FlatBasisView bview = flat_b.view();
+  const std::vector<double> shell_radii = MolecularGrid::compute_shell_radii(basis, 1e-15);
+
+  // Exact Cauchy-Schwarz per-shell bounds: V_diag_max[is] and S_diag_sqrt[is]
+  std::vector<double> v_diag_max(static_cast<std::size_t>(nsh), 0.0);
+  std::vector<double> s_diag_sqrt(static_cast<std::size_t>(nsh), 1.0);
+  for (int is = 0; is < nsh; ++is) {
+    const int nm = 2 * bview.shell_l[is] + 1;
+    const int ao0 = bview.shell_ao_offset[is];
+    double v_blk[81];
+    eval_shell_pair_esp(bview, is, is,
+                        bview.shell_center[3 * is + 0],
+                        bview.shell_center[3 * is + 1],
+                        bview.shell_center[3 * is + 2],
+                        0.0, v_blk);
+    double vmax = 0.0;
+    double smax = 0.0;
+    for (int m = 0; m < nm; ++m) {
+      vmax = std::max(vmax, std::abs(v_blk[m * nm + m]));
+      if (!s_exact.empty()) {
+        const std::size_t u = static_cast<std::size_t>(ao0 + m);
+        smax = std::max(smax, std::sqrt(std::max(0.0, s_exact[u * nao + u])));
+      } else {
+        smax = 1.0;
+      }
+    }
+    v_diag_max[static_cast<std::size_t>(is)] = vmax;
+    s_diag_sqrt[static_cast<std::size_t>(is)] = smax;
+  }
+
+  for (int ia_raw = 0; ia_raw < nsh; ++ia_raw) {
+    for (int ib_raw = 0; ib_raw <= ia_raw; ++ib_raw) {
+      int ia = ia_raw;
+      int ib = ib_raw;
+      if (bview.shell_l[ia] < bview.shell_l[ib]) {
+        std::swap(ia, ib);
+      }
+
+      const int la = bview.shell_l[ia];
+      const int lb = bview.shell_l[ib];
+      const int L = la + lb;
+      const int nma = 2 * la + 1;
+      const int nmb = 2 * lb + 1;
+      const int ao_a = bview.shell_ao_offset[ia];
+      const int ao_b = bview.shell_ao_offset[ib];
+
+      const double ax = bview.shell_center[3 * ia + 0];
+      const double ay = bview.shell_center[3 * ia + 1];
+      const double az = bview.shell_center[3 * ia + 2];
+      const double bx = bview.shell_center[3 * ib + 0];
+      const double by = bview.shell_center[3 * ib + 1];
+      const double bz = bview.shell_center[3 * ib + 2];
+      const double rab2 =
+          (ax - bx) * (ax - bx) + (ay - by) * (ay - by) + (az - bz) * (az - bz);
+
+      const int pa0 = bview.shell_prim_offset[ia];
+      const int npa = bview.shell_prim_count[ia];
+      const int pb0 = bview.shell_prim_offset[ib];
+      const int npb = bview.shell_prim_count[ib];
+
+      SphCartTerm ta[28], tb[28];
+      const int nta = sph_cart_terms(la, ta);
+      const int ntb = sph_cart_terms(lb, tb);
+      const int n_tet = tet_count(L);
+      const int h_block_len = nma * nmb * n_tet;
+
+      const int p_start = static_cast<int>(tbl.prims.size());
+      double sum_w = 0.0;
+      double sum_px = 0.0, sum_py = 0.0, sum_pz = 0.0;
+      double p_min = std::numeric_limits<double>::infinity();
+
+      std::vector<double> asymp_accum;
+      const bool concentric = (rab2 < 1e-12);
+      if (concentric && L <= 4) {
+        asymp_accum.assign(static_cast<std::size_t>(h_block_len), 0.0);
+      }
+
+      double Ex[5][5][9], Ey[5][5][9], Ez[5][5][9];
+
+      for (int ka = 0; ka < npa; ++ka) {
+        const double alpha = bview.prim_exp[pa0 + ka];
+        const double ca = bview.prim_coeff[pa0 + ka];
+        for (int kb = 0; kb < npb; ++kb) {
+          const double beta = bview.prim_exp[pb0 + kb];
+          const double cb = bview.prim_coeff[pb0 + kb];
+          const double p = alpha + beta;
+          const double inv_p = 1.0 / p;
+          const double mu = alpha * beta * inv_p;
           if (mu * rab2 > 42.0) continue;
-          const double pre = std::abs((kTwoPi / p) * ca * cb * std::exp(-mu * rab2));
-          max_pre = std::max(max_pre, pre);
+          const double pre = (kTwoPi * inv_p) * ca * cb * std::exp(-mu * rab2);
+          if (std::abs(pre) < pair_cutoff) continue;
+
+          const double px = (alpha * ax + beta * bx) * inv_p;
+          const double py = (alpha * ay + beta * by) * inv_p;
+          const double pz = (alpha * az + beta * bz) * inv_p;
+
+          SnkPrimPair pp;
+          pp.px = px;
+          pp.py = py;
+          pp.pz = pz;
+          pp.p = p;
+          pp.pre = pre;
+
+          if (L <= 4) {
+            pp.h_offset = static_cast<int>(tbl.h_coeffs.size());
+            tbl.h_coeffs.resize(tbl.h_coeffs.size() + static_cast<std::size_t>(h_block_len), 0.0);
+            double* h_dst = tbl.h_coeffs.data() + pp.h_offset;
+
+            if (L == 0) {
+              h_dst[0] = pre * ta[0].coeff * tb[0].coeff;
+            } else {
+              md_hermite_1d(la, lb, px - ax, px - bx, 0.5 * inv_p, Ex);
+              md_hermite_1d(la, lb, py - ay, py - by, 0.5 * inv_p, Ey);
+              md_hermite_1d(la, lb, pz - az, pz - bz, 0.5 * inv_p, Ez);
+              for (int i_a = 0; i_a < nta; ++i_a) {
+                const SphCartTerm& sa = ta[i_a];
+                for (int i_b = 0; i_b < ntb; ++i_b) {
+                  const SphCartTerm& sb = tb[i_b];
+                  const double sc = pre * (sa.coeff * sb.coeff);
+                  double* row = h_dst + (sa.m * nmb + sb.m) * n_tet;
+                  const int mx = sa.ix + sb.ix;
+                  const int my = sa.iy + sb.iy;
+                  const int mz = sa.iz + sb.iz;
+                  for (int t = 0; t <= mx; ++t) {
+                    const double ex = Ex[sa.ix][sb.ix][t];
+                    if (ex == 0.0) continue;
+                    for (int u = 0; u <= my; ++u) {
+                      const double exy = ex * Ey[sa.iy][sb.iy][u];
+                      if (exy == 0.0) continue;
+                      for (int v = 0; v <= mz; ++v) {
+                        row[tet_index(t, u, v)] += sc * exy * Ez[sa.iz][sb.iz][v];
+                      }
+                    }
+                  }
+                }
+              }
+            }
+
+            if (concentric) {
+              const double asymp_scale = kSqrtPiOver2 / std::sqrt(p);
+              for (int idx = 0; idx < h_block_len; ++idx) {
+                asymp_accum[static_cast<std::size_t>(idx)] += asymp_scale * h_dst[idx];
+              }
+            }
+          }
+
+          const double w = std::abs(pre);
+          sum_w += w;
+          sum_px += w * px;
+          sum_py += w * py;
+          sum_pz += w * pz;
+          p_min = std::min(p_min, p);
+          tbl.prims.push_back(pp);
         }
       }
-      if (max_pre >= pair_cutoff) {
-        pairs.push_back(SnkShellPair{ia, ib});
+
+      const int p_cnt = static_cast<int>(tbl.prims.size()) - p_start;
+      if (p_cnt == 0) continue;
+
+      SnkShellPair sp;
+      sp.ish_a = ia;
+      sp.ish_b = ib;
+      sp.la = la;
+      sp.lb = lb;
+      sp.ao_a = ao_a;
+      sp.ao_b = ao_b;
+      sp.nma = nma;
+      sp.nmb = nmb;
+      sp.prim_offset = p_start;
+      sp.prim_count = p_cnt;
+      sp.p_min = p_min;
+
+      if (sum_w > 0.0) {
+        sp.center[0] = sum_px / sum_w;
+        sp.center[1] = sum_py / sum_w;
+        sp.center[2] = sum_pz / sum_w;
+      } else {
+        sp.center[0] = 0.5 * (ax + bx);
+        sp.center[1] = 0.5 * (ay + by);
+        sp.center[2] = 0.5 * (az + bz);
+      }
+
+      const double da = std::sqrt((ax - sp.center[0]) * (ax - sp.center[0]) +
+                                  (ay - sp.center[1]) * (ay - sp.center[1]) +
+                                  (az - sp.center[2]) * (az - sp.center[2]));
+      const double db = std::sqrt((bx - sp.center[0]) * (bx - sp.center[0]) +
+                                  (by - sp.center[1]) * (by - sp.center[1]) +
+                                  (bz - sp.center[2]) * (bz - sp.center[2]));
+      // Product chi_a * chi_b is < 1e-15 outside BOTH shell_radii spheres -> intersection min!
+      sp.extent_radius = std::min(da + shell_radii[static_cast<std::size_t>(ia)],
+                                  db + shell_radii[static_cast<std::size_t>(ib)]);
+
+      if (!s_exact.empty()) {
+        if (L == 0) {
+          sp.q_monopole = s_exact[static_cast<std::size_t>(ao_a) * nao +
+                                  static_cast<std::size_t>(ao_b)];
+        } else {
+          double norm2 = 0.0;
+          for (int ma = 0; ma < nma; ++ma) {
+            for (int mb = 0; mb < nmb; ++mb) {
+              const double sv = s_exact[static_cast<std::size_t>(ao_a + ma) * nao +
+                                        static_cast<std::size_t>(ao_b + mb)];
+              norm2 += sv * sv;
+            }
+          }
+          sp.q_monopole = std::sqrt(norm2);
+        }
+      }
+
+      sp.v_max_near = std::sqrt(v_diag_max[static_cast<std::size_t>(ia)] *
+                                v_diag_max[static_cast<std::size_t>(ib)]);
+      sp.q_far_bound = s_diag_sqrt[static_cast<std::size_t>(ia)] *
+                       s_diag_sqrt[static_cast<std::size_t>(ib)];
+
+      if (concentric && L <= 4) {
+        sp.asymp_h_offset = static_cast<int>(tbl.h_coeffs.size());
+        tbl.h_coeffs.insert(tbl.h_coeffs.end(), asymp_accum.begin(), asymp_accum.end());
+      }
+
+      tbl.pairs.push_back(sp);
+    }
+  }
+  return tbl;
+}
+
+template <int L>
+inline void eval_precomputed_pair_esp_host(const SnkShellPair& sp,
+                                           const SnkPrimPair* prims,
+                                           const double* h_coeffs,
+                                           double gx, double gy, double gz,
+                                           double* v_sph) {
+  const int n_uv = sp.nma * sp.nmb;
+  constexpr int n_tet = tet_count(L);
+
+  if (sp.asymp_h_offset >= 0) {
+    const double xpc = sp.center[0] - gx;
+    const double ypc = sp.center[1] - gy;
+    const double zpc = sp.center[2] - gz;
+    const double rpc2 = xpc * xpc + ypc * ypc + zpc * zpc;
+    if (sp.p_min * rpc2 > boys_asymp_threshold(L)) {
+      const double inv_r = 1.0 / std::sqrt(rpc2);
+      const double* M = h_coeffs + sp.asymp_h_offset;
+      if constexpr (L == 0) {
+        v_sph[0] = M[0] * inv_r;
+        return;
+      }
+      const double inv_r2 = inv_r * inv_r;
+      double d[5];
+      d[0] = inv_r;
+      if constexpr (L >= 1) d[1] = -d[0] * inv_r2;
+      if constexpr (L >= 2) d[2] = -3.0 * d[1] * inv_r2;
+      if constexpr (L >= 3) d[3] = -5.0 * d[2] * inv_r2;
+      if constexpr (L >= 4) d[4] = -7.0 * d[3] * inv_r2;
+
+      double R[n_tet];
+      eval_hermite_coulomb_reg<L>(d, xpc, ypc, zpc, R);
+      for (int uv = 0; uv < n_uv; ++uv) {
+        const double* row = M + uv * n_tet;
+        double acc = 0.0;
+        for (int t = 0; t < n_tet; ++t) acc += row[t] * R[t];
+        v_sph[uv] = acc;
+      }
+      return;
+    }
+  }
+
+  for (int uv = 0; uv < n_uv; ++uv) v_sph[uv] = 0.0;
+  for (int kp = 0; kp < sp.prim_count; ++kp) {
+    const SnkPrimPair& pp = prims[sp.prim_offset + kp];
+    const double xpc = pp.px - gx;
+    const double ypc = pp.py - gy;
+    const double zpc = pp.pz - gz;
+    const double rpc2 = xpc * xpc + ypc * ypc + zpc * zpc;
+    const double* H = h_coeffs + pp.h_offset;
+
+    double F[5];
+    boys_vec_hd(L, pp.p * rpc2, F);
+    if constexpr (L == 0) {
+      v_sph[0] += H[0] * F[0];
+    } else {
+      const double m2p = -2.0 * pp.p;
+      double d[5];
+      d[0] = F[0];
+      if constexpr (L >= 1) d[1] = m2p * F[1];
+      if constexpr (L >= 2) d[2] = (m2p * m2p) * F[2];
+      if constexpr (L >= 3) d[3] = (m2p * m2p * m2p) * F[3];
+      if constexpr (L >= 4) d[4] = (m2p * m2p) * (m2p * m2p) * F[4];
+
+      double R[n_tet];
+      eval_hermite_coulomb_reg<L>(d, xpc, ypc, zpc, R);
+      for (int uv = 0; uv < n_uv; ++uv) {
+        const double* row = H + uv * n_tet;
+        double acc = 0.0;
+        for (int t = 0; t < n_tet; ++t) acc += row[t] * R[t];
+        v_sph[uv] += acc;
       }
     }
   }
-  return pairs;
 }
 
 #if defined(GPU4DFT_HAVE_CUDA)
@@ -61,7 +334,7 @@ void snk_esp_matrix_cuda(const detail::FlatBasisData& flat_basis,
                          double* out_v);
 void* snk_cuda_create(const detail::FlatBasisData& flat_basis,
                       const MolecularGrid& grid,
-                      const std::vector<SnkShellPair>& pairs,
+                      const SnkPairTable& pair_table,
                       const std::vector<double>& s_exact,
                       const SnkOptions& opts,
                       std::vector<double>& q_fit_out);
@@ -76,6 +349,15 @@ void snk_cuda_compute_k_host(void* impl,
 #endif
 
 }  // namespace snk_detail
+
+struct SemiNumericalK::HostPairState {
+  detail::FlatBasisData flat_basis;
+  snk_detail::SnkPairTable pair_table;
+
+  HostPairState(const Basis& b, const std::vector<double>& s_exact, double cutoff)
+      : flat_basis(b),
+        pair_table(snk_detail::build_snk_pair_table(b, flat_basis, s_exact, cutoff)) {}
+};
 
 #if defined(GPU4DFT_HAVE_CUDA)
 struct SemiNumericalK::CudaState {
@@ -197,7 +479,6 @@ void jacobi_syev(int n, std::vector<double> A, std::vector<double>& w, std::vect
   for (int i = 0; i < n; ++i) w[static_cast<std::size_t>(i)] = A[static_cast<std::size_t>(i) * n + i];
 }
 
-// Computes COSX overlap-fitting operator Q = S_grid^+ * S_exact (+ nullspace identity protection)
 std::vector<double> compute_cosx_q_host(int nao,
                                         const std::vector<double>& s_grid,
                                         const std::vector<double>& s_exact,
@@ -211,8 +492,6 @@ std::vector<double> compute_cosx_q_host(int nao,
   std::vector<double> evecs;
   jacobi_syev(nao, s_grid, evals, evecs);
 
-  // S_grid^+ = sum_{k: eval[k] > tol} (1 / eval[k]) v_k v_k^T
-  // Nullspace protection: P_null = sum_{k: eval[k] <= tol} v_k v_k^T
   std::vector<double> sg_pinv(n * n, 0.0);
   std::vector<double> p_null(n * n, 0.0);
   for (std::size_t k = 0; k < n; ++k) {
@@ -401,14 +680,15 @@ std::vector<double> snk_esp_matrix(const Basis& basis,
   if (nao == 0) return V;
 
   const detail::FlatBasisData flat(basis);
-  const auto pairs = snk_detail::build_snk_shell_pairs(basis, 1e-16);
+  const std::vector<double> empty_s;
+  const auto tbl = snk_detail::build_snk_pair_table(basis, flat, empty_s, 1e-16);
 
   if (backend == Backend::Cuda) {
 #if defined(GPU4DFT_HAVE_CUDA)
     if (snk_detail::snk_cuda_device_count() == 0) {
       throw std::runtime_error("snk_esp_matrix: no CUDA device available");
     }
-    snk_detail::snk_esp_matrix_cuda(flat, pairs,
+    snk_detail::snk_esp_matrix_cuda(flat, tbl.pairs,
                                     point_bohr[0], point_bohr[1], point_bohr[2],
                                     1e-16, V.data());
     return V;
@@ -424,19 +704,42 @@ std::vector<double> snk_esp_matrix(const Basis& basis,
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(dynamic)
 #endif
-  for (std::ptrdiff_t ip = 0; ip < static_cast<std::ptrdiff_t>(pairs.size()); ++ip) {
-    const auto& pr = pairs[static_cast<std::size_t>(ip)];
+  for (std::ptrdiff_t ip = 0; ip < static_cast<std::ptrdiff_t>(tbl.pairs.size()); ++ip) {
+    const auto& pr = tbl.pairs[static_cast<std::size_t>(ip)];
     const int ia = pr.ish_a;
     const int ib = pr.ish_b;
-    const int nma = 2 * bview.shell_l[ia] + 1;
-    const int nmb = 2 * bview.shell_l[ib] + 1;
-    const int ao_a = bview.shell_ao_offset[ia];
-    const int ao_b = bview.shell_ao_offset[ib];
+    const int nma = pr.nma;
+    const int nmb = pr.nmb;
+    const int ao_a = pr.ao_a;
+    const int ao_b = pr.ao_b;
 
     double block[81];
-    snk_detail::eval_shell_pair_esp(bview, ia, ib,
-                                    point_bohr[0], point_bohr[1], point_bohr[2],
-                                    1e-16, block);
+    const int L = pr.la + pr.lb;
+    if (L == 0) {
+      snk_detail::eval_precomputed_pair_esp_host<0>(
+          pr, tbl.prims.data(), tbl.h_coeffs.data(),
+          point_bohr[0], point_bohr[1], point_bohr[2], block);
+    } else if (L == 1) {
+      snk_detail::eval_precomputed_pair_esp_host<1>(
+          pr, tbl.prims.data(), tbl.h_coeffs.data(),
+          point_bohr[0], point_bohr[1], point_bohr[2], block);
+    } else if (L == 2) {
+      snk_detail::eval_precomputed_pair_esp_host<2>(
+          pr, tbl.prims.data(), tbl.h_coeffs.data(),
+          point_bohr[0], point_bohr[1], point_bohr[2], block);
+    } else if (L == 3) {
+      snk_detail::eval_precomputed_pair_esp_host<3>(
+          pr, tbl.prims.data(), tbl.h_coeffs.data(),
+          point_bohr[0], point_bohr[1], point_bohr[2], block);
+    } else if (L == 4) {
+      snk_detail::eval_precomputed_pair_esp_host<4>(
+          pr, tbl.prims.data(), tbl.h_coeffs.data(),
+          point_bohr[0], point_bohr[1], point_bohr[2], block);
+    } else {
+      snk_detail::eval_shell_pair_esp(bview, ia, ib,
+                                      point_bohr[0], point_bohr[1], point_bohr[2],
+                                      1e-16, block);
+    }
 
     for (int ma = 0; ma < nma; ++ma) {
       for (int mb = 0; mb < nmb; ++mb) {
@@ -468,9 +771,11 @@ SemiNumericalK::SemiNumericalK(const Basis& basis, const MolecularGrid& grid,
 #if defined(GPU4DFT_HAVE_CUDA)
     if (snk_detail::snk_cuda_device_count() > 0) {
       const detail::FlatBasisData flat(basis_);
-      const auto pairs = snk_detail::build_snk_shell_pairs(basis_, opts_.pair_cutoff);
+      const auto pair_table =
+          snk_detail::build_snk_pair_table(basis_, flat, s_exact_, opts_.pair_cutoff);
       cuda_ = std::make_unique<CudaState>();
-      cuda_->impl = snk_detail::snk_cuda_create(flat, grid_, pairs, s_exact_, opts_, q_fit_);
+      cuda_->impl =
+          snk_detail::snk_cuda_create(flat, grid_, pair_table, s_exact_, opts_, q_fit_);
       active_backend_ = Backend::Cuda;
       return;
     }
@@ -484,6 +789,7 @@ SemiNumericalK::SemiNumericalK(const Basis& basis, const MolecularGrid& grid,
   }
 
   active_backend_ = Backend::Host;
+  host_pairs_ = std::make_unique<HostPairState>(basis_, s_exact_, opts_.pair_cutoff);
   if (opts_.overlap_fitting && nao > 0 && grid_.npoints() > 0) {
     const std::vector<double> s_grid = compute_grid_overlap_host(basis_, grid_);
     q_fit_ = compute_cosx_q_host(basis_.nao(), s_grid, s_exact_, opts_.lindep_tol);
@@ -524,16 +830,14 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
 #endif
   }
 
-  // Host OpenMP spatially batched semi-numerical exchange (COSX)
-  const detail::FlatBasisData flat(basis_);
-  const detail::FlatBasisView bview = flat.view();
-  const auto pairs = snk_detail::build_snk_shell_pairs(basis_, opts_.pair_cutoff);
+  const detail::FlatBasisView bview = host_pairs_->flat_basis.view();
+  const auto& tbl = host_pairs_->pair_table;
   const auto& batches = grid_.batches();
   const auto& coords = grid_.coords();
   const auto& weights = grid_.weights();
   const int i_nao = static_cast<int>(nao);
+  const int nshell = bview.nshell;
 
-  // Symmetrize input density D
   std::vector<double> dm_sym(nao * nao);
   for (std::size_t i = 0; i < nao; ++i) {
     for (std::size_t j = 0; j < nao; ++j) {
@@ -554,6 +858,7 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
     std::vector<double> f_mat;
     std::vector<double> g_mat;
     std::vector<double> k_batch;
+    std::vector<double> f_sh_max(static_cast<std::size_t>(nshell), 0.0);
 
 #if defined(_OPENMP)
 #pragma omp for schedule(dynamic)
@@ -581,7 +886,6 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
         cur += static_cast<std::size_t>(nm);
       }
 
-      // Gather D_cols [nao x na]: D_cols[v, u] = dm_sym[v, act[u]]
       d_cols.resize(nao * na);
       for (std::size_t v = 0; v < nao; ++v) {
         for (std::size_t u = 0; u < na; ++u) {
@@ -589,43 +893,94 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
         }
       }
 
-      // GEMM 1: F [nao x ng] = D_cols [nao x na] * Phi [na x ng]
       f_mat.resize(nao * ng);
       host_gemm_nn(i_nao, i_ng, i_na, d_cols.data(), phi.data(), f_mat.data(), false);
 
-      // 1e ESP shell-pair contraction: G[v, g] = sum_s A_{vs}(r_g) F[s, g]
+      // Compute per-shell max |F| across this spatial batch for exact Cauchy-Schwarz screening
+      for (int is = 0; is < nshell; ++is) {
+        const int nm = 2 * bview.shell_l[is] + 1;
+        const std::size_t ao0 = static_cast<std::size_t>(bview.shell_ao_offset[is]);
+        double mval = 0.0;
+        for (int m = 0; m < nm; ++m) {
+          const double* row = f_mat.data() + (ao0 + static_cast<std::size_t>(m)) * ng;
+          for (std::size_t g = 0; g < ng; ++g) {
+            mval = std::max(mval, std::abs(row[g]));
+          }
+        }
+        f_sh_max[static_cast<std::size_t>(is)] = mval;
+      }
+
       g_mat.assign(nao * ng, 0.0);
-      for (const auto& pr : pairs) {
+      for (const auto& pr : tbl.pairs) {
         const int sa = pr.ish_a;
         const int sb = pr.ish_b;
-        const int nma = 2 * bview.shell_l[sa] + 1;
-        const int nmb = 2 * bview.shell_l[sb] + 1;
-        const std::size_t ao_a = static_cast<std::size_t>(bview.shell_ao_offset[sa]);
-        const std::size_t ao_b = static_cast<std::size_t>(bview.shell_ao_offset[sb]);
+        const double f_ub = std::max(f_sh_max[static_cast<std::size_t>(sa)],
+                                     f_sh_max[static_cast<std::size_t>(sb)]);
+        if (f_ub == 0.0) continue;
+
+        double d2_box = 0.0;
+        for (int d = 0; d < 3; ++d) {
+          double dd = 0.0;
+          if (pr.center[d] < b.box_min[d]) dd = b.box_min[d] - pr.center[d];
+          else if (pr.center[d] > b.box_max[d]) dd = pr.center[d] - b.box_max[d];
+          d2_box += dd * dd;
+        }
+        const double dist_box = std::sqrt(d2_box);
+        const double v_ub = (dist_box > pr.extent_radius + 1.0)
+                                ? (pr.q_far_bound / (dist_box - pr.extent_radius))
+                                : pr.v_max_near;
+        if (v_ub * f_ub < 1e-14) continue;
+
+        const int nma = pr.nma;
+        const int nmb = pr.nmb;
+        const std::size_t ao_a = static_cast<std::size_t>(pr.ao_a);
+        const std::size_t ao_b = static_cast<std::size_t>(pr.ao_b);
+        const int L = pr.la + pr.lb;
 
         for (std::size_t g = 0; g < ng; ++g) {
           const std::size_t gp = b.point_offset + g;
+          const double gx = coords[3 * gp + 0];
+          const double gy = coords[3 * gp + 1];
+          const double gz = coords[3 * gp + 2];
+
           double v_block[81];
-          snk_detail::eval_shell_pair_esp(
-              bview, sa, sb,
-              coords[3 * gp + 0], coords[3 * gp + 1], coords[3 * gp + 2],
-              opts_.pair_cutoff, v_block);
+          if (L == 0) {
+            snk_detail::eval_precomputed_pair_esp_host<0>(
+                pr, tbl.prims.data(), tbl.h_coeffs.data(), gx, gy, gz, v_block);
+          } else if (L == 1) {
+            snk_detail::eval_precomputed_pair_esp_host<1>(
+                pr, tbl.prims.data(), tbl.h_coeffs.data(), gx, gy, gz, v_block);
+          } else if (L == 2) {
+            snk_detail::eval_precomputed_pair_esp_host<2>(
+                pr, tbl.prims.data(), tbl.h_coeffs.data(), gx, gy, gz, v_block);
+          } else if (L == 3) {
+            snk_detail::eval_precomputed_pair_esp_host<3>(
+                pr, tbl.prims.data(), tbl.h_coeffs.data(), gx, gy, gz, v_block);
+          } else if (L == 4) {
+            snk_detail::eval_precomputed_pair_esp_host<4>(
+                pr, tbl.prims.data(), tbl.h_coeffs.data(), gx, gy, gz, v_block);
+          } else {
+            snk_detail::eval_shell_pair_esp(
+                bview, sa, sb, gx, gy, gz, opts_.pair_cutoff, v_block);
+          }
 
           for (int ma = 0; ma < nma; ++ma) {
             const std::size_t ua = ao_a + static_cast<std::size_t>(ma);
+            const double fa_g = f_mat[ua * ng + g];
+            double acc_a = 0.0;
             for (int mb = 0; mb < nmb; ++mb) {
               const std::size_t ub = ao_b + static_cast<std::size_t>(mb);
               const double a_uv = v_block[ma * nmb + mb];
-              g_mat[ua * ng + g] += a_uv * f_mat[ub * ng + g];
+              acc_a += a_uv * f_mat[ub * ng + g];
               if (sa != sb) {
-                g_mat[ub * ng + g] += a_uv * f_mat[ua * ng + g];
+                g_mat[ub * ng + g] += a_uv * fa_g;
               }
             }
+            g_mat[ua * ng + g] += acc_a;
           }
         }
       }
 
-      // Weight Phi_w [na x ng] = w_g * Phi[u, g]
       phi_w.resize(na * ng);
       for (std::size_t u = 0; u < na; ++u) {
         for (std::size_t g = 0; g < ng; ++g) {
@@ -633,7 +988,6 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
         }
       }
 
-      // GEMM 2: K_batch [na x nao] = Phi_w [na x ng] * G^T [ng x nao]
       k_batch.resize(na * nao);
       host_gemm_nt(i_na, i_nao, i_ng, phi_w.data(), g_mat.data(), k_batch.data(), false);
 
@@ -654,7 +1008,6 @@ void SemiNumericalK::compute_k(const double* dm, double* vk_out) const {
   }
 
   if (opts_.overlap_fitting) {
-    // Symmetrized COSX overlap-fitted exchange: 0.5 * (Q^T * K_raw + K_raw^T * Q)
     std::vector<double> qtk(nao * nao, 0.0);
     host_gemm_tn(i_nao, i_nao, i_nao, q_fit_.data(), k_raw.data(), qtk.data(), false);
     for (std::size_t i = 0; i < nao; ++i) {
@@ -887,7 +1240,7 @@ int gpu4dft_xc_c_eval_vxc(int nshell,
     const auto grid = gpu4dft::MolecularGrid::from_points(
         std::span<const double>(grid_coords, un * 3),
         std::span<const double>(grid_weights, un),
-        basis, 256, 1e-16);
+        basis, 2048, 1e-16);
     gpu4dft::XcOptions opts;
     opts.backend = (backend == 1) ? gpu4dft::Backend::Cuda : gpu4dft::Backend::Host;
     opts.precision = (precision == 1) ? gpu4dft::Precision::FP32 : gpu4dft::Precision::FP64;
@@ -921,6 +1274,79 @@ int gpu4dft_xc_c_eval_vxc(int nshell,
   }
 }
 
+int gpu4dft_xc_c_eval_fxc(int nshell,
+                          const int* sh_l,
+                          const double* sh_center,
+                          const int* sh_nprim,
+                          const double* prim_exp,
+                          const double* prim_coeff,
+                          int npts,
+                          const double* grid_coords,
+                          const double* grid_weights,
+                          const char* xc_name,
+                          int backend,
+                          int precision,
+                          int use_device_api,
+                          const double* dm0,
+                          int n_pert,
+                          const double* delta_dms,
+                          double* fxc_out) {
+  try {
+    const auto basis = build_basis_from_c(nshell, sh_l, sh_center, sh_nprim, prim_exp, prim_coeff);
+    const std::size_t un = static_cast<std::size_t>(npts);
+    const auto grid = gpu4dft::MolecularGrid::from_points(
+        std::span<const double>(grid_coords, un * 3),
+        std::span<const double>(grid_weights, un),
+        basis, 2048, 1e-16);
+    gpu4dft::XcOptions opts;
+    opts.backend = (backend == 1) ? gpu4dft::Backend::Cuda : gpu4dft::Backend::Host;
+    opts.precision = (precision == 1) ? gpu4dft::Precision::FP32 : gpu4dft::Precision::FP64;
+    gpu4dft::XcEngine eng(basis, grid, xc_name, opts);
+
+    const std::size_t nao2 = static_cast<std::size_t>(basis.nao()) * basis.nao();
+
+    if (use_device_api && opts.backend == gpu4dft::Backend::Cuda) {
+#if defined(GPU4DFT_HAVE_CUDA)
+      double *d_dm0 = nullptr, *d_ddm = nullptr, *d_fxc = nullptr;
+      if (cudaMalloc(&d_dm0, nao2 * sizeof(double)) != cudaSuccess) return -2;
+      if (cudaMalloc(&d_ddm, nao2 * sizeof(double)) != cudaSuccess) {
+        cudaFree(d_dm0);
+        return -2;
+      }
+      if (cudaMalloc(&d_fxc, nao2 * sizeof(double)) != cudaSuccess) {
+        cudaFree(d_dm0);
+        cudaFree(d_ddm);
+        return -2;
+      }
+      cudaMemcpy(d_dm0, dm0, nao2 * sizeof(double), cudaMemcpyHostToDevice);
+      eng.set_reference_density_device(d_dm0, nullptr);
+      for (int p = 0; p < n_pert; ++p) {
+        cudaMemcpy(d_ddm, delta_dms + static_cast<std::size_t>(p) * nao2,
+                   nao2 * sizeof(double), cudaMemcpyHostToDevice);
+        eng.eval_fxc_device(d_ddm, d_fxc, nullptr);
+        cudaMemcpy(fxc_out + static_cast<std::size_t>(p) * nao2, d_fxc,
+                   nao2 * sizeof(double), cudaMemcpyDeviceToHost);
+      }
+      cudaFree(d_dm0);
+      cudaFree(d_ddm);
+      cudaFree(d_fxc);
+      return 0;
+#else
+      return -1;
+#endif
+    }
+
+    eng.set_reference_density(dm0);
+    for (int p = 0; p < n_pert; ++p) {
+      eng.eval_fxc(delta_dms + static_cast<std::size_t>(p) * nao2,
+                   fxc_out + static_cast<std::size_t>(p) * nao2);
+    }
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
 int gpu4dft_xc_c_nuclear_grad(int natom,
                               const int* atomic_nums,
                               const double* atom_coords,
@@ -944,7 +1370,7 @@ int gpu4dft_xc_c_nuclear_grad(int natom,
     const auto grid = gpu4dft::MolecularGrid::from_points(
         std::span<const double>(grid_coords, un * 3),
         std::span<const double>(grid_weights, un),
-        basis, 256, 1e-16);
+        basis, 2048, 1e-16);
     const auto bk = (backend == 1) ? gpu4dft::Backend::Cuda : gpu4dft::Backend::Host;
     const auto g = gpu4dft::xc_nuclear_grad(basis, grid, atoms, xc_name, dm, bk);
     std::copy(g.begin(), g.end(), grad_out);
@@ -1012,7 +1438,7 @@ int gpu4dft_xc_c_snk_compute_k(int nshell,
     const auto grid = gpu4dft::MolecularGrid::from_points(
         std::span<const double>(grid_coords, un * 3),
         std::span<const double>(grid_weights, un),
-        basis, 256, 1e-13);
+        basis, 2048, 1e-13);
     gpu4dft::SnkOptions opts;
     opts.backend = (backend == 1) ? gpu4dft::Backend::Cuda : gpu4dft::Backend::Host;
     opts.precision = (precision == 1) ? gpu4dft::Precision::FP32 : gpu4dft::Precision::FP64;

@@ -1,8 +1,11 @@
-"""PySCF-style Python frontend wrapping the zero-Python-hot-path C++20/CUDA SCF workflow."""
+"""PySCF-style Python frontend wrapping the zero-Python-hot-path C++20/CUDA SCF,
+TDDFT/TDA/CIS Linear Response, Analytical Nuclear Gradients, and Nuclear Hessian workflows.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import numpy as np
@@ -15,10 +18,15 @@ from ._core import (
     DensitySolver,
     GemmMode,
     GradientResult,
+    HessianOptions,
     JKMode,
     MolecularScf,
     PartitionScheme,
     Precision,
+    ResponseMethod,
+    ResponseOptions,
+    ResponseResult,
+    VibrationalResult,
     WorkflowOptions,
     WorkflowResult,
 )
@@ -28,6 +36,8 @@ from .pyscf_interface import (
     basis_from_pyscf,
     minao_init_guess,
 )
+
+AU_TO_DEBYE = 2.541746473
 
 
 def _coerce_enum(enum_cls, val):
@@ -73,7 +83,7 @@ class GridsConfig:
         n_ang: int = 0,
         prune: bool = True,
         partition: PartitionScheme | str = "stratmann",
-        max_batch_points: int = 256,
+        max_batch_points: int = 2048,
         ao_cutoff: float = 1e-12,
     ) -> None:
         self.level = int(level)
@@ -106,6 +116,208 @@ class NuclearGradients:
 
     def grad(self, dm: np.ndarray | None = None) -> np.ndarray:
         return self.kernel(dm=dm)
+
+
+class LinearResponseSCF:
+    """PySCF-like CIS / TDA / TDHF / TDDFT driver (`mf.TDA().kernel()`, `mf.TDDFT().kernel()`).
+
+    Executes the entire Block-Davidson / Casida / SSF-RPA Krylov solver in C++20/CUDA
+    reusing GPU-resident `DirectJKEngine` / `RIJKEngine` (supporting `.density_fit()` RI-TDDFT!)
+    and GPU cached-AO 2nd-derivative `XcEngine::eval_fxc_device`.
+    """
+
+    def __init__(
+        self,
+        mf: _SCFBase,
+        *,
+        method: ResponseMethod | str = "tddft",
+        nstates: int | None = None,
+        n_states: int | None = None,
+        conv_tol: float = 1e-7,
+        max_cycle: int | None = None,
+        max_iter: int | None = None,
+        max_space: int | None = None,
+        max_subspace: int | None = None,
+        backend: Backend | str | None = None,
+        gemm_mode: GemmMode | str | None = None,
+        dynamic_precision: bool = False,
+        early_gemm_mode: GemmMode | str = "fp32",
+        fp64_switch_residual: float = 1e-3,
+        ozaki_slices: int | None = None,
+        denom_floor: float = 1e-8,
+    ) -> None:
+        self.base = mf
+        self.method = _coerce_enum(ResponseMethod, method)
+        self.nstates = int(nstates if nstates is not None else (n_states if n_states is not None else 5))
+        self.conv_tol = float(conv_tol)
+        self.max_cycle = int(
+            max_cycle if max_cycle is not None else (max_iter if max_iter is not None else 60)
+        )
+        self.max_space = int(
+            max_space if max_space is not None else (max_subspace if max_subspace is not None else 100)
+        )
+        self.backend = mf.backend if backend is None else _coerce_enum(Backend, backend)
+        self.gemm_mode = mf.gemm_mode if gemm_mode is None else _coerce_enum(GemmMode, gemm_mode)
+        self.dynamic_precision = bool(dynamic_precision)
+        self.early_gemm_mode = _coerce_enum(GemmMode, early_gemm_mode)
+        self.fp64_switch_residual = float(fp64_switch_residual)
+        self.ozaki_slices = int(mf.ozaki_slices if ozaki_slices is None else ozaki_slices)
+        self.denom_floor = float(denom_floor)
+
+        self.result: ResponseResult | None = None
+        self.converged: bool = False
+        self.iterations: int = 0
+        self.e: np.ndarray | None = None
+        self.e_ev: np.ndarray | None = None
+        self.f_osc: np.ndarray | None = None
+        self.transition_dipoles: np.ndarray | None = None
+        self.x_vectors: np.ndarray | None = None
+        self.y_vectors: np.ndarray | None = None
+        self.xy: list[tuple[np.ndarray, np.ndarray]] | None = None
+
+    def kernel(
+        self, nstates: int | None = None
+    ) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]]]:
+        if nstates is not None:
+            self.nstates = int(nstates)
+        if self.base.result is None:
+            self.base.kernel()
+        assert self.base._engine is not None
+
+        opts = ResponseOptions()
+        opts.backend = _coerce_enum(Backend, self.backend)
+        opts.method = _coerce_enum(ResponseMethod, self.method)
+        opts.gemm_mode = _coerce_enum(GemmMode, self.gemm_mode)
+        opts.dynamic_precision = bool(self.dynamic_precision)
+        opts.early_gemm_mode = _coerce_enum(GemmMode, self.early_gemm_mode)
+        opts.fp64_switch_residual = float(self.fp64_switch_residual)
+        opts.ozaki_slices = int(self.ozaki_slices)
+        opts.n_states = int(self.nstates)
+        opts.max_iter = int(self.max_cycle)
+        opts.max_subspace = int(self.max_space)
+        opts.conv_tol = float(self.conv_tol)
+        opts.denom_floor = float(self.denom_floor)
+
+        res = self.base._engine.run_response(opts)
+        self.result = res
+        self.converged = bool(res.converged)
+        self.iterations = int(res.iterations)
+        self.e = np.asarray(res.excitation_energies, dtype=np.float64)
+        self.e_ev = np.asarray(res.excitation_energies_ev, dtype=np.float64)
+        self.f_osc = np.asarray(res.oscillator_strengths, dtype=np.float64)
+        self.transition_dipoles = np.asarray(res.transition_dipoles, dtype=np.float64)
+        self.x_vectors = np.asarray(res.x_vectors, dtype=np.float64)
+        self.y_vectors = np.asarray(res.y_vectors, dtype=np.float64)
+
+        inv_sqrt2 = 1.0 / math.sqrt(2.0)
+        is_tda = opts.method == ResponseMethod.tda
+        self.xy = [
+            (
+                self.x_vectors[k] * inv_sqrt2,
+                0.0 if is_tda else (self.y_vectors[k] * inv_sqrt2),
+            )
+            for k in range(int(res.n_states))
+        ]
+        return self.e, self.xy
+
+    def run(self, nstates: int | None = None) -> LinearResponseSCF:
+        self.kernel(nstates=nstates)
+        return self
+
+    def oscillator_strength(self) -> np.ndarray:
+        if self.f_osc is None:
+            self.kernel()
+        assert self.f_osc is not None
+        return self.f_osc
+
+    def transition_dipole(self) -> np.ndarray:
+        if self.transition_dipoles is None:
+            self.kernel()
+        assert self.transition_dipoles is not None
+        return self.transition_dipoles
+
+
+class NuclearHessian:
+    """PySCF-like molecular nuclear Hessian & harmonic vibrational frequency driver (`mf.Hessian()`)."""
+
+    def __init__(
+        self,
+        mf: _SCFBase,
+        *,
+        step_bohr: float = 1e-3,
+        project_trans_rot: bool = True,
+        fixed_xc_grid: bool = True,
+        masses: np.ndarray | list[float] | None = None,
+        backend: Backend | str | None = None,
+    ) -> None:
+        self.base = mf
+        self.step_bohr = float(step_bohr)
+        self.project_trans_rot = bool(project_trans_rot)
+        self.fixed_xc_grid = bool(fixed_xc_grid)
+        self.masses = masses
+        self.backend = mf.backend if backend is None else _coerce_enum(Backend, backend)
+
+        self.result: VibrationalResult | None = None
+        self.de: np.ndarray | None = None
+        self.hessian_2d: np.ndarray | None = None
+        self.frequencies_cm1: np.ndarray | None = None
+        self.reduced_masses_amu: np.ndarray | None = None
+        self.force_constants_au: np.ndarray | None = None
+        self.normal_modes: np.ndarray | None = None
+        self.zpe_hartree: float = 0.0
+
+    @property
+    def grid_response(self) -> bool:
+        return not self.fixed_xc_grid
+
+    @grid_response.setter
+    def grid_response(self, val: bool) -> None:
+        self.fixed_xc_grid = not bool(val)
+
+    def kernel(self) -> np.ndarray:
+        if self.base.result is None:
+            self.base.kernel()
+        assert self.base._engine is not None
+
+        opts = HessianOptions()
+        opts.backend = _coerce_enum(Backend, self.backend)
+        opts.step_bohr = float(self.step_bohr)
+        opts.project_trans_rot = bool(self.project_trans_rot)
+        opts.fixed_xc_grid = bool(self.fixed_xc_grid)
+
+        m_arr = (
+            None
+            if self.masses is None
+            else np.ascontiguousarray(self.masses, dtype=np.float64)
+        )
+        vres = self.base._engine.run_hessian(opts=opts, masses=m_arr)
+        self.result = vres
+        n = int(vres.natom)
+        h2 = np.asarray(vres.hessian, dtype=np.float64)
+        self.hessian_2d = h2
+        # PySCF Hessian convention: shape (natom, natom, 3, 3)
+        self.de = np.ascontiguousarray(h2.reshape(n, 3, n, 3).transpose(0, 2, 1, 3))
+        self.frequencies_cm1 = np.asarray(vres.frequencies_cm1, dtype=np.float64)
+        self.reduced_masses_amu = np.asarray(vres.reduced_masses_amu, dtype=np.float64)
+        self.force_constants_au = np.asarray(vres.force_constants_au, dtype=np.float64)
+        self.normal_modes = np.asarray(vres.normal_modes, dtype=np.float64)
+        self.zpe_hartree = float(vres.zero_point_energy_hartree)
+        return self.de
+
+    def run(self) -> NuclearHessian:
+        self.kernel()
+        return self
+
+    def harmonic_analysis(self) -> dict[str, Any]:
+        if self.result is None:
+            self.kernel()
+        return {
+            "freq_wavenumber": self.frequencies_cm1,
+            "reduced_mass": self.reduced_masses_amu,
+            "force_const_au": self.force_constants_au,
+            "norm_mode": self.normal_modes,
+            "zpe_hartree": self.zpe_hartree,
+        }
 
 
 class _SCFBase:
@@ -357,6 +569,7 @@ class _SCFBase:
             self.grids.n_ang,
             self.grids.prune,
             str(self.grids.partition),
+            self.grids.max_batch_points,
             g_id,
             self.conv_tol,
             self.diis_tol,
@@ -478,6 +691,46 @@ class _SCFBase:
         if self.result is None:
             raise RuntimeError("SCF has not been run yet; call .kernel() first")
         return np.asarray(self.result.scf.fock_matrix, dtype=np.float64)
+
+    def dipole_moment(
+        self,
+        unit: str = "Debye",
+        origin: tuple[float, float, float] | np.ndarray = (0.0, 0.0, 0.0),
+    ) -> np.ndarray:
+        """Compute permanent molecular dipole moment in `'Debye'` (default) or `'AU'` (`e*Bohr`)."""
+        if self.result is None:
+            self.kernel()
+        assert self._engine is not None
+        orig = (float(origin[0]), float(origin[1]), float(origin[2]))
+        mu_au = np.asarray(self._engine.compute_dipole(orig), dtype=np.float64)
+        u = unit.strip().lower()
+        if u in ("debye", "d"):
+            return mu_au * AU_TO_DEBYE
+        if u in ("au", "a.u.", "atomic", "bohr", "e*bohr"):
+            return mu_au
+        raise ValueError(f"unknown dipole unit {unit!r}; choose 'Debye' or 'AU'")
+
+    dip_moment = dipole_moment
+
+    def CIS(self, **kwargs: Any) -> LinearResponseSCF:
+        """Configuration Interaction Singles / Tamm-Dancoff excited-state driver."""
+        return LinearResponseSCF(self, method=ResponseMethod.tda, **kwargs)
+
+    def TDA(self, **kwargs: Any) -> LinearResponseSCF:
+        """Tamm-Dancoff Approximation singlet excited-state driver (Direct or RI-TDA)."""
+        return LinearResponseSCF(self, method=ResponseMethod.tda, **kwargs)
+
+    def TDHF(self, **kwargs: Any) -> LinearResponseSCF:
+        """Time-Dependent Hartree-Fock / RPA singlet excited-state driver."""
+        return LinearResponseSCF(self, method=ResponseMethod.tddft, **kwargs)
+
+    def TDDFT(self, **kwargs: Any) -> LinearResponseSCF:
+        """Full Casida / SSF-RPA Time-Dependent DFT excited-state driver (Direct or RI-TDDFT)."""
+        return LinearResponseSCF(self, method=ResponseMethod.tddft, **kwargs)
+
+    def Hessian(self, **kwargs: Any) -> NuclearHessian:
+        """Seminumerical molecular nuclear Hessian & harmonic vibrational analysis driver."""
+        return NuclearHessian(self, **kwargs)
 
     def nuc_grad_method(self) -> NuclearGradients:
         return NuclearGradients(self)

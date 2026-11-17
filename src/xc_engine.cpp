@@ -31,6 +31,23 @@ void eval_ao_grid_cuda(const FlatBasisData& flat_basis,
 #endif
 }  // namespace detail
 
+struct XcEngine::HostFxcState {
+  bool ready = false;
+  std::vector<double> v2rho2;
+  std::vector<double> g0x;
+  std::vector<double> g0y;
+  std::vector<double> g0z;
+  std::vector<double> vsigma;
+  std::vector<double> v2rhosigma;
+  std::vector<double> v2sigma2;
+  std::vector<double> v2rhotau;
+  std::vector<double> v2sigmatau;
+  std::vector<double> v2tau2;
+  bool ao_cached = false;
+  std::vector<std::size_t> batch_phi_offset;
+  std::vector<double> phi_cache;
+};
+
 #if defined(GPU4DFT_HAVE_CUDA)
 struct XcEngine::CudaState {
   void* impl = nullptr;
@@ -52,6 +69,19 @@ double xc_cuda_eval_vxc_host(void* impl,
                              const double* h_dm,
                              double* h_vxc,
                              double* nelec_out);
+void xc_cuda_set_reference_density_device(void* impl,
+                                          const double* d_dm,
+                                          void* cuda_stream);
+void xc_cuda_set_reference_density_host(void* impl,
+                                        const double* h_dm);
+bool xc_cuda_has_reference_density(const void* impl) noexcept;
+void xc_cuda_eval_fxc_device(void* impl,
+                             const double* d_delta_dm,
+                             double* d_fxc_out,
+                             void* cuda_stream);
+void xc_cuda_eval_fxc_host(void* impl,
+                           const double* h_delta_dm,
+                           double* h_fxc_out);
 std::vector<double> xc_cuda_nuclear_grad(void* impl,
                                          const int* ao_to_atom,
                                          int natom,
@@ -541,6 +571,494 @@ double XcEngine::eval_vxc_device(const double* d_dm, double* d_vxc, void* cuda_s
 #else
   (void)d_dm;
   (void)d_vxc;
+  (void)cuda_stream;
+  throw std::runtime_error("gpu4dft was built without CUDA");
+#endif
+}
+
+void XcEngine::set_reference_density(std::span<const double> h_dm) {
+  const std::size_t n = static_cast<std::size_t>(basis_.nao());
+  if (h_dm.size() != n * n) {
+    throw std::invalid_argument("XcEngine::set_reference_density: dm size must equal nao * nao");
+  }
+  set_reference_density(h_dm.data());
+}
+
+void XcEngine::set_reference_density(const double* h_dm) {
+  const std::size_t nao = static_cast<std::size_t>(basis_.nao());
+  if (nao > 0 && h_dm == nullptr) {
+    throw std::invalid_argument("XcEngine::set_reference_density: h_dm must not be null");
+  }
+
+  if (active_backend_ == Backend::Cuda) {
+#if defined(GPU4DFT_HAVE_CUDA)
+    detail::xc_cuda_set_reference_density_host(cuda_->impl, h_dm);
+    return;
+#endif
+  }
+
+  if (!host_fxc_) {
+    host_fxc_ = std::make_unique<HostFxcState>();
+  }
+  HostFxcState& st = *host_fxc_;
+  const std::size_t npts = grid_.npoints();
+  st.v2rho2.assign(npts, 0.0);
+  if (xc_family_ >= 1) {
+    st.g0x.assign(npts, 0.0);
+    st.g0y.assign(npts, 0.0);
+    st.g0z.assign(npts, 0.0);
+    st.vsigma.assign(npts, 0.0);
+    st.v2rhosigma.assign(npts, 0.0);
+    st.v2sigma2.assign(npts, 0.0);
+  }
+  if (xc_family_ == 2) {
+    st.v2rhotau.assign(npts, 0.0);
+    st.v2sigmatau.assign(npts, 0.0);
+    st.v2tau2.assign(npts, 0.0);
+  }
+  if (nao == 0 || npts == 0) {
+    st.ready = true;
+    return;
+  }
+
+  const detail::FlatBasisData flat(basis_);
+  const detail::FlatBasisView bview = flat.view();
+  const auto fid = static_cast<xc_gen::XcFunctionalId>(xc_func_id_);
+  const int deriv = (xc_family_ == 0) ? 0 : 1;
+  const std::size_t ncomp = (deriv == 0) ? 1 : 4;
+  const auto& batches = grid_.batches();
+  const auto& coords = grid_.coords();
+
+  // Cache host active-batch Phi if within 512 MiB so repeated TDDFT eval_fxc calls skip AO eval
+  if (!st.ao_cached) {
+    std::size_t total_elems = 0;
+    st.batch_phi_offset.resize(batches.size(), 0);
+    for (std::size_t ib = 0; ib < batches.size(); ++ib) {
+      st.batch_phi_offset[ib] = total_elems;
+      total_elems += ncomp * batches[ib].active_aos.size() * batches[ib].npoints;
+    }
+    if (total_elems > 0 && total_elems * sizeof(double) <= (512ULL << 20)) {
+      st.phi_cache.assign(total_elems, 0.0);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic)
+#endif
+      for (std::ptrdiff_t ib = 0; ib < static_cast<std::ptrdiff_t>(batches.size()); ++ib) {
+        const SpatialBatch& batch = batches[static_cast<std::size_t>(ib)];
+        const std::size_t ng = batch.npoints;
+        const std::size_t na = batch.active_aos.size();
+        if (ng == 0 || na == 0) continue;
+        const std::size_t comp_stride = na * ng;
+        double* dst = st.phi_cache.data() + st.batch_phi_offset[static_cast<std::size_t>(ib)];
+        std::size_t local_ao_cursor = 0;
+        for (int is : batch.active_shells) {
+          const int nm = 2 * bview.shell_l[is] + 1;
+          for (std::size_t g = 0; g < ng; ++g) {
+            const std::size_t gp = batch.point_offset + g;
+            detail::eval_shell_at_point(
+                bview, is,
+                coords[3 * gp + 0], coords[3 * gp + 1], coords[3 * gp + 2],
+                deriv, dst + local_ao_cursor * ng + g, comp_stride, ng);
+          }
+          local_ao_cursor += static_cast<std::size_t>(nm);
+        }
+      }
+      st.ao_cached = true;
+    } else {
+      st.batch_phi_offset.clear();
+    }
+  }
+
+#if defined(_OPENMP)
+#pragma omp parallel
+#endif
+  {
+    std::vector<double> phi_local;
+    std::vector<double> d_act;
+    std::vector<double> t_mat;
+    std::vector<double> rho_g, gx_g, gy_g, gz_g, tau_g;
+
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+    for (std::ptrdiff_t ib = 0; ib < static_cast<std::ptrdiff_t>(batches.size()); ++ib) {
+      const std::size_t uib = static_cast<std::size_t>(ib);
+      const SpatialBatch& batch = batches[uib];
+      const std::size_t ng = batch.npoints;
+      const std::size_t na = batch.active_aos.size();
+      if (ng == 0 || na == 0) continue;
+
+      const std::size_t comp_stride = na * ng;
+      const double* phi_ptr = nullptr;
+      if (st.ao_cached) {
+        phi_ptr = st.phi_cache.data() + st.batch_phi_offset[uib];
+      } else {
+        phi_local.assign(ncomp * comp_stride, 0.0);
+        std::size_t local_ao_cursor = 0;
+        for (int is : batch.active_shells) {
+          const int nm = 2 * bview.shell_l[is] + 1;
+          for (std::size_t g = 0; g < ng; ++g) {
+            const std::size_t gp = batch.point_offset + g;
+            detail::eval_shell_at_point(
+                bview, is,
+                coords[3 * gp + 0], coords[3 * gp + 1], coords[3 * gp + 2],
+                deriv, phi_local.data() + local_ao_cursor * ng + g, comp_stride, ng);
+          }
+          local_ao_cursor += static_cast<std::size_t>(nm);
+        }
+        phi_ptr = phi_local.data();
+      }
+
+      d_act.resize(na * na);
+      for (std::size_t u = 0; u < na; ++u) {
+        const std::size_t gu = static_cast<std::size_t>(batch.active_aos[u]);
+        for (std::size_t v = 0; v < na; ++v) {
+          const std::size_t gv = static_cast<std::size_t>(batch.active_aos[v]);
+          d_act[u * na + v] = 0.5 * (h_dm[gu * nao + gv] + h_dm[gv * nao + gu]);
+        }
+      }
+
+      const int i_na = static_cast<int>(na);
+      const int i_ng = static_cast<int>(ng);
+      const std::size_t n_tcomp = (xc_family_ == 2) ? 4 : 1;
+      t_mat.resize(n_tcomp * comp_stride);
+      host_gemm_nn(i_na, i_ng, i_na, d_act.data(), phi_ptr, t_mat.data(), false);
+      if (xc_family_ == 2) {
+        for (std::size_t b = 1; b <= 3; ++b) {
+          host_gemm_nn(i_na, i_ng, i_na, d_act.data(),
+                       phi_ptr + b * comp_stride,
+                       t_mat.data() + b * comp_stride, false);
+        }
+      }
+
+      rho_g.assign(ng, 0.0);
+      if (xc_family_ >= 1) {
+        gx_g.assign(ng, 0.0);
+        gy_g.assign(ng, 0.0);
+        gz_g.assign(ng, 0.0);
+      }
+      if (xc_family_ == 2) {
+        tau_g.assign(ng, 0.0);
+      }
+
+      const double* phi0 = phi_ptr;
+      const double* phix = (xc_family_ >= 1) ? (phi_ptr + 1 * comp_stride) : nullptr;
+      const double* phiy = (xc_family_ >= 1) ? (phi_ptr + 2 * comp_stride) : nullptr;
+      const double* phiz = (xc_family_ >= 1) ? (phi_ptr + 3 * comp_stride) : nullptr;
+      const double* t0 = t_mat.data();
+
+      for (std::size_t u = 0; u < na; ++u) {
+        for (std::size_t g = 0; g < ng; ++g) {
+          const std::size_t off = u * ng + g;
+          const double t0_ug = t0[off];
+          rho_g[g] += phi0[off] * t0_ug;
+          if (xc_family_ >= 1) {
+            gx_g[g] += 2.0 * phix[off] * t0_ug;
+            gy_g[g] += 2.0 * phiy[off] * t0_ug;
+            gz_g[g] += 2.0 * phiz[off] * t0_ug;
+          }
+          if (xc_family_ == 2) {
+            tau_g[g] += 0.5 * (phix[off] * t_mat[1 * comp_stride + off] +
+                               phiy[off] * t_mat[2 * comp_stride + off] +
+                               phiz[off] * t_mat[3 * comp_stride + off]);
+          }
+        }
+      }
+
+      for (std::size_t g = 0; g < ng; ++g) {
+        const std::size_t gp = batch.point_offset + g;
+        const double r = rho_g[g];
+        const double s = (xc_family_ >= 1)
+                             ? (gx_g[g] * gx_g[g] + gy_g[g] * gy_g[g] + gz_g[g] * gz_g[g])
+                             : 0.0;
+        const double t = (xc_family_ == 2) ? tau_g[g] : 0.0;
+
+        xc_gen::XcPointOut pt;
+        xc_gen::eval_xc_point(fid, r, s, t, 2, pt, opts_.rho_cutoff);
+        st.v2rho2[gp] = pt.v2rho2;
+        if (xc_family_ >= 1) {
+          st.g0x[gp] = gx_g[g];
+          st.g0y[gp] = gy_g[g];
+          st.g0z[gp] = gz_g[g];
+          st.vsigma[gp] = pt.vsigma;
+          st.v2rhosigma[gp] = pt.v2rhosigma;
+          st.v2sigma2[gp] = pt.v2sigma2;
+        }
+        if (xc_family_ == 2) {
+          st.v2rhotau[gp] = pt.v2rhotau;
+          st.v2sigmatau[gp] = pt.v2sigmatau;
+          st.v2tau2[gp] = pt.v2tau2;
+        }
+      }
+    }
+  }
+  st.ready = true;
+}
+
+void XcEngine::set_reference_density_device(const double* d_dm, void* cuda_stream) {
+  if (active_backend_ != Backend::Cuda) {
+    throw std::runtime_error("XcEngine::set_reference_density_device requires Backend::Cuda");
+  }
+  if (basis_.nao() > 0 && d_dm == nullptr) {
+    throw std::invalid_argument("XcEngine::set_reference_density_device: d_dm must not be null");
+  }
+#if defined(GPU4DFT_HAVE_CUDA)
+  detail::xc_cuda_set_reference_density_device(cuda_->impl, d_dm, cuda_stream);
+#else
+  (void)d_dm;
+  (void)cuda_stream;
+  throw std::runtime_error("gpu4dft was built without CUDA");
+#endif
+}
+
+bool XcEngine::has_reference_density() const noexcept {
+  if (active_backend_ == Backend::Cuda) {
+#if defined(GPU4DFT_HAVE_CUDA)
+    return cuda_ && cuda_->impl && detail::xc_cuda_has_reference_density(cuda_->impl);
+#else
+    return false;
+#endif
+  }
+  return host_fxc_ && host_fxc_->ready;
+}
+
+std::vector<double> XcEngine::eval_fxc(std::span<const double> h_delta_dm) const {
+  const std::size_t n = static_cast<std::size_t>(basis_.nao());
+  if (h_delta_dm.size() != n * n) {
+    throw std::invalid_argument("XcEngine::eval_fxc: delta_dm size must equal nao * nao");
+  }
+  return eval_fxc(h_delta_dm.data());
+}
+
+std::vector<double> XcEngine::eval_fxc(const double* h_delta_dm) const {
+  const std::size_t n = static_cast<std::size_t>(basis_.nao());
+  std::vector<double> fxc(n * n, 0.0);
+  eval_fxc(h_delta_dm, fxc.data());
+  return fxc;
+}
+
+void XcEngine::eval_fxc(const double* h_delta_dm, double* h_fxc_out) const {
+  const std::size_t nao = static_cast<std::size_t>(basis_.nao());
+  if (nao > 0 && h_fxc_out == nullptr) {
+    throw std::invalid_argument("XcEngine::eval_fxc: h_fxc_out must not be null");
+  }
+  if (nao > 0 && h_delta_dm == nullptr) {
+    throw std::invalid_argument("XcEngine::eval_fxc: h_delta_dm must not be null");
+  }
+  if (!has_reference_density()) {
+    throw std::logic_error(
+        "XcEngine::eval_fxc: reference density not set; call set_reference_density first");
+  }
+  std::fill_n(h_fxc_out, nao * nao, 0.0);
+  if (nao == 0 || grid_.npoints() == 0) return;
+
+  if (active_backend_ == Backend::Cuda) {
+#if defined(GPU4DFT_HAVE_CUDA)
+    detail::xc_cuda_eval_fxc_host(cuda_->impl, h_delta_dm, h_fxc_out);
+    return;
+#endif
+  }
+
+  const HostFxcState& st = *host_fxc_;
+  const detail::FlatBasisData flat(basis_);
+  const detail::FlatBasisView bview = flat.view();
+  const int deriv = (xc_family_ == 0) ? 0 : 1;
+  const std::size_t ncomp = (deriv == 0) ? 1 : 4;
+  const auto& batches = grid_.batches();
+  const auto& coords = grid_.coords();
+  const auto& weights = grid_.weights();
+
+#if defined(_OPENMP)
+#pragma omp parallel
+#endif
+  {
+    std::vector<double> local_fxc(nao * nao, 0.0);
+    std::vector<double> phi_local;
+    std::vector<double> d_act;
+    std::vector<double> t_mat;
+    std::vector<double> w_mat;
+    std::vector<double> v_half;
+    std::vector<double> drho, dgx, dgy, dgz, dtau, vtau_w;
+
+#if defined(_OPENMP)
+#pragma omp for schedule(dynamic)
+#endif
+    for (std::ptrdiff_t ib = 0; ib < static_cast<std::ptrdiff_t>(batches.size()); ++ib) {
+      const std::size_t uib = static_cast<std::size_t>(ib);
+      const SpatialBatch& batch = batches[uib];
+      const std::size_t ng = batch.npoints;
+      const std::size_t na = batch.active_aos.size();
+      if (ng == 0 || na == 0) continue;
+
+      const std::size_t comp_stride = na * ng;
+      const double* phi_ptr = nullptr;
+      if (st.ao_cached) {
+        phi_ptr = st.phi_cache.data() + st.batch_phi_offset[uib];
+      } else {
+        phi_local.assign(ncomp * comp_stride, 0.0);
+        std::size_t local_ao_cursor = 0;
+        for (int is : batch.active_shells) {
+          const int nm = 2 * bview.shell_l[is] + 1;
+          for (std::size_t g = 0; g < ng; ++g) {
+            const std::size_t gp = batch.point_offset + g;
+            detail::eval_shell_at_point(
+                bview, is,
+                coords[3 * gp + 0], coords[3 * gp + 1], coords[3 * gp + 2],
+                deriv, phi_local.data() + local_ao_cursor * ng + g, comp_stride, ng);
+          }
+          local_ao_cursor += static_cast<std::size_t>(nm);
+        }
+        phi_ptr = phi_local.data();
+      }
+
+      d_act.resize(na * na);
+      for (std::size_t u = 0; u < na; ++u) {
+        const std::size_t gu = static_cast<std::size_t>(batch.active_aos[u]);
+        for (std::size_t v = 0; v < na; ++v) {
+          const std::size_t gv = static_cast<std::size_t>(batch.active_aos[v]);
+          d_act[u * na + v] = 0.5 * (h_delta_dm[gu * nao + gv] + h_delta_dm[gv * nao + gu]);
+        }
+      }
+
+      const int i_na = static_cast<int>(na);
+      const int i_ng = static_cast<int>(ng);
+      const std::size_t n_tcomp = (xc_family_ == 2) ? 4 : 1;
+      t_mat.resize(n_tcomp * comp_stride);
+      host_gemm_nn(i_na, i_ng, i_na, d_act.data(), phi_ptr, t_mat.data(), false);
+      if (xc_family_ == 2) {
+        for (std::size_t b = 1; b <= 3; ++b) {
+          host_gemm_nn(i_na, i_ng, i_na, d_act.data(),
+                       phi_ptr + b * comp_stride,
+                       t_mat.data() + b * comp_stride, false);
+        }
+      }
+
+      drho.assign(ng, 0.0);
+      if (xc_family_ >= 1) {
+        dgx.assign(ng, 0.0);
+        dgy.assign(ng, 0.0);
+        dgz.assign(ng, 0.0);
+      }
+      if (xc_family_ == 2) {
+        dtau.assign(ng, 0.0);
+        vtau_w.assign(ng, 0.0);
+      }
+
+      const double* phi0 = phi_ptr;
+      const double* phix = (xc_family_ >= 1) ? (phi_ptr + 1 * comp_stride) : nullptr;
+      const double* phiy = (xc_family_ >= 1) ? (phi_ptr + 2 * comp_stride) : nullptr;
+      const double* phiz = (xc_family_ >= 1) ? (phi_ptr + 3 * comp_stride) : nullptr;
+      const double* t0 = t_mat.data();
+
+      for (std::size_t u = 0; u < na; ++u) {
+        for (std::size_t g = 0; g < ng; ++g) {
+          const std::size_t off = u * ng + g;
+          const double t0_ug = t0[off];
+          drho[g] += phi0[off] * t0_ug;
+          if (xc_family_ >= 1) {
+            dgx[g] += 2.0 * phix[off] * t0_ug;
+            dgy[g] += 2.0 * phiy[off] * t0_ug;
+            dgz[g] += 2.0 * phiz[off] * t0_ug;
+          }
+          if (xc_family_ == 2) {
+            dtau[g] += 0.5 * (phix[off] * t_mat[1 * comp_stride + off] +
+                              phiy[off] * t_mat[2 * comp_stride + off] +
+                              phiz[off] * t_mat[3 * comp_stride + off]);
+          }
+        }
+      }
+
+      w_mat.assign(comp_stride, 0.0);
+      for (std::size_t g = 0; g < ng; ++g) {
+        const std::size_t gp = batch.point_offset + g;
+        const double wg = weights[gp];
+        const double dr = drho[g];
+
+        double d_vrho = st.v2rho2[gp] * dr;
+        double wvx = 0.0, wvy = 0.0, wvz = 0.0;
+        if (xc_family_ >= 1) {
+          const double gx0 = st.g0x[gp];
+          const double gy0 = st.g0y[gp];
+          const double gz0 = st.g0z[gp];
+          const double dsig = 2.0 * (gx0 * dgx[g] + gy0 * dgy[g] + gz0 * dgz[g]);
+          d_vrho += st.v2rhosigma[gp] * dsig;
+          double d_vsigma = st.v2rhosigma[gp] * dr + st.v2sigma2[gp] * dsig;
+          if (xc_family_ == 2) {
+            const double dt = dtau[g];
+            d_vrho += st.v2rhotau[gp] * dt;
+            d_vsigma += st.v2sigmatau[gp] * dt;
+            const double d_vtau =
+                st.v2rhotau[gp] * dr + st.v2sigmatau[gp] * dsig + st.v2tau2[gp] * dt;
+            vtau_w[g] = 0.5 * wg * d_vtau;
+          }
+          const double vs0 = st.vsigma[gp];
+          wvx = 2.0 * wg * (d_vsigma * gx0 + vs0 * dgx[g]);
+          wvy = 2.0 * wg * (d_vsigma * gy0 + vs0 * dgy[g]);
+          wvz = 2.0 * wg * (d_vsigma * gz0 + vs0 * dgz[g]);
+        }
+        const double wv0 = 0.5 * wg * d_vrho;
+
+        for (std::size_t u = 0; u < na; ++u) {
+          const std::size_t off = u * ng + g;
+          double w_ug = wv0 * phi0[off];
+          if (xc_family_ >= 1) {
+            w_ug += wvx * phix[off] + wvy * phiy[off] + wvz * phiz[off];
+          }
+          w_mat[off] = w_ug;
+        }
+      }
+
+      v_half.resize(na * na);
+      host_gemm_nt(i_na, i_na, i_ng, phi0, w_mat.data(), v_half.data(), false);
+
+      if (xc_family_ == 2) {
+        for (std::size_t b = 1; b <= 3; ++b) {
+          const double* phib = phi_ptr + b * comp_stride;
+          for (std::size_t u = 0; u < na; ++u) {
+            for (std::size_t g = 0; g < ng; ++g) {
+              w_mat[u * ng + g] = 0.5 * vtau_w[g] * phib[u * ng + g];
+            }
+          }
+          host_gemm_nt(i_na, i_na, i_ng, phib, w_mat.data(), v_half.data(), true);
+        }
+      }
+
+      for (std::size_t u = 0; u < na; ++u) {
+        const std::size_t gu = static_cast<std::size_t>(batch.active_aos[u]);
+        for (std::size_t v = 0; v < na; ++v) {
+          const std::size_t gv = static_cast<std::size_t>(batch.active_aos[v]);
+          local_fxc[gu * nao + gv] += v_half[u * na + v] + v_half[v * na + u];
+        }
+      }
+    }
+
+#if defined(_OPENMP)
+#pragma omp critical
+#endif
+    {
+      for (std::size_t idx = 0; idx < nao * nao; ++idx) {
+        h_fxc_out[idx] += local_fxc[idx];
+      }
+    }
+  }
+}
+
+void XcEngine::eval_fxc_device(const double* d_delta_dm, double* d_fxc_out,
+                               void* cuda_stream) const {
+  if (active_backend_ != Backend::Cuda) {
+    throw std::runtime_error("XcEngine::eval_fxc_device requires Backend::Cuda");
+  }
+  if (!has_reference_density()) {
+    throw std::logic_error(
+        "XcEngine::eval_fxc_device: reference density not set; call set_reference_density_device first");
+  }
+  if (basis_.nao() > 0 && (d_delta_dm == nullptr || d_fxc_out == nullptr)) {
+    throw std::invalid_argument("XcEngine::eval_fxc_device: device pointers must not be null");
+  }
+#if defined(GPU4DFT_HAVE_CUDA)
+  detail::xc_cuda_eval_fxc_device(cuda_->impl, d_delta_dm, d_fxc_out, cuda_stream);
+#else
+  (void)d_delta_dm;
+  (void)d_fxc_out;
   (void)cuda_stream;
   throw std::runtime_error("gpu4dft was built without CUDA");
 #endif

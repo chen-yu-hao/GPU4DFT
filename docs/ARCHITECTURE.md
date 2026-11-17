@@ -1,25 +1,26 @@
 # GPU4DFT 软件架构与数学设计规范
 
-> **版本**：0.2.0-arch  
-> **定位**：面向新一代异构加速器（NVIDIA Ampere / Hopper / Blackwell 与 AMD CDNA3 MI300）的 GPU 原生第一性原理量子化学与密度泛函理论（DFT）计算框架。
+> **版本**：0.3.0-stage2  
+> **定位**：面向新一代异构加速器（NVIDIA Ampere / Hopper / Blackwell 与 AMD CDNA3 MI300）的 GPU 原生第一性原理分子量子化学与周期性平面波密度泛函理论（DFT）统一计算框架。
 
 ---
 
 ## 目录
 
 1. [设计哲学与全局数学约定](#1-设计哲学与全局数学约定)
-2. [五层高斯体系总体架构](#2-五层高斯体系总体架构)
+2. [五层分子与周期性统一架构](#2-五层分子与周期性统一架构)
 3. [第一层：Python `nanobind` 前端与生态互操作层](#3-第一层python-nanobind-前端与生态互操作层)
-4. [第二层：C++20 GPU 常驻自洽场（SCF）驱动层](#4-第二层c20-gpu-常驻自洽场scf驱动层)
+4. [第二层：C++20 GPU 常驻自洽场（SCF）与响应驱动层](#4-第二层c20-gpu-常驻自洽场scf与响应驱动层)
 5. [第三层：核心计算引擎层](#5-第三层核心计算引擎层)
-   - [5.1 单/双电子积分与多算法 J/K 引擎（Direct JK / RI-JK / sn-K）](#51-单双电子积分与多算法-jk-引擎direct-jk--ri-jk--sn-k)
+   - [5.1 单/双电子积分与全显存零拷贝 J/K 引擎（Direct JK / GPU 原生 RI-JK / sn-K）](#51-单双电子积分与全显存零拷贝-jk-引擎direct-jk--gpu-原生-ri-jk--sn-k)
    - [5.2 混合精度与 Tensor Core 算术引擎（动态四元组路由与 Ozaki INT8 方案）](#52-混合精度与-tensor-core-算术引擎动态四元组路由与-ozaki-int8-方案)
-   - [5.3 交换关联（XC）数值积分与符号自动微分泛函引擎](#53-交换关联xc数值积分与符号自动微分泛函引擎)
+   - [5.3 交换关联（XC）4 流缓存积分与符号一/二阶自动微分泛函引擎](#53-交换关联xc4-流缓存积分与符号一二阶自动微分泛函引擎)
    - [5.4 线性代数与无对角化密度矩阵纯化引擎（cuSOLVER / SP2 / 分布式特征求解）](#54-线性代数与无对角化密度矩阵纯化引擎cusolver--sp2--分布式特征求解)
+   - [5.5 线性响应激发态（CIS / TDA / TDDFT）、CPHF 极化率与分子振动 Hessian 引擎](#55-线性响应激发态cis--tda--tddftcphf-极化率与分子振动-hessian-引擎)
 6. [第四层：统一代码生成器与自动调优层](#6-第四层统一代码生成器与自动调优层)
 7. [第五层：多 GPU 通信与动态负载均衡调度层](#7-第五层多-gpu-通信与动态负载均衡调度层)
-8. [平面波赝势 DFT（Plane-Wave DFT）扩展蓝图](#8-平面波赝势-dftplane-wave-dft扩展蓝图)
-9. [分阶段数值验证与性能回归路线图](#9-分阶段数值验证与性能回归路线图)
+8. [平面波赝势与自适应压缩交换杂化泛函子系统（`gpu4dft::pw`）](#8-平面波赝势与自适应压缩交换杂化泛函子系统gpu4dftpw)
+9. [分阶段数值验证与实测里程碑总结](#9-分阶段数值验证与实测里程碑总结)
 
 ---
 
@@ -62,30 +63,31 @@
 
 ---
 
-## 2. 五层高斯体系总体架构
+## 2. 五层分子与周期性统一架构
 
-GPU4DFT 高斯原子轨道（GTO）子系统自顶向下划分为职责正交的五个层次：
+GPU4DFT 分子高斯原子轨道（GTO）与周期性平面波赝势（`gpu4dft::pw`）子系统自顶向下划分为职责正交的五个层次：
 
 ```mermaid
 flowchart TD
     subgraph L1["Layer 1: Python nanobind 前端与生态互操作层 (python/)"]
-        PY_API["gpu4dft Python 包 & PySCF Mole 零损耗转换"]
+        PY_API["gpu4dft Python 包: RHF / RKS / TDDFT / Hessian & gpu4dft.pw"]
         ASE_CALC["ASE Calculator 接口 (能量 E / 解析原子力 F = -dE/dR)"]
-        NB_BIND["nanobind 零拷贝 Capsule 桥接 & GIL 释放 (_core)"]
+        NB_BIND["nanobind 零拷贝 Capsule 桥接 & GIL 释放 (_core, _core.pw)"]
     end
 
-    subgraph L2["Layer 2: C++20 GPU 常驻 SCF 驱动层 (scf.hpp, diis.hpp, device_pool.hpp)"]
-        SCF_DRV["ScfDriver (RHF / RKS / Hybrid DFT / 增量 Fock / 动态精度调度)"]
+    subgraph L2["Layer 2: C++20 GPU 常驻 SCF 与响应驱动层 (scf.hpp, workflow.hpp, response.hpp)"]
+        SCF_DRV["ScfDriver & MolecularScf (零拷贝设备常驻 Direct / RI-JK / sn-K)"]
+        RESP_DRV["LinearResponseDriver (CIS / TDA / TDDFT / CPHF) & NuclearHessian"]
         DIIS["GpuDiis (环形显存残差队列 + 8x8 Host Pulay 求解)"]
-        GRAPH["CudaGraphExecutor (全步线性代数/纯化/外推图捕获与重放)"]
-        MEMPOOL["DeviceMemoryPool (cudaMallocAsync 流有序显存池 + 对齐 Arena)"]
+        GRAPH["CudaGraphExecutor & DeviceMemoryPool (流有序池 + 全步图固化)"]
     end
 
-    subgraph L3["Layer 3: 核心计算引擎层 (Compute Engines)"]
-        JK_ENG["J/K 引擎: DirectJKEngine (MD J-Engine + Rys 2D-VRR) | RIJKEngine | SemiNumericalK (COSX)"]
+    subgraph L3["Layer 3: 核心计算引擎层 (GTO & Plane-Wave Compute Engines)"]
+        JK_ENG["全显存 J/K: DirectJKEngine (compute_jk_device) | GPU 原生 RIJKEngine | 渐近筛选 sn-K"]
         MP_ENG["混合精度引擎: Schwarz x 密度动态 FP64/FP32 分派 | Ozaki INT8 Tensor Core 仿真 GEMM"]
-        XC_ENG["XC 数值积分引擎: GPU M4+Lebedev+SSF 格点 | 八叉树空间分块 + 活性 AO 筛选 | 批量 GEMM V_xc"]
-        LA_ENG["线性代数引擎: cuSOLVER 正则正交化与对角化 | SP2 二阶迹重置纯化 | cuSOLVERMp/ELPA 扩展"]
+        XC_ENG["4 流缓存 XC 引擎: GPU M4+Lebedev+SSF 格点 | 活性 AO 显存缓存 | eval_vxc & eval_fxc"]
+        PW_ENG["平面波赝势引擎 (pw.hpp): 批量 3D cuFFT | GTH ZGEMM | Davidson/LOBPCG | Lin's ACE"]
+        LA_ENG["线性代数引擎: cuSOLVER 正则正交化与对角化 | SP2 二阶迹重置纯化"]
     end
 
     subgraph L4["Layer 4: 统一代码生成器与自动调优层 (codegen/)"]
@@ -102,15 +104,20 @@ flowchart TD
     PY_API --> NB_BIND
     ASE_CALC --> NB_BIND
     NB_BIND --> SCF_DRV
+    NB_BIND --> RESP_DRV
+    NB_BIND --> PW_ENG
     SCF_DRV --> DIIS
     SCF_DRV --> GRAPH
-    SCF_DRV --> MEMPOOL
     SCF_DRV --> JK_ENG
     SCF_DRV --> MP_ENG
     SCF_DRV --> XC_ENG
     SCF_DRV --> LA_ENG
+    RESP_DRV --> JK_ENG
+    RESP_DRV --> XC_ENG
+    RESP_DRV --> LA_ENG
     JK_ENG --> ERI_CG
     XC_ENG --> XC_CG
+    PW_ENG --> XC_CG
     ERI_CG --> TUNER
     JK_ENG --> DYN_Q
     XC_ENG --> COMM
@@ -122,12 +129,13 @@ flowchart TD
 
 | 架构层级 | 公共头文件 (`include/gpu4dft/`) | 实现与构建期代码生成 (`src/`, `codegen/`) | 核心职责 |
 | :--- | :--- | :--- | :--- |
-| **Layer 1: 前端层** | — | `python/bindings.cpp`, `python/gpu4dft/__init__.py`, `python/gpu4dft/pyscf_interface.py` | `nanobind` C++20 绑定、零拷贝 `ndarray` 胶囊封装、PySCF/ASE 互操作 |
-| **Layer 2: SCF 驱动层** | `device_pool.hpp`, `diis.hpp`, `scf.hpp` | `src/cuda/device_pool.cu`, `src/diis.cpp`, `src/cuda/diis_cuda.cu`, `src/scf.cpp` | 流有序显存池、CUDA Graphs 捕获、GPU CDIIS、无主机干预 SCF 闭环与核梯度组装 |
-| **Layer 3a: 积分与 J/K** | `basis.hpp`, `boys.hpp`, `rys.hpp`, `harmonics.hpp`, `shell_pair_view.hpp`, `shell_pairs.hpp`, `eri.hpp`, `one_electron.hpp`, `jk_engine.hpp`, `snk.hpp` | `src/basis.cpp`, `src/shell_pairs.cpp`, `src/eri.cpp`, `src/cuda/eri_cuda.cu`, `src/one_electron.cpp`, `src/cuda/one_electron_cuda.cu`, `src/jk_engine.cpp`, `src/cuda/jk_cuda.cu`, `src/snk.cpp`, `src/cuda/snk_cuda.cu` | SoA 壳对与 Schwarz 界、单电子积分、Direct J/K、RI-JK、半数值 COSX 交换、1e+2e 解析核梯度 |
-| **Layer 3b/d: 混合精度与线性代数** | `types.hpp`, `linalg.hpp` | `src/linalg.cpp`, `src/cuda/linalg_cuda.cu` | `Precision::Mixed` 控制、Ozaki INT8 Tensor Core 无损 GEMM、`cuSOLVER` 对角化、SP2 迹重置纯化 |
-| **Layer 3c: XC 积分** | `xc.hpp` | `src/xc_grid.cpp`, `src/xc_engine.cpp`, `src/cuda/xc_cuda.cu` | GPU 分子格点与 Becke/SSF 权重、八叉树空间分块、活性 AO 筛选、批量 GEMM $\mathbf{V}_{\text{xc}}$ 与 XC 核梯度 |
-| **Layer 4: 代码生成层** | `config.hpp`, `math.hpp`, `kernel_registry.hpp`, `generated/*.hpp` | `codegen/gpu4dft_codegen/*.py`, `codegen/xc_codegen/*.py` | 发射 Host/CUDA/HIP 双电子积分与导数内核、发射符号自动微分 XC 泛函头文件、内核自动调优 |
+| **Layer 1: 前端层** | — | `python/bindings.cpp`, `python/gpu4dft/{__init__,scf,pw,pyscf_interface}.py` | `nanobind` C++20 绑定（含 `_core.pw`）、PySCF 风格 `RHF`/`RKS`/`.TDDFT()`/`.Hessian()`、`gpu4dft.pw` 与 ASE 互操作 |
+| **Layer 2: SCF 与响应驱动层** | `device_pool.hpp`, `diis.hpp`, `scf.hpp`, `workflow.hpp`, `response.hpp` | `src/cuda/device_pool.cu`, `src/diis.cpp`, `src/cuda/diis_cuda.cu`, `src/scf.cpp`, `src/workflow.cpp`, `src/response.cpp`, `src/cuda/response_cuda.cu` | 流有序显存池、CUDA Graphs、GPU CDIIS、全显存零拷贝 `MolecularScf`、CIS/TDA/TDDFT 块 Davidson、CPHF 与核 Hessian |
+| **Layer 3a: 积分与 J/K** | `basis.hpp`, `boys.hpp`, `rys.hpp`, `harmonics.hpp`, `shell_pair_view.hpp`, `shell_pairs.hpp`, `eri.hpp`, `one_electron.hpp`, `jk_engine.hpp`, `snk.hpp` | `src/basis.cpp`, `src/shell_pairs.cpp`, `src/eri.cpp`, `src/cuda/eri_cuda.cu`, `src/one_electron.cpp`, `src/cuda/one_electron_cuda.cu`, `src/jk_engine.cpp`, `src/cuda/jk_cuda.cu`, `src/snk.cpp`, `src/cuda/snk_cuda.cu` | SoA 壳对与 Schwarz 界、单电子与电偶极积分、零拷贝设备常驻 Direct J/K（对称/非对称）、100% GPU 原生 RI-JK、渐近筛选 4 流 COSX、1e+2e 解析核梯度 |
+| **Layer 3b/d: 混合精度与线性代数** | `types.hpp`, `linalg.hpp` | `src/linalg.cpp`, `src/cuda/linalg_cuda.cu` | `Precision::Mixed` 控制、Ozaki INT8 Tensor Core 无损 GEMM、RI 分块 GPU 转置核、`cuSOLVER` 对角化、SP2 迹重置纯化 |
+| **Layer 3c: XC 积分与响应核** | `xc.hpp` | `src/xc_grid.cpp`, `src/xc_engine.cpp`, `src/cuda/xc_cuda.cu` | GPU 分子格点与 SSF 权重、4 流活性 AO 显存缓存、批量 GEMM $\mathbf{V}_{\text{xc}}$、绝热二阶核 $\mathbf{F}_{\text{xc}}$ (`eval_fxc_device`) 与 XC 核梯度 |
+| **Layer 3e: 周期性平面波 DFT** | `pw.hpp` | `src/pw.cpp`, `src/cuda/pw_cuda.cu` | 双空间平面波基组、GTH 可分模守恒赝势、批量 3D `cuFFT` / Stockham+Bluestein FFT、块 Davidson & LOBPCG、Lin's ACE 杂化泛函引擎 |
+| **Layer 4: 代码生成层** | `config.hpp`, `math.hpp`, `kernel_registry.hpp`, `generated/*.hpp` | `codegen/gpu4dft_codegen/*.py`, `codegen/xc_codegen/*.py` | 发射 Host/CUDA/HIP 双电子积分与导数内核、发射符号自动微分一/二阶 XC 泛函头文件、内核自动调优 |
 | **Layer 5: 多 GPU 层** | `multigpu.hpp` | `src/multigpu.cpp`, `src/cuda/multigpu_cuda.cu` | 多设备上下文、原子工作窃取队列、NCCL/RCCL/P2P 全局归约、NVSHMEM 分布式张量扩展接口 |
 
 ---
@@ -168,7 +176,7 @@ inline Matrix2D vector_to_numpy_2d(std::vector<double> data, std::size_t rows, s
 
 ---
 
-## 4. 第二层：C++20 GPU 常驻自洽场（SCF）驱动层
+## 4. 第二层：C++20 GPU 常驻自洽场（SCF）与响应驱动层
 
 ### 4.1 流有序显存池 (`DeviceMemoryPool`) 与 CUDA Graphs 固化 (`CudaGraphExecutor`)
 
@@ -332,7 +340,7 @@ class ScfDriver {
 
 ## 5. 第三层：核心计算引擎层
 
-### 5.1 单/双电子积分与多算法 J/K 引擎（Direct JK / RI-JK / sn-K）
+### 5.1 单/双电子积分与全显存零拷贝 J/K 引擎（Direct JK / GPU 原生 RI-JK / sn-K）
 
 #### 5.1.1 壳对 SoA 视图与 Schwarz 降序排列 (`shell_pair_view.hpp`, `shell_pairs.hpp`)
 
@@ -407,28 +415,26 @@ flowchart LR
 $$\Omega_{abcd}(\mathbf{D}) = Q_{ab} Q_{cd} \max\!\Big(\underbrace{D_{cd}^{\text{sh}},\, D_{ab}^{\text{sh}}}_{\text{Coulomb }\mathbf{J}\text{ 贡献}},\, \underbrace{\frac{\alpha_x}{2}\max(D_{ac}^{\text{sh}}, D_{ad}^{\text{sh}}, D_{bc}^{\text{sh}}, D_{bd}^{\text{sh}})}_{\text{Exchange }\mathbf{K}\text{ 贡献 (LinK 界)}}\Big)$$
 - 在增量 SCF 步中，传入密度差分 $\Delta\mathbf{D}^{(n)} = \mathbf{D}^{(n)} - \mathbf{D}^{(n-1)}$ 计算 $\Delta\mathbf{J}(\Delta\mathbf{D}^{(n)})$ 与 $\Delta\mathbf{K}(\Delta\mathbf{D}^{(n)})$。随着 SCF 趋向收敛，$\|\Delta\mathbf{D}^{(n)}\|_\infty$ 从 $O(1)$ 迅速降至 $10^{-6}$ 以下，绝大部分四元组满足 $\Omega_{abcd}(\Delta\mathbf{D}^{(n)}) < \tau_{\text{cut}}$ 而被跳过，单步积分耗时随迭代步数单调骤降 3–10 倍。
 
-#### 5.1.5 三中心 RI-J / RI-K（Density Fitting）Tensor Core 流水线 (`RIJKEngine`)
+#### 5.1.5 100% GPU 原生三中心 RI-J / RI-K 零拷贝流水线 (`RIJKEngine`)
 
 引入辅助拟合基组 $\{P, Q\}$（规模 $N_{\text{aux}} \approx 2.5\text{–}3.5 N_{\text{AO}}$，如 `def2-universal-jkfit`），将四中心双电子积分近似分解为二中心库仑度量矩阵 $V_{PQ} = (P|Q)$ 与三中心积分 $(\mu\nu|P)$：
 $$(\mu\nu|\lambda\sigma) \approx \sum_{P,Q=1}^{N_{\text{aux}}} (\mu\nu|P)\, (V^{-1})_{PQ}\, (Q|\lambda\sigma)$$
-1. **预处理步**：GPU 计算二中心矩阵 $\mathbf{V} \in \mathbb{R}^{N_{\text{aux}}\times N_{\text{aux}}}$，执行 Cholesky 分解 $\mathbf{V} = \mathbf{L}\mathbf{L}^\top$（若存在近奇异本征值则采用对称特征值伪逆 $\mathbf{V}^{-1/2}$），并对三中心积分做三角求解 `cublasDtrsm` 生成三阶拟合张量 $B_{P,\mu\nu} = \sum_Q (\mathbf{L}^{-1})_{PQ}(\mu\nu|Q)$。
-2. **RI-J 收缩（$O(N_{\text{aux}} N_{\text{AO}}^2)$）**：两次矩阵–向量乘积（`cublasDgemv`）：
-   $$\gamma_P = \sum_{\mu\nu} B_{P,\mu\nu} D_{\mu\nu}, \qquad J_{\mu\nu} = \sum_{P=1}^{N_{\text{aux}}} B_{P,\mu\nu} \gamma_P$$
-3. **RI-K 收缩（$O(N_{\text{aux}} N_{\text{occ}} N_{\text{AO}}^2)$）**：利用占据分子轨道因子 $\mathbf{C}_{\text{occ}} \in \mathbb{R}^{N_{\text{AO}}\times N_{\text{occ}}}$（无需显式构造四阶张量）：
-   - 第一步批量 GEMM（按 $P$ 切片支持显存分块）：$X_{P\mu, i} = \sum_{\nu=1}^{N_{\text{AO}}} B_{P,\mu\nu} C_{\nu i}$；
-   - 第二步大规模密集对称收缩（支持 `FP64`、`FP32` Tensor Core 或 **`OzakiInt8` Tensor Core**）：
-     $$K_{\mu\nu} = 2 \sum_{P=1}^{N_{\text{aux}}} \sum_{i=1}^{N_{\text{occ}}} X_{P\mu, i} X_{P\nu, i}$$
+1. **100% GPU 原生预处理步（提速最高达 `77.4x`）**：二中心库仑矩阵 $\mathbf{V} \in \mathbb{R}^{N_{\text{aux}}\times N_{\text{aux}}}$ 与三中心积分张量 $(\mu\nu|Q)$ 全部由 GPU Rys 求积内核直接在显存中构建，随后调用 `cusolverDnDpotrf` 执行 Cholesky 分解 $\mathbf{V} = \mathbf{L}\mathbf{L}^\top$（近奇异模自动走特征值伪逆 $\mathbf{V}^{-1/2}$），并在显存上原地执行 `cublasDtrsm` 得到常驻三阶拟合张量 `d_B`（维度 $[N_{\text{aux}}, N_{\text{AO}}, N_{\text{AO}}]$）。在 `(H2O)_16/def2-svp`（$N_{\text{AO}}=384$）上，预处理时间从 CPU 路径的 `48.94s` 骤降至 **`0.632s`**。
+2. **零拷贝显存借用（Zero-Copy Device Borrowing）**：`RIJKEngine::device_b_ptr()` 将常驻显存的 `d_B` 裸指针直接暴露给 `MolecularScf` 与 `LinearResponseDriver`，彻底消除百 MB 级三阶张量的 Host 下载与二次上传。
+3. **RI-J 与精确对称/非对称分块 RI-K 收缩**：
+   - **RI-J（$O(N_{\text{aux}} N_{\text{AO}}^2)$）**：通过两次 `cublasDgemv` 在显存内完成 $\gamma_P = \sum_{\mu\nu} B_{P,\mu\nu} D_{\mu\nu}$ 与 $J_{\mu\nu} = \sum_P B_{P,\mu\nu} \gamma_P$。
+   - **RI-K（支持 `FP64`、`FP32` 及分块 `OzakiInt8` Tensor Core，兼容 `symmetrize_dm = false`）**：按辅助指标分块 $B_c$ 计算 $\mathbf{T}_{\text{raw}} = \mathbf{B}_c \mathbf{D} \in \mathbb{R}^{(B_c N_{\text{AO}})\times N_{\text{AO}}}$，经 GPU 专用置换核 `permute_ri_chunk_pair_device`（$[B_c, N_{\text{AO}}, N_{\text{AO}}] \to [N_{\text{AO}}, B_c, N_{\text{AO}}]$）重排后执行单次大矩阵乘法 $\mathbf{K} \mathrel{+}= \mathbf{T}_p \mathbf{B}_p^\top$，在常数级瞬态显存内同时精确支持对称基态 SCF 与非对称 TDDFT/CPHF 跃迁密度收缩！
 
-#### 5.1.6 半数值交换引擎 (`sn-K` / `COSX`, `include/gpu4dft/snk.hpp`)
+#### 5.1.6 渐近静电筛选 4 流半数值交换引擎 (`sn-K` / `COSX`, `include/gpu4dft/snk.hpp`)
 
-针对弥散大基组（如 `def2-tzvp` / `ma-def2-tzvp`）下解析四中心 $\mathbf{K}$ 与 RI-K 的高复杂度，半数值交换（Chain-of-Spheres Exchange, COSX）将一个电子坐标在实空间分子格点 $\{\mathbf{r}_g, w_g\}$ 上数值离散，另一个电子坐标保持解析库仑势积分：
+针对弥散大基组下解析四中心 $\mathbf{K}$ 的高复杂度，半数值交换（Chain-of-Spheres Exchange, COSX）将一个电子坐标在实空间分子格点 $\{\mathbf{r}_g, w_g\}$ 上数值离散，另一个电子坐标保持解析库仑势积分：
 $$A_{\nu g} = \int \frac{\phi_\nu(\mathbf{r}')}{|\mathbf{r}' - \mathbf{r}_g|}\,\mathrm{d}\mathbf{r}'$$
-- 利用与 XC 引擎同构的空间八叉树分块与活性 AO 筛选，在每个空间块 $B$ 上仅计算活性轨道函数值 $\boldsymbol{\Phi}_B \in \mathbb{R}^{|\mathcal{A}_B|\times N_g}$ 与单电子静电势矩阵 $\mathbf{A}_B$；
-- 通过三次密集 cuBLAS GEMM 完成数值收缩与 **Neese 重叠拟合（Overlap Fitting）一致性投影修正**（消除稀疏格点在近核区的数值正交性误差）：
+- **渐近多极筛选 + 4 流超批并发**：利用壳对高斯乘积紧支集与远场 $Q_{ab}/|\mathbf{P}-\mathbf{r}_g|$ 渐近上界裁剪无效单电子静电势对，配合活性 AO 显存常驻缓存与 4 条独立 CUDA 流并发 `cuBLAS` GEMM 流水线，使 GPU COSX 吞吐较基础实现提升 **`10.6x–14.2x`**；
+- 通过三次密集 GEMM 完成数值收缩与 **Neese 重叠拟合（Overlap Fitting）一致性投影修正**：
   $$\mathbf{S}_{\text{grid}} = \boldsymbol{\Phi}\operatorname{diag}(\mathbf{w})\boldsymbol{\Phi}^\top, \qquad \mathbf{Q} = \mathbf{S}^{-1}\mathbf{S}_{\text{grid}}$$
   $$\mathbf{G} = \mathbf{D}\mathbf{A}, \qquad \mathbf{K}_{\text{raw}} = \boldsymbol{\Phi}\operatorname{diag}(\mathbf{w})\mathbf{G}^\top, \qquad \mathbf{K}_{\text{COSX}} = \frac{1}{2}\big(\mathbf{Q}^\top \mathbf{K}_{\text{raw}} + \mathbf{K}_{\text{raw}}^\top \mathbf{Q}\big)$$
 
-#### 5.1.7 J/K、单电子与核梯度 C++20 接口签名
+#### 5.1.7 J/K、单电子、偶极矩与核梯度 C++20 接口签名
 
 ```cpp
 // include/gpu4dft/one_electron.hpp & include/gpu4dft/jk_engine.hpp & include/gpu4dft/snk.hpp
@@ -439,11 +445,14 @@ struct Atom {
   std::array<double, 3> center{};  // Bohr
 };
 
-// 单电子积分与解析核梯度
+// 单电子积分、电偶极矩与解析核梯度
 std::vector<double> overlap_matrix(const Basis& basis, Backend backend = Backend::Cuda);
 std::vector<double> kinetic_matrix(const Basis& basis, Backend backend = Backend::Cuda);
 std::vector<double> nuclear_attraction_matrix(const Basis& basis, std::span<const Atom> atoms,
                                               Backend backend = Backend::Cuda);
+std::array<std::vector<double>, 3> dipole_matrices(const Basis& basis,
+                                                   std::array<double, 3> origin = {0.0, 0.0, 0.0},
+                                                   Backend backend = Backend::Cuda);
 double nuclear_repulsion_energy(std::span<const Atom> atoms);
 std::vector<double> nuclear_repulsion_grad(std::span<const Atom> atoms);
 std::vector<double> one_electron_grad(const Basis& basis, std::span<const Atom> atoms,
@@ -457,6 +466,7 @@ struct JKOptions {
   double fp32_threshold = 1e-6;
   bool compute_j = true;
   bool compute_k = true;
+  bool symmetrize_dm = true;              // false 时精确计算非对称跃迁密度 J(X), K(X) (TDDFT/CPHF)
   double k_scale = 1.0;
 };
 
@@ -464,6 +474,7 @@ class DirectJKEngine {
  public:
   explicit DirectJKEngine(const Basis& basis, double prim_cutoff = 1e-15);
   void compute_jk(const double* dm, double* vj_out, double* vk_out, const JKOptions& opts = {});
+  // 全显存零拷贝设备接口（消除每步 SCF/TDDFT 的 Host<->Device 往返与 CPU 球谐变换）
   void compute_jk_device(const double* d_dm, double* d_vj_out, double* d_vk_out,
                          const JKOptions& opts, void* stream = nullptr);
 };
@@ -471,13 +482,18 @@ class DirectJKEngine {
 class RIJKEngine {
  public:
   RIJKEngine(const Basis& orbital_basis, const Basis& aux_basis, Backend backend = Backend::Cuda);
+  bool has_device_b() const noexcept;
+  const double* device_b_ptr() const noexcept;  // 显存常驻 [naux * nao * nao] 零拷贝指针
   void compute_jk(const double* dm, double* vj_out, double* vk_out, const JKOptions& opts = {});
+  void compute_jk_device(const double* d_dm, double* d_vj_out, double* d_vk_out,
+                         const JKOptions& opts, void* stream = nullptr);
 };
 
 class SemiNumericalK {
  public:
-  SemiNumericalK(const Basis& basis, const MolecularGrid& grid, Backend backend = Backend::Cuda);
-  std::vector<double> compute_k(const double* dm, Precision precision = Precision::FP64);
+  SemiNumericalK(const Basis& basis, const MolecularGrid& grid, const SnkOptions& opts = {});
+  void compute_k_device(const double* d_dm, double* d_vk_out,
+                        Precision precision = Precision::FP64, void* stream = nullptr);
 };
 
 std::vector<double> jk_nuclear_grad(const Basis& basis, const double* dm, double k_fraction,
@@ -551,7 +567,7 @@ flowchart LR
 
 ---
 
-### 5.3 交换关联（XC）数值积分与符号自动微分泛函引擎
+### 5.3 交换关联（XC）4 流缓存积分与符号一/二阶自动微分泛函引擎
 
 #### 5.3.1 GPU 分子格点生成与 Stratmann–Scuseria–Frisch (SSF) 剖分 (`MolecularGrid`)
 
@@ -560,22 +576,21 @@ Kohn–Sham 交换关联能 $E_{\text{xc}} = \int f_{\text{xc}}\big(\rho(\mathbf
 2. **GPU 并行 Becke / SSF 原子剖分权重**：定义原子间共焦椭球坐标 $\mu_{AB}(\mathbf{r}) = \frac{|\mathbf{r}-\mathbf{R}_A| - |\mathbf{r}-\mathbf{R}_B|}{|\mathbf{R}_A - \mathbf{R}_B|}$。相比原始 Becke 三次迭代多项式，**Stratmann–Scuseria–Frisch (SSF)** 方案引入紧支集截断参数 $a = 0.64$：当 $\mu_{AB} \le -a$ 时阶跃函数恒为 $1$，当 $\mu_{AB} \ge a$ 时直接置 $0$（提前退出内层原子对循环），中间区 $(-a, a)$ 采用五阶平滑多项式 $g(x) = \frac{1}{16}(35x - 35x^3 + 21x^5 - 5x^7)$（$x = \mu_{AB}/a$）。该设计在 GPU 上实现每线程一格点全并行求权，并将大分子剖分复杂度从 $O(N_{\text{atom}}^3)$ 降至渐近线性。
 3. **外部精确格点注入（`MolecularGrid::from_points`）**：支持直接导入 PySCF `dft.gen_grid.Grids` 生成的 `(coords, weights)`，用于隔离格点差异、以 $< 10^{-12}$ 精度逐位校验泛函与积分引擎。
 
-#### 5.3.2 空间八叉树分块、活性基函数筛选与批量 Tensor Core GEMM 流水线 (`XcEngine`)
+#### 5.3.2 空间八叉树超批分块、活性 AO 显存常驻缓存与 4 流 GEMM 流水线 (`XcEngine`)
 
-原子轨道高斯函数随距离指数衰减：$\phi_\mu(\mathbf{r}) \propto e^{-\alpha_{\min}|\mathbf{r}-\mathbf{A}|^2}$。若在全部格点上评估全部 $N_{\text{AO}}$ 个基函数，内存带宽与算量将高达 $O(N_{\text{grid}} N_{\text{AO}}^2)$。GPU4DFT 采用**空间聚簇 + 稀疏活性子块稠密 GEMM** 策略：
+原子轨道高斯函数随距离指数衰减：$\phi_\mu(\mathbf{r}) \propto e^{-\alpha_{\min}|\mathbf{r}-\mathbf{A}|^2}$。若在全部格点上评估全部 $N_{\text{AO}}$ 个基函数，内存带宽与算量将高达 $O(N_{\text{grid}} N_{\text{AO}}^2)$。GPU4DFT 采用**空间聚簇超批（$N_g \le 2048$）+ 活性 AO 显存常驻缓存（`cache_ao_on_device`）+ 4 流并发 `cuBLAS` GEMM** 策略，将每步 SCF/TDDFT 的 AO 径向与球谐求值开销降至零，实测吞吐较重算流水线加速 **`14.7x–22x`**：
 
 ```mermaid
 flowchart LR
-    GRID["GPU 分子格点\n(coords, weights)"] --> OCT["3D 空间八叉树/Morton 分箱\n每块 N_g = 256~512 紧致格点"]
-    OCT --> ACT["包围盒径向截断筛选\n提取每块活性壳/AO 列表 A_B"]
-    ACT --> EVAL["GPU 活性 AO 求值内核\nΦ^(0), ∇Φ in R^{|A_B| x N_g}"]
-    EVAL --> GEMM1["cuBLAS 块 GEMM\nT = D_act * Φ^(0)"]
-    GEMM1 --> RHO["格点归约生成密度变量\n(ρ_g, σ_g = |∇ρ|^2, τ_g)"]
-    RHO --> SYM["符号生成 GPU4DFT_HD 泛函核\n(ε_xc, v_ρ, v_σ, v_τ, v2...)"]
-    SYM --> GEMM2["构造半加权矩阵 W\n对称双侧 GEMM: V_xc_act += Φ W^T + W Φ^T\n(+ meta-GGA 梯度缩并) -> 散射回 d_V_xc"]
+    GRID["GPU 分子格点\n(coords, weights)"] --> OCT["3D 空间八叉树/Morton 分箱\n超批 N_g <= 2048 紧致格点"]
+    OCT --> ACT["包围盒径向截断筛选\n一次性 GPU 求值并缓存活性 Φ^(0), ∇Φ"]
+    ACT --> GEMM1["4 流并发 cuBLAS GEMM\nT = D_act * Φ^(0)"]
+    GEMM1 --> RHO["格点归约生成基态/微扰密度\n(ρ_g, σ_g = |∇ρ|^2, τ_g)"]
+    RHO --> SYM["符号生成 GPU4DFT_HD 泛函核\n(ε_xc, v_ρ, v_σ, v_τ, v_ρρ, v_ρσ, v_σσ...)"]
+    SYM --> GEMM2["4 流对称双侧 GEMM 构造\nV_xc_act 或绝热核 F_xc_act -> 散射回显存"]
 ```
 
-- **严格对齐 PySCF 的密度与势矩阵公式**：  
+- **严格对齐 PySCF 的一阶势 $\mathbf{V}_{\text{xc}}$ 与二阶绝热核 $\mathbf{F}_{\text{xc}}[\delta\mathbf{D}]$ 公式**：  
   在空间块 $B$（含活性轨道集 $\mathcal{A}_B$，规模 $n_b = |\mathcal{A}_B| \ll N_{\text{AO}}$）上：
   $$\rho_g = \sum_{\mu\in\mathcal{A}_B} \Phi_{\mu g}^{(0)} T_{\mu g}^{(0)}, \qquad \nabla\rho_g = 2\sum_{\mu\in\mathcal{A}_B} (\nabla\Phi_{\mu g}) T_{\mu g}^{(0)}, \qquad \sigma_g = |\nabla\rho_g|^2$$
   $$\tau_g = \frac{1}{2} \sum_{\xi\in\{x,y,z\}} \sum_{\mu,\nu\in\mathcal{A}_B} D_{\mu\nu} \Phi_{\mu g}^{(\xi)} \Phi_{\nu g}^{(\xi)}$$
@@ -583,6 +598,7 @@ flowchart LR
   $$W_{\mu g} = w_g \left( \frac{1}{2} v_{\rho,g} \Phi_{\mu g}^{(0)} + 2 v_{\sigma,g} (\nabla\rho_g \cdot \nabla\Phi_{\mu g}) \right)$$
   并通过对称 GEMM 构造势矩阵（对于 TPSS 等 meta-GGA 额外累加动能密度项）：
   $$\mathbf{V}_{\text{xc}, B} = \boldsymbol{\Phi}_B^{(0)} \mathbf{W}^\top + \mathbf{W} (\boldsymbol{\Phi}_B^{(0)})^\top + \frac{1}{2}\sum_{\xi\in\{x,y,z\}} \boldsymbol{\Phi}_B^{(\xi)} \operatorname{diag}(\mathbf{w} \odot \mathbf{v}_\tau) (\boldsymbol{\Phi}_B^{(\xi)})^\top$$
+  对于线性响应 TDDFT / CPKS，`XcEngine::set_reference_density_device` 预缓存基态格点二阶泛函偏导 $(v_{\rho\rho}, v_{\rho\sigma}, v_{\sigma\sigma}, \dots)$，`eval_fxc_device` 对任意对称微扰密度 $\delta\mathbf{D}$ 直接在 4 流缓存 AO 上完成绝热核收缩 $\mathbf{F}_{\text{xc}}[\delta\mathbf{D}] = \left.\frac{\mathrm{d}\mathbf{V}_{\text{xc}}[\mathbf{D}_0 + \lambda\delta\mathbf{D}]}{\mathrm{d}\lambda}\right|_{\lambda=0}$（与 PySCF `nr_rks_fxc` 最大元误差 $1.39\times 10^{-16}$）。
 
 #### 5.3.3 零依赖符号自动微分泛函代码生成器 (`codegen/xc_codegen/`)
 
@@ -593,43 +609,32 @@ flowchart LR
    - **GGA**：Becke 88 (`gga_x_b88`)、Lee–Yang–Parr (`gga_c_lyp`)、Perdew–Burke–Ernzerhof (`gga_x_pbe` + `gga_c_pbe`)；
    - **Meta-GGA**：Tao–Perdew–Staroverov–Scuseria (`mgga_x_tpss` + `mgga_c_tpss`，含等轨道指示因子 $\alpha = \frac{\tau - |\nabla\rho|^2/(8\rho)}{\tau_{\text{unif}}}$ 的正则化光滑处理）；
    - **组合泛函与杂化泛函**：`lda`/`svwn`, `svwn_rpa`, `spz81`, `pbe`, `blyp`, `b3lyp`, `b3lyp5`, `pbe0`, `tpss`。
-   - 同时发射能量密度 $\epsilon_{\text{xc}}$、一阶势导数 $(v_\rho, v_\sigma, v_\tau)$（用于 SCF 与解析核梯度 `xc_nuclear_grad`）以及**二阶核导数 $(v_{\rho\rho}, v_{\rho\sigma}, v_{\sigma\sigma}, \dots)$**（直接支撑解析分子 Hessian 与线性响应 TDDFT 绝热交换关联核 $\mathbf{K}_{\text{xc}}$）。
+   - 同时发射能量密度 $\epsilon_{\text{xc}}$、一阶势导数 $(v_\rho, v_\sigma, v_\tau)$（用于分子/平面波 SCF 与解析核梯度 `xc_nuclear_grad`）以及**二阶核导数 $(v_{\rho\rho}, v_{\rho\sigma}, v_{\sigma\sigma}, \dots)$**（直接支撑线性响应 TDDFT/CPKS 绝热核 `eval_fxc_device`）。
 
 ```cpp
 // include/gpu4dft/xc.hpp 核心接口签名
 namespace gpu4dft {
 
-struct XcAtom {
-  int atomic_number = 0;
-  std::array<double, 3> center{};
-};
-
-double xc_exact_exchange_fraction(std::string_view xc_name);
-
-class MolecularGrid {
- public:
-  MolecularGrid(std::span<const XcAtom> atoms, const Basis& basis,
-                int radial_points = 75, int angular_points = 302,
-                Backend backend = Backend::Cuda);
-  static MolecularGrid from_points(std::vector<double> coords, std::vector<double> weights,
-                                   const Basis& basis, Backend backend = Backend::Cuda);
-  std::size_t npoints() const noexcept;
-  std::size_t nblocks() const noexcept;
-};
-
-struct XcResult {
-  double exc = 0.0;
-  double integrated_electrons = 0.0;
-  std::vector<double> vxc;  // [nao * nao]
+struct XcOptions {
+  Backend backend = Backend::Cuda;
+  Precision precision = Precision::FP64;
+  double rho_cutoff = 1e-15;
+  bool cache_ao_on_device = true;         // 显存常驻缓存每块活性 Φ^(0), ∇Φ
+  std::size_t max_ao_cache_mb = 2048;     // 设备 AO 缓存上限
 };
 
 class XcEngine {
  public:
   XcEngine(const Basis& basis, const MolecularGrid& grid, std::string xc_name,
-           Backend backend = Backend::Cuda);
+           XcOptions opts = {});
   XcResult eval_vxc(const double* dm, Precision precision = Precision::FP64);
   double eval_vxc_device(const double* d_dm, double* d_vxc_out,
                          Precision precision = Precision::FP64, void* stream = nullptr);
+
+  // TDDFT / CPKS 二阶绝热交换关联核 F_xc[sym_dm] 零拷贝设备接口
+  void set_reference_density_device(const double* d_dm0, void* stream = nullptr);
+  void eval_fxc_device(const double* d_sym_dm, double* d_fxc_out, void* stream = nullptr);
+
   std::vector<double> xc_nuclear_grad(std::span<const XcAtom> atoms, const double* dm);
 };
 
@@ -717,6 +722,57 @@ DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext& ctx, int nao, int nmo, in
                                      const double* d_F, const double* d_X, double* d_P_work,
                                      double* d_D_out, double* d_W_out = nullptr,
                                      const Sp2Options& opts = {}, StreamHandle stream = nullptr);
+
+}  // namespace gpu4dft
+```
+
+---
+
+### 5.5 线性响应激发态（CIS / TDA / TDDFT）、CPHF 极化率与分子振动 Hessian 引擎
+
+`include/gpu4dft/response.hpp` 构建了全显存零拷贝常驻的闭壳层单重态线性响应激发态、耦合微扰（CPHF / CPKS）与分子核振动分析引擎：
+
+1. **Tamm–Dancoff 近似（CIS / TDA）与完整 Casida RPA 方程（TDHF / TDDFT）**：
+   - 在正则分子轨道基 $\{\phi_i\}_{\text{occ}} \otimes \{\phi_a\}_{\text{vir}}$（维数 $N_{\text{ov}} = N_{\text{occ}} N_{\text{vir}}$）上，完整线性响应 Casida 本征方程为非厄米广义特征值问题：
+     $$\begin{pmatrix} \mathbf{A} & \mathbf{B} \\ \mathbf{B} & \mathbf{A} \end{pmatrix} \begin{pmatrix} \mathbf{X}_n \\ \mathbf{Y}_n \end{pmatrix} = \omega_n \begin{pmatrix} \mathbf{I} & \mathbf{0} \\ \mathbf{0} & -\mathbf{I} \end{pmatrix} \begin{pmatrix} \mathbf{X}_n \\ \mathbf{Y}_n \end{pmatrix}, \qquad \mathbf{X}_n^\top\mathbf{X}_n - \mathbf{Y}_n^\top\mathbf{Y}_n = 1$$
+   - **TDA / CIS**：忽略退激发耦合块 $\mathbf{B} = \mathbf{0}$，直接在 GPU 上以对角轨道能差 $(\varepsilon_a - \varepsilon_i)$ 预条件的**块 Davidson（Block-Davidson）** 迭代求解厄米本征问题 $\mathbf{A}\mathbf{X}_n = \omega_n\mathbf{X}_n$。
+   - **完整 TDDFT / TDHF**：对于纯泛函（$\alpha_x = 0$），$(\mathbf{A}-\mathbf{B}) = \operatorname{diag}(\varepsilon_a - \varepsilon_i)$ 严格对角，直接转化为对称正定平方本征问题 $\mathbf{\Omega}\mathbf{F}_n = \omega_n^2 \mathbf{F}_n$（其中 $\mathbf{\Omega} = (\mathbf{A}-\mathbf{B})^{1/2}(\mathbf{A}+\mathbf{B})(\mathbf{A}-\mathbf{B})^{1/2}$，每次迭代仅需 **1 次**对称 J + $F_{\text{xc}}$ 收缩！）；对于含精确交换的杂化泛函与 TDHF（$\alpha_x > 0$），通过单次非对称跃迁密度矩阵 $\mathbf{M} = \mathbf{C}_{\text{occ}}\mathbf{Z}\mathbf{C}_{\text{vir}}^\top \in \mathbb{R}^{N_{\text{AO}}\times N_{\text{AO}}}$ 的零拷贝 GPU 收缩同时构造 $(\mathbf{A}+\mathbf{B})\mathbf{Z}$ 与 $(\mathbf{A}-\mathbf{B})\mathbf{Z}$：
+     $$\mathbf{V}_+ = 4\mathbf{J}(\mathbf{M}) + 2\mathbf{F}_{\text{xc}}[\mathbf{M}+\mathbf{M}^\top] - \alpha_x\big(\mathbf{K}(\mathbf{M}) + \mathbf{K}(\mathbf{M})^\top\big), \qquad \mathbf{V}_- = -\alpha_x\big(\mathbf{K}(\mathbf{M}) - \mathbf{K}(\mathbf{M})^\top\big)$$
+   - **全栈零拷贝 RI-TDDFT 与 Ozaki INT8 集成**：`MolecularScf::run_response` 直接复用 `DirectJKEngine::compute_jk_device(..., symmetrize_dm=false)` 或显存常驻 `RIJKEngine::compute_jk_device(..., symmetrize_dm=false)`（含分块 `OzakiInt8` RI-K）与 `XcEngine::eval_fxc_device`，AO$\leftrightarrow$MO 轨道变换支持 `FP64`、`FP32` 与 `OzakiInt8` Tensor Core GEMM，在 Blackwell 上相对 48 核 CPU PySCF 加速达 **`13.3x–32.1x`**，并在 `(H2O)_8/def2-svp` PBE RI-TDDFT 上超越 `GPU4PySCF` 达 **`2.77x`**。
+   - **电偶极跃迁矩与振子强度**：利用 GPU 电偶极积分矩阵 $\boldsymbol{\mu}_{\text{AO}}$ 计算长度规范跃迁偶极矩 $\mathbf{d}_n = \sqrt{2}\,\mathrm{Tr}\!\big[\boldsymbol{\mu}_{\text{AO}}\mathbf{C}_{\text{occ}}(\mathbf{X}_n + \mathbf{Y}_n)\mathbf{C}_{\text{vir}}^\top\big]$ 及无量纲振子强度 $f_n = \frac{2}{3}\omega_n |\mathbf{d}_n|^2$。
+
+2. **CPHF / CPKS 静态极化率与分子核振动 Hessian (`solve_cphf`, `compute_molecular_hessian`)**：
+   - 预条件共轭梯度法求解耦合微扰方程 $(\mathbf{A}+\mathbf{B})\mathbf{Z}^{(\beta)} = -\boldsymbol{\mu}_{\text{ov}}^{(\beta)}$，给出 $3\times 3$ 静态电偶极极化率张量 $\alpha_{\alpha\beta} = -4\,\mathrm{Tr}\big[(\boldsymbol{\mu}_{\text{ov}}^{(\alpha)})^\top \mathbf{Z}^{(\beta)}\big]$。
+   - `MolecularScf::run_hessian` 固定平衡几何分子积分格点（消除格点权重导数噪声）并以平衡态收敛密度矩阵热启动中心差分位移点的 GPU SCF 与解析核梯度（单位移点仅需 4–6 步 SCF），随后经 Eckart 平动/转动正交投影与质量加权对角化获得简谐振动频率、约化质量、力常数与零点振动能（ZPE），相对 PySCF 解析 Hessian 频率偏差 **`< 0.002 cm⁻¹`**。
+
+```cpp
+// include/gpu4dft/response.hpp 核心接口签名
+namespace gpu4dft {
+
+enum class ResponseMethod { TDA, TDDFT };
+
+struct ResponseCallbacks {
+  std::function<void(const double* dm_ptr, double* vj_out, double* vk_out, void* stream)> build_jk;
+  std::function<void(const double* sym_dm_ptr, double* fxc_out, void* stream)> build_fxc;
+  bool device_resident = false;
+  bool fxc_device_resident = false;
+};
+
+class LinearResponseDriver {
+ public:
+  explicit LinearResponseDriver(ResponseOptions opts = {}, DeviceMemoryPool* pool = nullptr);
+  ResponseResult run(int nao, int nmo, int n_occ, const double* mo_energies_host,
+                     const double* mo_coeff_host, const ResponseCallbacks& callbacks,
+                     const std::array<std::vector<double>, 3>* ao_dipoles_host = nullptr);
+};
+
+CphfResult solve_cphf(int nao, int nmo, int n_occ, const double* mo_energies_host,
+                      const double* mo_coeff_host, const double* rhs_mo_host,
+                      const ResponseCallbacks& callbacks, const CphfOptions& opts = {});
+
+VibrationalResult analyze_hessian(std::span<const Atom> atoms, const double* hessian_3n_3n_host,
+                                  std::span<const double> custom_masses_amu = {},
+                                  const HessianOptions& opts = {});
 
 }  // namespace gpu4dft
 ```
@@ -831,102 +887,78 @@ class MultiGpuManager {
 
 ---
 
-## 8. 平面波赝势 DFT（Plane-Wave DFT）扩展蓝图
+## 8. 平面波赝势与自适应压缩交换杂化泛函子系统（`gpu4dft::pw`）
 
-GPU4DFT 的架构并非局限于局域高斯分子体系。第二层显存池与图执行器、第三层 Ozaki INT8 / 混合精度 GEMM 与符号自动微分 XC 内核、第四层 CUDA/HIP 双后端代码生成器以及第五层 NCCL/NVSHMEM 通信栈，均可直接复用于周期性晶体、表面催化与凝聚态体系的**平面波赝势密度泛函理论子系统（`gpu4dft::pw`）**。
+GPU4DFT 在 `include/gpu4dft/pw.hpp`、`src/pw.cpp`、`src/cuda/pw_cuda.cu` 与 Python 子模块 `gpu4dft.pw` 中完整实现了面向周期性晶体与凝聚态体系的**原生 GPU 平面波赝势 Kohn–Sham 与自适应压缩交换杂化泛函子系统（`gpu4dft::pw`）**，直接共享底层符号自动微分 XC 内核与稠密 GPU 线性代数栈。
 
-### 8.1 双空间基组表示与多级并行拓扑
+### 8.1 双空间基组表示、Ewald 晶格能与 GTH 可分赝势 (`PwCell`, `PwBasis`)
 
-在晶胞体积 $\Omega$ 与布里渊区采样网格 $\{\mathbf{k}\}$ 下，Kohn–Sham 准粒子波函数按动能截断球展开：
+在晶胞体积 $\Omega = |\det(\mathbf{A})|$ 与布里渊区采样网格 $\{\mathbf{k}, w_{\mathbf{k}}\}$ 下，Kohn–Sham 准粒子波函数按动能截断球展开：
 $$\psi_{n\mathbf{k}}(\mathbf{r}) = \frac{1}{\sqrt{\Omega}} \sum_{\frac{1}{2}|\mathbf{k}+\mathbf{G}|^2 \le E_{\text{cut}}} c_{n\mathbf{k}}(\mathbf{G})\, e^{\mathrm{i}(\mathbf{k}+\mathbf{G})\cdot\mathbf{r}}$$
-- **双球截断与实空间网格**：波函数球截断能 $E_{\text{cut}}$（平面波数 $N_{\text{PW}}(\mathbf{k})$），光滑电荷密度与局域势截断能 $E_{\text{cut}}^{\rho} = 4 E_{\text{cut}}$（模守恒赝势 NCPP）或 $8\text{–}12 E_{\text{cut}}$（超软 USPP / 投影缀加波 PAW），对应三维实空间均匀 FFT 网格 $N_1 \times N_2 \times N_3$。每个 $\mathbf{k}$ 点的 $N_{\text{band}}$ 条能带存储为列主序复数密集矩阵 $\boldsymbol{\Psi}_{\mathbf{k}} \in \mathbb{C}^{N_{\text{PW}} \times N_{\text{band}}}$（$\Gamma$ 点实波函数体系存储半空间共轭压缩矩阵，内存与算量减半）。
-- **三级正交并行层次 `(k-point, band, G-vector)`**：
-  1. **顶层 $\mathbf{k}$ 点组并行（$G_{\mathbf{k}}$）**：各 $\mathbf{k}$ 点哈密顿本征求解完全独立，仅在每步 SCF 末尾通过一次轻量级 `AllReduce` 汇总实空间总电荷密度 $\rho(\mathbf{r}) = \sum_{\mathbf{k}} w_{\mathbf{k}} \sum_n f_{n\mathbf{k}} |\psi_{n\mathbf{k}}(\mathbf{r})|^2$，跨节点通信比接近零；
-  2. **中层能带组并行（$G_{\text{band}}$）**：在批量三维 FFT 与局域势作用阶段，将 $N_{\text{band}}$ 划分为每卡独立能带子批次；在子空间正交化与 Rayleigh–Ritz 阶段切换为块分布矩阵通信；
-  3. **底层平面波 $\mathbf{G}$ 向量 / Pencil 域分解（$G_{\text{PW}}$）**：针对数千原子超晶胞单条能带较大场景，将三维 FFT 网格按二维铅笔（2D Pencil）切分，底层调用 `cuFFTMp`（基于 NVSHMEM 硬件加速转置）。
+- **双球截断与 $2^a 3^b 5^c$ 光滑 FFT 网格**：波函数球截断能 $E_{\text{cut}}$（活性平面波数 $N_{\text{PW}}(\mathbf{k})$），光滑电荷密度与局域势截断能 $E_{\text{cut}}^{\rho} = 4 E_{\text{cut}}$，自动选取最优光滑三维均匀网格 $N_1 \times N_2 \times N_3$。`PwCell` 内置三维精确 Ewald 离子排斥能（与 `PySCF-PBC` 误差 $< 10^{-12}\ E_\text{h}$）及周期性点电荷 Madelung 常数 $\xi$（用于精确交换可积奇点修正 `ExxDiv::Ewald`）。
+- **Goedecker–Teter–Hutter (GTH / HGH) 可分模守恒赝势**：内置 `Z = 1..18`（`gth-pade` / `gth-lda` 与 `gth-pbe`）解析参数表，局域部分在倒空间精确求值并包含 $\mathbf{G}=\mathbf{0}$ 核电中和常数 $\varepsilon_{\text{core}}/\Omega$，非局域通道直接由解析 Fourier 径向多项式 $q_{l,i}(|\mathbf{k}+\mathbf{G}|r_l)$ 与实固体球谐函数构造。
 
 ```mermaid
 flowchart TD
-    PSI["倒空间波函数块 Ψ_k in C^{N_PW x N_band}"] --> KIN["1. 动能对角算符 (GPU 融合逐元素核)\n(T Ψ)_{G,n} = 0.5 |k+G|^2 Ψ_{G,n}"]
-    PSI --> FFT_FWD["2. 局域势通道: 球面稀疏 Scatter -> 3D 网格\n批量 cuFFT / rocFFT / cuFFTMp (G -> r)\n实空间乘 V_loc(r) = V_ion^loc + V_H + V_xc\n批量逆 3D FFT (r -> G) -> 球面 Gather"]
-    PSI --> VNL["3. 非局域赝势通道 (纯 Tensor Core GEMM!)\nP = B_k^H Ψ_k (ZGEMM / 实部虚部分离 Ozaki INT8)\nV_NL Ψ_k = B_k (D_ion P)"]
-    PSI --> ACE["4. 杂化泛函压缩交换通道 (ACE 低秩 GEMM!)\nV_X^ACE Ψ_k = - Ξ_k (Ξ_k^H Ψ_k)"]
+    PSI["倒空间波函数块 Ψ_k in C^{N_PW x N_band}"] --> KIN["1. 动能对角算符 (GPU 融合核)\n(T Ψ)_{G,n} = 0.5 |k+G|^2 Ψ_{G,n}"]
+    PSI --> FFT_FWD["2. 局域势通道: 球面稀疏 Scatter -> 3D 网格\n批量 cuFFTPlanMany (G -> r)\n实空间乘 V_loc(r) = V_ion^loc + V_H + V_xc\n批量逆 3D cuFFT (r -> G) -> 球面 Gather"]
+    PSI --> VNL["3. GTH Kleinman-Bylander 非局域赝势 (ZGEMM)\nC = P_k^H Ψ_k,  V_NL Ψ_k = P_k (H_proj C)"]
+    PSI --> ACE["4. Lin's ACE 自适应压缩精确交换 (零 FFT 低秩 GEMM!)\nV_X^ACE Ψ_k = - Ξ_k (Ξ_k^H Ψ_k)"]
     KIN --> HPSI["哈密顿作用输出 H_k Ψ_k"]
     FFT_FWD --> HPSI
     VNL --> HPSI
     ACE --> HPSI
-    HPSI --> EIG["5. 面向 GEMM 的块迭代本征求解器\nLOBPCG / Block-Davidson / PPCG\n(FP32 预条件 + Ozaki/FP64 Rayleigh-Ritz)"]
+    HPSI --> EIG["5. Teter 预条件块迭代本征求解 + Kerker-DIIS 混合\nBlock-Davidson / LOBPCG + Pulay Kerker 密度混合"]
 ```
 
-### 8.2 批量三维 FFT 与 GEMM 化非局域赝势投影子
+### 8.2 批量三维 `cuFFT` 与 GEMM 化 Kleinman–Bylander 非局域赝势
 
-1. **分批流水线 3D FFT（`cuFFT` / `rocFFT` / `cuFFTMp`）**：  
-   若一次性将全部 $N_{\text{band}}$ 条波函数展开到完整三维立方网格 $(N_1 N_2 N_3 \times N_{\text{band}})$，显存占用将是紧凑球存储的 $8\text{–}15$ 倍。`gpu4dft::pw` 采用双流分批（Batch Size $B_{\text{fft}} = 16 \sim 64$）流水线：在 `DeviceMemoryPool` 复用的固定尺寸缓冲中执行 `ScatterSphereToBox` $\to$ `cufftExecZ2Z(INVERSE)` $\to$ `PointwiseMulVloc` $\to$ `cufftExecZ2Z(FORWARD)` $\to$ `GatherBoxToSphere`，既跑满 HBM/GDDR7 带宽又将瞬态显存锁死在常数级。实空间交换关联势 $V_{\text{xc}}(\mathbf{r})$ **直接复用高斯子系统的 `xc_codegen` 生成的 `GPU4DFT_HD` 泛函头文件**（$\nabla\rho$ 由倒空间乘 $\mathrm{i}\mathbf{G}$ 经一次 FFT 精确求得，无实空间有限差分截断误差！）。
-2. **非局域赝势的密集矩阵乘法重构**：  
-   模守恒 Kleinman–Bylander 或 PAW 非局域势算符具有天然低秩可分结构：
-   $$\hat{V}_{\text{NL}}^{\mathbf{k}} = \sum_{I,\alpha,\beta} |\beta_{I\alpha}^{\mathbf{k}}\rangle\, D_{\alpha\beta}^I\, \langle \beta_{I\beta}^{\mathbf{k}}|$$
-   将晶胞内全部原子的球谐结构因子投影函数预组装为密集列矩阵 $\mathbf{B}_{\mathbf{k}} \in \mathbb{C}^{N_{\text{PW}}\times N_{\text{proj}}}$（$N_{\text{proj}} \sim 8\text{–}18 N_{\text{atom}}$），则对整块波函数的作用完全化为两次算术强度极高的矩阵乘法：
-   $$\mathbf{P} = \mathbf{B}_{\mathbf{k}}^\dagger \boldsymbol{\Psi}_{\mathbf{k}} \in \mathbb{C}^{N_{\text{proj}}\times N_{\text{band}}}, \qquad \hat{V}_{\text{NL}}^{\mathbf{k}}\boldsymbol{\Psi}_{\mathbf{k}} = \mathbf{B}_{\mathbf{k}} (\mathbf{D}_{\text{ion}} \mathbf{P})$$
-   将复数矩阵拆分为实部与虚部连续块（或使用 Gauss 3M 法），即可直接喂入 **Blackwell `OzakiInt8` Tensor Core GEMM 引擎**，使大体系中最耗时的 $O(N_{\text{atom}} N_{\text{band}} N_{\text{PW}})$ 非局域投影获得数量级加速！
+1. **批量 3D FFT（CUDA `cufftPlanMany` + Host Stockham/Bluestein 参考）**：  
+   `gpu4dft::pw` 在 GPU 上通过 `cufftPlanMany` 执行能带分批三维复数 FFT：从紧凑球索引 `ScatterSphereToBox` $\to$ `cufftExecZ2Z(INVERSE)` $\to$ 实空间乘 $V_{\text{loc}}(\mathbf{r})$ $\to$ `cufftExecZ2Z(FORWARD)` $\to$ `GatherBoxToSphere`。实空间交换关联势 $V_{\text{xc}}(\mathbf{r})$ **直接复用高斯子系统的 `xc_codegen` 符号自动微分泛函核**（GGA 密度梯度 $\nabla\rho(\mathbf{r})$ 由倒空间精确乘 $\mathrm{i}\mathbf{G}$ 经逆 FFT 求得，零有限差分误差）。无 GPU 时自动使用内置混合基 $2/3/5$ Stockham + 任意素数长度 Bluestein 三维 OpenMP FFT。
+2. **非局域赝势的密集矩阵乘法重构 (`NonLocalProjector`)**：  
+   将晶胞内全部原子的 GTH 非局域投影子预组装为列主序复数矩阵 $\mathbf{P}_{\mathbf{k}} \in \mathbb{C}^{N_{\text{PW}}\times N_{\text{proj}}}$ 与块对角耦合矩阵 $\mathbf{H}_{\text{proj}} \in \mathbb{C}^{N_{\text{proj}}\times N_{\text{proj}}}$，对整块能带的作用完全转化为高算术强度 `cublasZgemm`：
+   $$\hat{V}_{\text{NL}}^{\mathbf{k}}\boldsymbol{\Psi}_{\mathbf{k}} = \mathbf{P}_{\mathbf{k}} \big(\mathbf{H}_{\text{proj}} (\mathbf{P}_{\mathbf{k}}^\dagger \boldsymbol{\Psi}_{\mathbf{k}})\big)$$
 
-### 8.3 面向 GEMM 的迭代本征求解器（LOBPCG / Davidson / PPCG）与杂化泛函 ACE 加速
+### 8.3 块迭代本征求解器（Davidson / LOBPCG）与 Lin's ACE 杂化泛函加速
 
-1. **三类块迭代本征求解器协同**：
-   - **Block-Davidson 与 LOBPCG（局部最优块预条件共轭梯度）**：在三维试探子空间 $\mathcal{V}_k = \operatorname{span}[\boldsymbol{\Psi}_k, \mathbf{W}_k, \mathbf{P}_{k-1}]$（其中残差 $\mathbf{R}_k = \mathbf{H}\boldsymbol{\Psi}_k - \boldsymbol{\Psi}_k\boldsymbol{\Lambda}_k$ 经 Teter 动能对角预条件子 $\mathbf{W}_k = \mathbf{P}_{\text{Teter}}\mathbf{R}_k$ 缩放）上，通过块 GEMM 构造 $3N_{\text{band}} \times 3N_{\text{band}}$ 投影矩阵 $\mathbf{H}_{\text{sub}} = \mathbf{V}_k^\dagger(\mathbf{H}\mathbf{V}_k)$ 与 $\mathbf{S}_{\text{sub}} = \mathbf{V}_k^\dagger\mathbf{V}_k$，由 `cusolverDnZhegvd` 求解广义特征值并执行子空间旋转 $\boldsymbol{\Psi}_{k+1} = \mathbf{V}_k \mathbf{C}_{\text{sub}}$。支持**混合精度预条件内循环**：残差与预条件步采用 `FP32` FFT + `FP32` Tensor Core GEMM，仅在 Rayleigh–Ritz 正交化与收敛外步采用 `FP64` / `OzakiInt8`。
-   - **PPCG（Projected Preconditioned Conjugate Gradient）**：当超晶胞 $N_{\text{band}} > 2,000$ 时，全局 $3N_{\text{band}}$ 维广义特征值分解本身成为串行瓶颈。PPCG 先执行一次块正交锁定，随后将所有能带独立拆分为互不耦合的 **$3\times 3$ 微子空间**在单个 GPU 内核中高度并行求解，周期性做块 Rayleigh–Ritz 旋转，完美扩展至上万能带体系。
-
+1. **Teter–Payne–Allan 预条件块 Davidson 与 LOBPCG**：  
+   采用光滑有理动能预条件子 $P_{\text{Teter}}(T_{\mathbf{G}}, E_{\text{kin},n})$ 加速高动能平面波收敛，支持子空间扩张 **Block-Davidson** 与三块递推 **LOBPCG**，外层自洽循环结合 **Kerker 长波介电屏蔽预条件（$\frac{|\mathbf{G}|^2}{|\mathbf{G}|^2 + q_0^2}$）与 Pulay DIIS 电荷密度混合**，消除超晶胞长波电荷振荡（Charge Sloshing）。
 2. **杂化泛函自适应压缩交换算子（Lin's Adaptive Compressed Exchange, ACE）**：  
-   在平面波基下直接评估精确 Fock 交换算符 $(\hat{V}_X \psi_i)(\mathbf{r}) = -\sum_{j=1}^{N_{\text{occ}}} \psi_j(\mathbf{r}) \int \frac{\psi_j^*(\mathbf{r}')\psi_i(\mathbf{r}')}{|\mathbf{r}-\mathbf{r}'|}\,\mathrm{d}\mathbf{r}'$ 每次哈密顿作用都需要 $N_{\text{occ}} N_{\text{band}}$ 次三维 Poisson FFT（在倒空间乘以库仑核 $\frac{4\pi}{|\mathbf{G}+\mathbf{q}|^2}$ 并带 Gygi–Baldereschi 可积奇点修正），若直接放入 Davidson 内循环将慢上百倍。  
-   采用 **Lin (2016) ACE 低秩精确压缩格式**：
-   - 在外层交换循环固定当前占据轨道 $\boldsymbol{\Psi}_{\text{occ}}$，执行一次真实交换作用得到 $\mathbf{W} = \hat{V}_X[\boldsymbol{\Psi}_{\text{occ}}]\boldsymbol{\Psi}_{\text{occ}} \in \mathbb{C}^{N_{\text{PW}}\times N_{\text{occ}}}$（利用 $ij$ 对称性减半 Poisson FFT，且可用 `FP32` `cuFFT` 加速远步迭代）；
-   - 计算对称正定交换内积矩阵 $\mathbf{M} = -\boldsymbol{\Psi}_{\text{occ}}^\dagger \mathbf{W} \in \mathbb{C}^{N_{\text{occ}}\times N_{\text{occ}}}$，做 Cholesky 分解 $\mathbf{M} = \mathbf{L}\mathbf{L}^\dagger$，并做三角右解得到压缩交换投影基：
-     $$\boldsymbol{\Xi} = \mathbf{W}\mathbf{L}^{-\dagger} \in \mathbb{C}^{N_{\text{PW}} \times N_{\text{occ}}}$$
-   - 在整个内层自洽/本征迭代中，低秩 ACE 算符对全部占据子空间**在代数上恒等于精确交换算符**（$\hat{V}_X^{\text{ACE}}\boldsymbol{\Psi}_{\text{occ}} = \hat{V}_X\boldsymbol{\Psi}_{\text{occ}}$），且对任意试探波函数块的作用简化为**零 FFT 的两次密集 GEMM**：
-     $$\hat{V}_X^{\text{ACE}}\boldsymbol{\Psi} = -\boldsymbol{\Xi}\big(\boldsymbol{\Xi}^\dagger \boldsymbol{\Psi}\big)$$
-
-### 8.4 平面波子系统核心 C++20 接口与统一代码生成策略
-
-- **共享 CUDA / HIP 代码生成**：平面波子系统中的球面–立方网格 Gather/Scatter、动能与 Teter 预条件逐元素融合核、实空间电荷密度平方模累加及球谐 Bessel 投影函数生成核，统一纳入 `codegen/pw_codegen` 以 `GPU4DFT_HD` 模板发射 `.cu` 与 `.hip` 驱动，并使用统一的 FFT 后端包装层（编译期映射 `cufft*` $\leftrightarrow$ `rocfft*`）。
+   直接评估平面波精确交换 $(\hat{V}_X \psi_i)(\mathbf{r}) = -\sum_{j\in\text{occ}} \psi_j(\mathbf{r}) \int \frac{\psi_j^*(\mathbf{r}')\psi_i(\mathbf{r}')}{|\mathbf{r}-\mathbf{r}'|}\,\mathrm{d}\mathbf{r}'$ 在每次 Davidson 哈密顿作用中均需 $O(N_{\text{occ}} N_{\text{band}})$ 次三维 Poisson FFT。`PwKohnShamSolver` 实现了 **Lin (2016) ACE 双循环精确低秩压缩**：
+   - 外层交换循环对当前占据轨道计算一次精确交换作用 $\mathbf{W} = \hat{V}_X[\boldsymbol{\Psi}_{\text{occ}}]\boldsymbol{\Psi}_{\text{occ}} \in \mathbb{C}^{N_{\text{PW}}\times N_{\text{occ}}}$（含最小镜像布里渊区折叠与 Gygi–Baldereschi `ExxDiv::Ewald` 修正）；
+   - 构造对称正定内积矩阵 $\mathbf{M} = -\boldsymbol{\Psi}_{\text{occ}}^\dagger \mathbf{W} = \mathbf{L}\mathbf{L}^\dagger$，经 Cholesky 三角求解得压缩投影基 $\boldsymbol{\Xi} = \mathbf{W}\mathbf{L}^{-\dagger} \in \mathbb{C}^{N_{\text{PW}}\times N_{\text{occ}}}$；
+   - 在整个内层 Kohn–Sham 自洽与 Davidson 迭代中，低秩算符 $\hat{V}_X^{\text{ACE}}\boldsymbol{\Psi} = -\boldsymbol{\Xi}(\boldsymbol{\Xi}^\dagger\boldsymbol{\Psi})$ 在占据子空间上与精确交换**代数恒等**，且将每次哈密顿作用简化为**零 FFT 的两次 `cublasZgemm`**！在 Blackwell 实测中，金刚石硅超晶胞 `PBE` / `PBE0` 相对 `PySCF-PBC` 提速 **`162.7x–193.3x`**，在 `Si8` 超晶胞上较 48 核 OpenMP Host 快 **`8.78x`**，ACE 压缩减少 **`10.5x–16.6x`** Poisson FFT 并带来 **`1.41x–1.85x`** GPU 净加速。
 
 ```cpp
-// 蓝图接口规范：include/gpu4dft/pw/pw_hamiltonian.hpp
+// include/gpu4dft/pw.hpp 核心接口签名
 namespace gpu4dft::pw {
 
-struct Lattice {
-  std::array<std::array<double, 3>, 3> a_vecs;  // Bohr 晶格基矢
+enum class PwSolverType : int { Davidson = 0, LOBPCG = 1, BlockDavidson = 0 };
+enum class ExxDiv : int { None = 0, Ewald = 1 };
+
+class PwCell {
+ public:
+  PwCell(const std::array<std::array<double, 3>, 3>& a_vecs,
+         std::vector<PwAtom> atoms, std::string_view pseudo_family = "gth-pade");
   double volume() const noexcept;
+  double ewald_energy(double precision = 1e-13) const;
+  double madelung_constant(std::array<int, 3> kmesh = {1, 1, 1}, double precision = 1e-13) const;
 };
 
 class PwBasis {
  public:
-  PwBasis(const Lattice& lattice, double ecut_wfc, double ecut_rho = 0.0,
-          std::array<int, 3> k_point_frac = {0, 0, 0}, Backend backend = Backend::Cuda);
-  int npw() const noexcept;
+  PwBasis(const PwCell& cell, double ecut_wfc, double ecut_rho = 0.0,
+          std::span<const std::array<double, 3>> kpoints = {},
+          std::span<const double> kweights = {});
   std::array<int, 3> fft_grid() const noexcept;
+  int nkpts() const noexcept;
+  const KPointBasis& kpoint(int ik = 0) const;
 };
 
-class NonLocalProjector {
+class PwKohnShamSolver {
  public:
-  NonLocalProjector(const PwBasis& basis, std::span<const Atom> atoms, GemmMode mode = GemmMode::OzakiInt8);
-  void apply_add(const void* d_psi, void* d_hpsi, int nband, void* stream = nullptr) const;
-};
-
-class AceOperator {
- public:
-  void rebuild(const PwBasis& basis, const void* d_psi_occ, int nocc,
-               Precision fft_prec = Precision::FP64, void* stream = nullptr);
-  void apply_add(double alpha_x, const void* d_psi, void* d_hpsi, int nband,
-                 GemmMode mode = GemmMode::OzakiInt8, void* stream = nullptr) const;
-};
-
-enum class PwSolverType { BlockDavidson, LOBPCG, PPCG };
-
-struct PwEigensolverOptions {
-  PwSolverType type = PwSolverType::LOBPCG;
-  GemmMode gemm_mode = GemmMode::OzakiInt8;
-  Precision precondition_precision = Precision::FP32;
-  int max_subspace_iter = 15;
-  double residual_tol = 1e-8;
+  PwKohnShamSolver(const PwBasis& basis, PwScfOptions opts = {});
+  PwScfResult run();
 };
 
 }  // namespace gpu4dft::pw
@@ -934,25 +966,25 @@ struct PwEigensolverOptions {
 
 ---
 
-## 9. 分阶段数值验证与性能回归路线图
+## 9. 分阶段数值验证与实测里程碑总结
 
-### 9.1 六阶段工程演进里程碑
+### 9.1 六阶段工程演进与 Blackwell (`sm_120`) 实测验收状态
 
-| 阶段 | 核心交付里程碑 | 关键数值验收标准（对照 PySCF / `libcint` / `Libxc`） |
+| 阶段 | 核心交付里程碑 | Blackwell (`RTX PRO 6000`) 实测验证结果（`340/340` CTest 100% 全绿） |
 | :--- | :--- | :--- |
-| **Phase 0: 基座验证** | Boys $F_0$、壳对 SoA、`(ss|ss)` Host + CUDA `FP64`/`FP32`、构建期代码生成与 `nanobind` | H₂/H₄/HeH⁺/H₈ 五体系 ERI 相对最大元误差 `< 1e-13` (FP64) / `< 1e-6` (FP32)，真实 Blackwell GPU 通过 |
-| **Phase 1: 完备积分与 J/K** | `boys_vec` ($m \le 24$)、Rys ($n_r \le 8$)、任意角动量 ($s,p,d,f,g$) 1e/2e 生成器（Host/CUDA/HIP）、`DirectJKEngine`（Schwarz + 动态混合精度 + 原子队列）、`RIJKEngine`、1e+2e 解析核梯度 | `S, T, V_nuc` 及全角动量 `eri_tensor` 误差 `< 1e-12`；Direct JK 与 Mixed JK 能量误差 `<= 1e-10` $E_\text{h}$；解析梯度对照有限差分与 PySCF `< 1e-8` $E_\text{h}/a_0$ |
-| **Phase 2: XC 与半数值交换** | `xc_codegen` 符号自动微分（LDA/GGA/TPSS + 一二阶导数）、GPU M4+Lebedev+SSF 分子格点、八叉树分块 + 活性 AO 批量 GEMM `XcEngine`、`SemiNumericalK` (COSX)、XC 核梯度 | 逐点 `eval_xc` 与同格点 $E_{\text{xc}}, \mathbf{V}_{\text{xc}}$ 对照 PySCF/Libxc 误差 `< 1e-12`；COSX 与 XC 梯度严格自洽 |
-| **Phase 3: GPU 常驻驱动与 Ozaki/SP2** | `DeviceMemoryPool`、`CudaGraphExecutor`、**`OzakiInt8` Tensor Core GEMM**、`solve_fock_diag` & `solve_fock_sp2`、`GpuDiis`、多卡 `MultiGpuManager`、全闭环 `ScfDriver` | `OzakiInt8` 对照 `cublasDgemm` 相对误差 `< 1e-13`；SP2 纯化与对角化能量差 `< 1e-10` $E_\text{h}$；端到端 RHF/LDA/PBE/B3LYP/TPSS 收敛能量与 PySCF 偏差 `<= 1e-10` $E_\text{h}$ |
-| **Phase 4: 自动调优与竞品对标** | Blackwell / Hopper / MI300 自动调优表固化、全套水团簇/烷烃/药物分子基准测试 | 建立相对 **GPU4PySCF** 与 **TeraChem** 的自动化 CI 精度与吞吐回归基线（详见 [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md)） |
-| **Phase 5: 响应性质与平面波扩展** | `deriv_order = 2` 解析分子 Hessian、线性响应 TDDFT、`gpu4dft::pw` 平面波赝势 + ACE 杂化引擎 | 分子振动频率对照 PySCF `< 0.1 cm⁻¹`；平面波晶体总能对照 Quantum ESPRESSO / ABINIT `< 1e-9` Ry |
+| **Phase 0: 基座验证** | Boys $F_0$、壳对 SoA、`(ss|ss)` Host + CUDA `FP64`/`FP32`、构建期代码生成与 `nanobind` | H₂/H₄/HeH⁺/H₈ 五体系 ERI 相对最大元误差 `< 1e-13` (FP64) / `< 1e-6` (FP32) |
+| **Phase 1: 完备积分与零拷贝 J/K** | `boys_vec` ($m \le 24$)、Rys ($n_r \le 8$)、任意角动量 ($s..g$) 1e/2e 生成器、全显存零拷贝 `DirectJKEngine`、100% GPU 原生 `RIJKEngine`、1e+2e 解析核梯度 | `Direct_FP64` 在**全部 `15/15` 组分子 SCF 上超越 `GPU4PySCF`（快 `1.35x–5.43x`）**；GPU 原生 `RI-JK` 预处理提速 **`77.4x`**，端到端最高较 48 核 CPU 快 **`34.4x`**、较 `GPU4PySCF` 快 **`1.75x`** |
+| **Phase 2: 4 流缓存 XC 与渐近 `sn-K`** | `xc_codegen` 符号自动微分（LDA/GGA/TPSS + 一二阶导数）、GPU M4+Lebedev+SSF 格点、4 流活性 AO 显存缓存 `XcEngine`（含 `eval_fxc_device`）、渐近筛选 `SemiNumericalK` | `XcEngine` 提速 **`14.7x–22x`**，二阶核 `eval_fxc_device` 误差 `1.39e-16`；渐近筛选 4 流 COSX 提速 **`10.6x–14.2x`**；解析核梯度较 `GPU4PySCF` 快达 **`2.34x`** |
+| **Phase 3: GPU 常驻驱动与 Ozaki/SP2** | `DeviceMemoryPool`、`CudaGraphExecutor`、**`OzakiInt8` Tensor Core GEMM**、`solve_fock_diag` & `solve_fock_sp2`、`GpuDiis`、多卡 `MultiGpuManager` | `OzakiInt8` 达 **`9.73 TFLOPS`（较原生 FP64 快 `6.31x`，误差 `2.14e-15`）**；CUDA Graph 稳态分配 `0` 次，`C12H26` 上 `OzakiInt8 + Graph` 超越原生 FP64 |
+| **Phase 4: 自动调优与 7 大套件对标** | Blackwell 自动调优表固化、覆盖 GEMM/ERI/Ablation/SCF/Grad/TDDFT/PW-DFT 的 7 大自动化基准套件 | 完整 JSON 与 Markdown 实测基准归档于 [benchmarks/results/BENCHMARK_REPORT.md](../benchmarks/results/BENCHMARK_REPORT.md) |
+| **Phase 5: 线性响应激发态、振动 Hessian 与平面波 ACE** | `LinearResponseDriver`（`CIS`/`TDA`/`TDHF`/`TDDFT`/`RI-TDDFT` + `OzakiInt8`）、CPHF 极化率、分子核 Hessian、`gpu4dft::pw` 平面波赝势 + Lin's ACE 引擎 | GPU `RI-TDDFT` 较 48 核 CPU 快 **`13.3x–32.1x`**、较 `GPU4PySCF` 快达 **`2.77x`**；简谐频率偏差 **`< 0.002 cm⁻¹`**；平面波 `PBE`/`PBE0` 较 `PySCF-PBC` 快 **`162.7x–193.3x`**、较 48 核 Host 快 **`8.78x`**，ACE 提速 **`1.85x`** |
 
 ### 9.2 与主流 GPU 量子化学框架的架构定位对比
 
 | 架构维度 | GPU4PySCF | TeraChem | GPU4DFT（本项目） |
 | :--- | :--- | :--- | :--- |
-| **驱动与控制平面** | Python + CuPy 胶水驱动为主，SCF 循环存在较多 Python 调度 | 闭源 C++/CUDA 单体架构，以 $s,p,d$ 特化为主 | **零 Python 热路径 C++20 `ScfDriver` + `CudaGraphExecutor` 全步固化** |
-| **代码生成与跨厂商移植** | 手写/半生成 CUDA C 内核，绑定 NVIDIA 生态 | 闭源专有 CUDA 内核 | **纯 Python 统一代码生成器，一份 `GPU4DFT_HD` 数学同时发射 Host / CUDA / AMD HIP + 符号自动微分 XC** |
+| **驱动与控制平面** | Python + CuPy 胶水驱动为主，SCF 循环存在较多 Python 调度 | 闭源 C++/CUDA 单体架构，以 $s,p,d$ 特化为主 | **零 Python 热路径 C++20 全显存常驻驱动 + `CudaGraphExecutor` 全步固化** |
+| **代码生成与跨厂商移植** | 手写/半生成 CUDA C 内核，绑定 NVIDIA 生态 | 闭源专有 CUDA 内核 | **纯 Python 统一代码生成器，一份 `GPU4DFT_HD` 数学同时发射 Host / CUDA / AMD HIP + 符号自动微分一/二阶 XC** |
 | **Blackwell 等受限 FP64 硬件适配** | 稠密线性代数与 RI-K 重度依赖原生 `cublasDgemm` | 混合精度积分（FP32/FP64），传统对角化依赖 FP64 | **四元组动态混合精度积分 + `OzakiInt8` Tensor Core 无损仿真 FP64 GEMM + SP2 纯 GEMM 迹重置纯化** |
-| **J/K 算法谱系** | Direct Rys JK + RI-JK | Direct MD/J-Engine JK + RI | **同库统一涵盖 Direct（MD J-Engine + Rys 2D-VRR 双轨）、RI-JK 与半数值 `sn-K`（COSX）** |
-| **周期性凝聚态扩展** | 高斯周期边界 PBC 为主 | 分子体系为主 | **共享显存池、Ozaki GEMM、符号 XC 与多卡层的原生平面波赝势 + ACE 杂化扩展蓝图** |
+| **J/K 与激发态响应谱系** | Direct Rys JK + RI-JK + TDDFT | Direct MD/J-Engine JK + RI + CIS/TDDFT | **同库零拷贝统一涵盖 Direct（MD J-Engine + Rys 2D-VRR）、100% GPU 原生 RI-JK、`sn-K`、Direct/RI-TDDFT (`OzakiInt8`)、CPHF 与核 Hessian** |
+| **周期性凝聚态扩展** | 高斯周期边界 PBC 为主 | 分子体系为主 | **内置 `gpu4dft::pw` 原生平面波赝势（GTH + 批量 3D `cuFFT` + Davidson/LOBPCG + Lin's ACE 压缩精确交换杂化泛函）** |

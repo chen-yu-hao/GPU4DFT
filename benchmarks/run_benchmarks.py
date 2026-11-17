@@ -13,6 +13,10 @@ Evaluates:
        6-31g*, def2-svp, def2-tzvp
   5. Analytical Nuclear Gradients (RHF, PBE, B3LYP): accuracy vs PySCF, translational
      invariance, T_grad / T_SCF ratio, and speedup vs GPU4PySCF & CPU PySCF
+  6. GPU TDDFT & RI-TDDFT Excited States (TDA & Full Casida/SSF-RPA across C6H6, (H2O)_8,
+     and aspirin; Direct, RI-JK FP64, and RI-JK OzakiInt8 vs PySCF & GPU4PySCF)
+  7. Plane-Wave Kohn-Sham & Lin's ACE Hybrid DFT (Diamond Si2, Si4, Si8 across PBE & PBE0
+     vs PySCF-PBC, GPU Uncompressed EXX, and multi-core OpenMP Host)
 
 Outputs structured JSON + publication-ready Markdown summary tables.
 """
@@ -41,9 +45,12 @@ if str(CODEGEN_DIR) not in sys.path:
     sys.path.insert(0, str(CODEGEN_DIR))
 
 import gpu4dft  # noqa: E402
-from pyscf import df, dft, gto, scf  # noqa: E402
+from pyscf import df, dft, gto, scf, tdscf  # noqa: E402
 from pyscf.grad import rhf as pyscf_grad_rhf  # noqa: E402
 from pyscf.grad import rks as pyscf_grad_rks  # noqa: E402
+from pyscf.pbc import dft as pbc_dft  # noqa: E402
+from pyscf.pbc import gto as pbc_gto  # noqa: E402
+from pyscf.pbc.gto.pseudo import pp as pbc_pp  # noqa: E402
 
 try:
     import cupy as cp  # type: ignore
@@ -336,7 +343,7 @@ def build_mol(system_name: str, basis: str) -> gto.Mole:
 
 
 def run_gemm_suite(backend: str) -> list[dict[str, Any]]:
-    print("\n=== [1/5] Ozaki INT8 Tensor Core GEMM Benchmark ===")
+    print("\n=== [1/7] Ozaki INT8 Tensor Core GEMM Benchmark ===")
     sizes = [256, 512, 1003, 1024, 2048, 4096]
     rows: list[dict[str, Any]] = []
     for n in sizes:
@@ -369,7 +376,7 @@ def run_gemm_suite(backend: str) -> list[dict[str, Any]]:
 
 
 def run_eri_throughput_suite(backend: str) -> list[dict[str, Any]]:
-    print("\n=== [2/5] ERI Quartet Kernel Throughput ===")
+    print("\n=== [2/7] ERI Quartet Kernel Throughput ===")
     cases = [
         ("(H2O)_2", "sto-3g", "s/p deep contraction"),
         ("(H2O)_2", "6-31g*", "s/p/d mixed shells"),
@@ -429,7 +436,7 @@ def run_eri_throughput_suite(backend: str) -> list[dict[str, Any]]:
 
 
 def run_solver_ablation_suite(backend: str) -> list[dict[str, Any]]:
-    print("\n=== [3/5] Solver & CUDA Graph Ablation (Diag vs SP2 + OzakiInt8) ===")
+    print("\n=== [3/7] Solver & CUDA Graph Ablation (Diag vs SP2 + OzakiInt8) ===")
     targets = [
         ("C8H18", "def2-svp"),
         ("(H2O)_8", "def2-svp"),
@@ -567,7 +574,7 @@ def _run_gpu4pyscf_scf(
 def run_end_to_end_scf_suite(
     backend: str, preset: str, include_slow_cpu: bool
 ) -> list[dict[str, Any]]:
-    print("\n=== [4/5] Head-to-Head SCF Benchmarks (GPU4DFT vs GPU4PySCF vs CPU PySCF) ===")
+    print("\n=== [4/7] Head-to-Head SCF Benchmarks (GPU4DFT vs GPU4PySCF vs CPU PySCF) ===")
 
     # Matrix of (system, basis, method) covering all requested molecules & basis sets
     if preset == "quick":
@@ -780,7 +787,7 @@ def run_end_to_end_scf_suite(
 
 
 def run_gradient_suite(backend: str, preset: str) -> list[dict[str, Any]]:
-    print("\n=== [5/5] Analytical Nuclear Gradients Benchmark ===")
+    print("\n=== [5/7] Analytical Nuclear Gradients Benchmark ===")
     cases = [
         ("C6H6", "def2-svp", "rhf"),
         ("C6H6", "def2-svp", "b3lyp"),
@@ -898,6 +905,528 @@ def run_gradient_suite(backend: str, preset: str) -> list[dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Suite 6: GPU TDDFT & RI-TDDFT Excited States vs PySCF & GPU4PySCF
+# ---------------------------------------------------------------------------
+
+
+def _run_pyscf_cpu_td(
+    mf_cpu: Any, resp_kind: str, nstates: int = 5, conv_tol: float = 1e-6
+) -> dict[str, Any]:
+    td = tdscf.TDA(mf_cpu) if resp_kind == "tda" else tdscf.TDDFT(mf_cpu)
+    td.nstates = nstates
+    td.conv_tol = conv_tol
+    t0 = time.perf_counter()
+    td.kernel()
+    f_osc = np.asarray(td.oscillator_strength(), dtype=np.float64)
+    t_td = time.perf_counter() - t0
+    return {
+        "converged": bool(np.all(td.converged)) if isinstance(td.converged, (list, tuple, np.ndarray)) else bool(td.converged),
+        "e_eh": np.asarray(td.e, dtype=np.float64),
+        "f_osc": f_osc,
+        "time_td_s": t_td,
+    }
+
+
+def _run_gpu4pyscf_td(
+    mol: gto.Mole,
+    xc: str,
+    dm0: np.ndarray,
+    density_fit: bool,
+    resp_kind: str,
+    nstates: int = 5,
+    conv_tol: float = 1e-6,
+) -> dict[str, Any] | None:
+    if not HAVE_GPU4PYSCF:
+        return None
+    try:
+        is_hf = xc.lower() == "rhf"
+        mf_g = gpu4pyscf_scf.RHF(mol) if is_hf else gpu4pyscf_dft.RKS(mol, xc=xc)
+        if not is_hf:
+            mf_g.grids.level = 3
+        if density_fit:
+            mf_g = mf_g.density_fit(auxbasis="def2-universal-jkfit")
+        mf_g.conv_tol = 1e-10
+        sync_gpu()
+        t_scf0 = time.perf_counter()
+        mf_g.kernel(dm0=dm0)
+        sync_gpu()
+        t_scf = time.perf_counter() - t_scf0
+
+        td_g = mf_g.TDA() if resp_kind == "tda" else mf_g.TDDFT()
+        td_g.nstates = nstates
+        td_g.conv_tol = conv_tol
+        sync_gpu()
+        t0 = time.perf_counter()
+        td_g.kernel()
+        sync_gpu()
+        t_td = time.perf_counter() - t0
+        return {
+            "time_scf_s": t_scf,
+            "time_td_s": t_td,
+            "time_e2e_s": t_scf + t_td,
+        }
+    except Exception:
+        return None
+
+
+def run_tddft_suite(backend: str, preset: str) -> list[dict[str, Any]]:
+    print("\n=== [6/7] GPU TDDFT & RI-TDDFT Excited States Benchmark ===")
+    nstates = 5
+    if preset == "quick":
+        groups = [
+            ("C6H6", "def2-svp", "b3lyp", [("tddft", False, "fp64"), ("tddft", True, "ozaki_int8")]),
+            ("(H2O)_8", "def2-svp", "pbe", [("tddft", True, "ozaki_int8")]),
+        ]
+    else:
+        groups = [
+            (
+                "C6H6",
+                "def2-svp",
+                "b3lyp",
+                [
+                    ("tddft", False, "fp64"),
+                    ("tddft", True, "fp64"),
+                    ("tddft", True, "ozaki_int8"),
+                    ("tda", True, "ozaki_int8"),
+                ],
+            ),
+            (
+                "(H2O)_8",
+                "def2-svp",
+                "pbe",
+                [
+                    ("tddft", False, "fp64"),
+                    ("tddft", True, "fp64"),
+                    ("tddft", True, "ozaki_int8"),
+                ],
+            ),
+            (
+                "(H2O)_8",
+                "def2-svp",
+                "b3lyp",
+                [
+                    ("tddft", True, "fp64"),
+                    ("tddft", True, "ozaki_int8"),
+                ],
+            ),
+            (
+                "aspirin",
+                "def2-svp",
+                "b3lyp",
+                [
+                    ("tda", True, "ozaki_int8"),
+                    ("tddft", True, "fp64"),
+                    ("tddft", True, "ozaki_int8"),
+                ],
+            ),
+        ]
+
+    rows: list[dict[str, Any]] = []
+    for sys_name, basis_name, xc_name, specs in groups:
+        mol = build_mol(sys_name, basis_name)
+        dm0 = gpu4dft.minao_init_guess(mol)
+        g_ref = dft.Grids(mol)
+        g_ref.level = 3
+        g_ref.build()
+        shared_grids = (
+            np.ascontiguousarray(g_ref.coords, dtype=np.float64),
+            np.ascontiguousarray(g_ref.weights, dtype=np.float64),
+        )
+
+        # Cache CPU PySCF SCF + TD references per (use_df, resp_kind)
+        cpu_scf_cache: dict[bool, dict[str, Any]] = {}
+        cpu_td_cache: dict[tuple[bool, str], dict[str, Any]] = {}
+        g4p_td_cache: dict[tuple[bool, str], dict[str, Any] | None] = {}
+
+        for resp_kind, use_df, gmode in specs:
+            if use_df not in cpu_scf_cache:
+                mf_cpu = dft.RKS(mol, xc=xc_name)
+                mf_cpu.grids.level = 3
+                if use_df:
+                    mf_cpu = mf_cpu.density_fit(auxbasis="def2-universal-jkfit")
+                mf_cpu.conv_tol = 1e-10
+                t_c0 = time.perf_counter()
+                mf_cpu.grids.build()
+                mf_cpu.kernel(dm0=dm0)
+                t_cpu_scf = time.perf_counter() - t_c0
+                cpu_scf_cache[use_df] = {"mf": mf_cpu, "time_scf_s": t_cpu_scf}
+
+            if (use_df, resp_kind) not in cpu_td_cache:
+                cpu_td_cache[(use_df, resp_kind)] = _run_pyscf_cpu_td(
+                    cpu_scf_cache[use_df]["mf"], resp_kind, nstates=nstates, conv_tol=1e-6
+                )
+            if (use_df, resp_kind) not in g4p_td_cache:
+                g4p_td_cache[(use_df, resp_kind)] = _run_gpu4pyscf_td(
+                    mol, xc_name, dm0, use_df, resp_kind, nstates=nstates, conv_tol=1e-6
+                )
+
+            ref_td = cpu_td_cache[(use_df, resp_kind)]
+            t_cpu_scf = cpu_scf_cache[use_df]["time_scf_s"]
+            t_cpu_td = ref_td["time_td_s"]
+            t_cpu_e2e = t_cpu_scf + t_cpu_td
+
+            g4p_td = g4p_td_cache[(use_df, resp_kind)]
+            t_g4p_td = g4p_td["time_td_s"] if g4p_td is not None else None
+
+            mf = gpu4dft.RKS(
+                mol,
+                xc=xc_name,
+                backend=backend,
+                precision="mixed" if gmode == "ozaki_int8" else "fp64",
+                dynamic_precision=(gmode == "ozaki_int8"),
+                gemm_mode=gmode,
+                grids=shared_grids,
+                conv_tol=1e-10,
+            )
+            if use_df:
+                mf.density_fit(auxbasis="def2-universal-jkfit")
+
+            sync_gpu()
+            t_s0 = time.perf_counter()
+            mf.kernel(dm0=dm0)
+            sync_gpu()
+            t_scf_g4d = time.perf_counter() - t_s0
+
+            td = (
+                mf.TDA(nstates=nstates, gemm_mode=gmode, conv_tol=1e-6)
+                if resp_kind == "tda"
+                else mf.TDDFT(nstates=nstates, gemm_mode=gmode, conv_tol=1e-6)
+            )
+            sync_gpu()
+            t_r0 = time.perf_counter()
+            e_got, _ = td.kernel()
+            sync_gpu()
+            t_td_g4d = time.perf_counter() - t_r0
+            t_e2e_g4d = t_scf_g4d + t_td_g4d
+
+            f_got = td.oscillator_strength()
+            max_de_eh = float(np.max(np.abs(e_got - ref_td["e_eh"])))
+            max_de_ev = max_de_eh * 27.21138602
+            max_df = float(np.max(np.abs(f_got - ref_td["f_osc"])))
+            sp_td_cpu = t_cpu_td / max(t_td_g4d, 1e-12)
+            sp_e2e_cpu = t_cpu_e2e / max(t_e2e_g4d, 1e-12)
+            sp_td_g4p = (t_g4p_td / max(t_td_g4d, 1e-12)) if t_g4p_td is not None else None
+
+            mode_tag = ("RI_" if use_df else "Direct_") + resp_kind.upper() + f"_{gmode}"
+            rec = {
+                "system": sys_name,
+                "basis": basis_name,
+                "nao": mol.nao,
+                "n_occ": int(td.result.n_occ),
+                "n_vir": int(td.result.n_vir),
+                "xc": xc_name.upper(),
+                "response_method": resp_kind.upper(),
+                "mode": mode_tag,
+                "use_df": use_df,
+                "gemm_mode": gmode,
+                "nstates": nstates,
+                "converged": td.converged,
+                "iterations": td.iterations,
+                "matvec_count": int(td.result.matvec_count),
+                "lowest_excitation_ev": float(td.e_ev[0]),
+                "max_oscillator_strength": float(np.max(f_got)),
+                "max_abs_omega_diff_eh": max_de_eh,
+                "max_abs_omega_diff_ev": max_de_ev,
+                "max_abs_fosc_diff": max_df,
+                "time_scf_s": t_scf_g4d,
+                "time_td_s": t_td_g4d,
+                "time_e2e_s": t_e2e_g4d,
+                "pyscf_cpu_td_s": t_cpu_td,
+                "pyscf_cpu_e2e_s": t_cpu_e2e,
+                "gpu4pyscf_td_s": t_g4p_td,
+                "speedup_td_vs_pyscf_cpu": sp_td_cpu,
+                "speedup_e2e_vs_pyscf_cpu": sp_e2e_cpu,
+                "speedup_td_vs_gpu4pyscf": sp_td_g4p,
+            }
+            rows.append(rec)
+            g4p_s = f"{t_g4p_td:6.3f}s ({sp_td_g4p:4.2f}x)" if t_g4p_td is not None else "N/A"
+            print(
+                f"  {sys_name}/{basis_name} [{xc_name.upper()} {mode_tag:22s}]: "
+                f"T_td={t_td_g4d:6.3f}s ({td.iterations:2d} it, {rec['matvec_count']:2d} mv) | "
+                f"E1={rec['lowest_excitation_ev']:.3f} eV | max|dw|={max_de_eh:.2e} Eh | "
+                f"CPU_td={t_cpu_td:6.3f}s ({sp_td_cpu:5.2f}x) | GPU4PySCF={g4p_s}"
+            )
+            del td, mf
+            gc.collect()
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Suite 7: Plane-Wave Kohn-Sham & Lin's ACE Hybrid DFT Benchmark
+# ---------------------------------------------------------------------------
+
+
+class _BenchPyscfExactPWCell(pbc_gto.Cell):
+    """Exact spherical plane-wave basis adapter for PySCF-PBC FFTDF head-to-head comparison."""
+
+    def __init__(self, ecut_wfc: float, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.ecut_wfc = float(ecut_wfc)
+        self._pw_cache: dict[str, np.ndarray] = {}
+
+    def build(self, *args: Any, **kwargs: Any) -> Any:
+        res = super().build(*args, **kwargs)
+        gv = self.get_Gv(self.mesh)
+        self._max_npw = int(np.sum(0.5 * np.einsum("gx,gx->g", gv, gv) <= self.ecut_wfc + 1e-12))
+        return res
+
+    def _active_gv(self) -> tuple[np.ndarray, np.ndarray]:
+        gv = self.get_Gv(self.mesh)
+        kin = 0.5 * np.einsum("gx,gx->g", gv, gv)
+        idx = np.where(kin <= self.ecut_wfc + 1e-12)[0]
+        return gv[idx], kin[idx]
+
+    def nao_nr(self, cart: Any = None) -> int:
+        return self._max_npw
+
+    def _pos_half_g(self, gv: np.ndarray) -> np.ndarray:
+        c0 = gv[:, 0] > 1e-12
+        c1 = (np.abs(gv[:, 0]) <= 1e-12) & (gv[:, 1] > 1e-12)
+        c2 = (np.abs(gv[:, 0]) <= 1e-12) & (np.abs(gv[:, 1]) <= 1e-12) & (gv[:, 2] > 1e-12)
+        return gv[c0 | c1 | c2]
+
+    def _full_ao(self, want_deriv1: bool) -> np.ndarray:
+        key = str(int(want_deriv1))
+        if key in self._pw_cache:
+            return self._pw_cache[key]
+        coords = self.get_uniform_grids()
+        gv, _ = self._active_gv()
+        pos = self._pos_half_g(gv)
+        npos = len(pos)
+        nao = self._max_npw
+        ao0 = np.zeros((len(coords), nao), dtype=np.float64)
+        ao0[:, 0] = 1.0 / math.sqrt(self.vol)
+        phase = coords @ pos.T
+        cp_m = math.sqrt(2.0 / self.vol) * np.cos(phase)
+        sp_m = math.sqrt(2.0 / self.vol) * np.sin(phase)
+        ao0[:, 1 : 1 + npos] = cp_m
+        ao0[:, 1 + npos : 1 + 2 * npos] = sp_m
+        if want_deriv1:
+            ao1 = np.zeros((4, len(coords), nao), dtype=np.float64)
+            ao1[0] = ao0
+            for d in range(3):
+                ao1[1 + d, :, 1 : 1 + npos] = -sp_m * pos[None, :, d]
+                ao1[1 + d, :, 1 + npos : 1 + 2 * npos] = cp_m * pos[None, :, d]
+            res = ao1
+        else:
+            res = ao0
+        self._pw_cache[key] = res
+        return res
+
+    def pbc_eval_gto(
+        self,
+        eval_name: str,
+        coords: np.ndarray,
+        comp: Any = None,
+        kpts: Any = None,
+        kpt: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        _ = (comp, kpt, kwargs)
+        want_d1 = ("deriv1" in eval_name) or ("ip" in eval_name)
+        ugrids = self.get_uniform_grids()
+        if len(coords) == len(ugrids):
+            sl = slice(None)
+        else:
+            p0 = int(np.argmin(np.sum(np.abs(ugrids - coords[0]), axis=1)))
+            sl = slice(p0, p0 + len(coords))
+        full = self._full_ao(want_d1)
+        out = full[:, sl, :] if want_d1 else full[sl, :]
+        if kpts is not None and np.ndim(kpts) == 2:
+            return [out for _ in range(len(kpts))]
+        return out
+
+    def pbc_intor(
+        self,
+        intor: str,
+        hermi: int = 1,
+        kpts: Any = None,
+        kpt: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        _ = (hermi, kpt, kwargs)
+        nao = self._max_npw
+        if "ovlp" in intor:
+            mat = np.eye(nao, dtype=np.float64)
+        else:
+            gv, _ = self._active_gv()
+            pos = self._pos_half_g(gv)
+            npos = len(pos)
+            kin_pos = 0.5 * np.einsum("gx,gx->g", pos, pos)
+            d = np.zeros(nao, dtype=np.float64)
+            d[1 : 1 + npos] = kin_pos
+            d[1 + npos : 1 + 2 * npos] = kin_pos
+            mat = np.diag(d)
+        if kpts is not None and np.ndim(kpts) == 2:
+            return np.asarray([mat for _ in range(len(kpts))])
+        return mat
+
+
+def _diamond_si_supercell(nx: int, ny: int, nz: int, a_ang: float = 5.43) -> tuple[np.ndarray, list[int], np.ndarray]:
+    a_b = a_ang * 1.8897259885789233
+    a_prim = np.array(
+        [[0.0, 0.5 * a_b, 0.5 * a_b], [0.5 * a_b, 0.0, 0.5 * a_b], [0.5 * a_b, 0.5 * a_b, 0.0]],
+        dtype=np.float64,
+    )
+    prim_pos = np.array([[0.0, 0.0, 0.0], [0.25 * a_b, 0.25 * a_b, 0.25 * a_b]], dtype=np.float64)
+    a_super = np.array([nx * a_prim[0], ny * a_prim[1], nz * a_prim[2]], dtype=np.float64)
+    coords_list = []
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                shift = ix * a_prim[0] + iy * a_prim[1] + iz * a_prim[2]
+                coords_list.append(prim_pos + shift)
+    coords = np.vstack(coords_list)
+    return a_super, [14] * len(coords), coords
+
+
+def _run_pyscf_pbc_pw(
+    a_bohr: np.ndarray, coords_bohr: np.ndarray, xc: str, ecut: float, mesh: tuple[int, int, int]
+) -> tuple[float, float]:
+    atoms_pyscf = [("Si", p.tolist()) for p in coords_bohr]
+    t0 = time.perf_counter()
+    pcell = _BenchPyscfExactPWCell(
+        ecut_wfc=ecut,
+        a=a_bohr,
+        atom=atoms_pyscf,
+        unit="B",
+        pseudo="gth-pbe",
+        mesh=list(mesh),
+        verbose=0,
+    )
+    pcell.build()
+    hcore = pcell.pbc_intor("int1e_kin") + pbc_pp.get_pp(pcell)
+    mf = pbc_dft.RKS(pcell, xc=xc)
+    mf.exxdiv = "ewald"
+    mf.chkfile = None
+    mf.get_hcore = lambda *a, **kw: hcore
+    mf.conv_tol = 1e-9
+    e0, u0 = mf.eig(hcore, np.eye(pcell.nao_nr()))
+    dm0 = mf.make_rdm1(u0, mf.get_occ(e0, u0))
+    etot = float(mf.kernel(dm0=dm0))
+    elapsed_ms = (time.perf_counter() - t0) * 1e3
+    return etot, elapsed_ms
+
+
+def run_pw_dft_suite(backend: str, preset: str) -> list[dict[str, Any]]:
+    print("\n=== [7/7] Plane-Wave Kohn-Sham & ACE Hybrid DFT Benchmark ===")
+    has_cuda_pw = (backend == "cuda") and gpu4dft.pw.cuda_pw_available()
+
+    if preset == "quick":
+        cases = [
+            ("Diamond Si2", (1, 1, 1), "pbe0", 10.0, True),
+            ("Diamond Si4 (2x1x1)", (2, 1, 1), "pbe0", 16.0, False),
+        ]
+    else:
+        cases = [
+            ("Diamond Si2", (1, 1, 1), "pbe", 10.0, True),
+            ("Diamond Si2", (1, 1, 1), "pbe0", 10.0, True),
+            ("Diamond Si2", (1, 1, 1), "pbe0", 15.0, False),
+            ("Diamond Si4 (2x1x1)", (2, 1, 1), "pbe0", 18.0, False),
+            ("Diamond Si8 (2x2x1)", (2, 2, 1), "pbe", 20.0, False),
+            ("Diamond Si8 (2x2x1)", (2, 2, 1), "pbe0", 16.0, False),
+        ]
+
+    rows: list[dict[str, Any]] = []
+    for label, sc, xc_name, ecut, run_pyscf_ref in cases:
+        a_bohr, z_list, coords_bohr = _diamond_si_supercell(*sc)
+        cell = gpu4dft.pw.PwCell(a_bohr, z_list, coords_bohr, "gth-pbe")
+        basis = gpu4dft.pw.PwBasis(cell, ecut_wfc=ecut)
+        mesh = tuple(int(x) for x in basis.fft_grid)
+        npw = int(basis.kpoint(0).npw)
+        is_hybrid = xc_name.lower() in ("pbe0", "b3lyp", "hf")
+
+        # Warmup GPU cuFFT plans on this grid
+        if has_cuda_pw:
+            _ = gpu4dft.pw.run_scf(
+                cell, xc=xc_name, ecut_wfc=ecut, backend="cuda", use_ace=True, conv_tol=1e-3
+            )
+            sync_gpu()
+
+        # 1. GPU4DFT CUDA (ACE for hybrids)
+        gpu_res = None
+        gpu_ms = None
+        if has_cuda_pw:
+            t_samples = []
+            for _ in range(2):
+                r = gpu4dft.pw.run_scf(
+                    cell, xc=xc_name, ecut_wfc=ecut, backend="cuda", use_ace=True, conv_tol=1e-9
+                )
+                t_samples.append(float(r.elapsed_ms))
+                gpu_res = r
+            gpu_ms = statistics.median(t_samples)
+
+        # 2. GPU4DFT CUDA Uncompressed EXX (for hybrid ACE speedup & FFT reduction ablation)
+        uncomp_ms = None
+        uncomp_ffts = None
+        if has_cuda_pw and is_hybrid:
+            r_unc = gpu4dft.pw.run_scf(
+                cell, xc=xc_name, ecut_wfc=ecut, backend="cuda", use_ace=False, conv_tol=1e-9
+            )
+            uncomp_ms = float(r_unc.elapsed_ms)
+            uncomp_ffts = int(r_unc.total_poisson_ffts)
+
+        # 3. Multi-core Host OpenMP reference
+        host_res = gpu4dft.pw.run_scf(
+            cell, xc=xc_name, ecut_wfc=ecut, backend="host", use_ace=True, conv_tol=1e-9
+        )
+        host_ms = float(host_res.elapsed_ms)
+
+        # 4. PySCF-PBC exact plane-wave reference (when enabled)
+        pyscf_e = None
+        pyscf_ms = None
+        if run_pyscf_ref:
+            pyscf_e, pyscf_ms = _run_pyscf_pbc_pw(a_bohr, coords_bohr, xc_name, ecut, mesh)
+
+        primary_res = gpu_res if gpu_res is not None else host_res
+        e_got = float(primary_res.total_energy)
+        ref_e = pyscf_e if pyscf_e is not None else float(host_res.total_energy)
+        abs_de = abs(e_got - ref_e)
+
+        sp_host = (host_ms / gpu_ms) if (gpu_ms is not None and gpu_ms > 0) else None
+        sp_ace = (uncomp_ms / gpu_ms) if (uncomp_ms is not None and gpu_ms is not None and gpu_ms > 0) else None
+        fft_red = (
+            (uncomp_ffts / max(1, int(primary_res.total_poisson_ffts)))
+            if uncomp_ffts is not None
+            else None
+        )
+        sp_pyscf = (pyscf_ms / gpu_ms) if (pyscf_ms is not None and gpu_ms is not None and gpu_ms > 0) else None
+
+        rec = {
+            "system": label,
+            "natom": len(z_list),
+            "xc": xc_name.upper(),
+            "ecut_ha": ecut,
+            "fft_grid": f"{mesh[0]}x{mesh[1]}x{mesh[2]}",
+            "npw": npw,
+            "converged": bool(primary_res.converged),
+            "scf_iterations": int(primary_res.scf_iterations),
+            "poisson_ffts": int(primary_res.total_poisson_ffts),
+            "uncompressed_poisson_ffts": uncomp_ffts,
+            "fft_reduction_ace": fft_red,
+            "energy_hartree": e_got,
+            "abs_diff_vs_ref_eh": abs_de,
+            "gpu_cuda_ms": gpu_ms,
+            "uncompressed_gpu_ms": uncomp_ms,
+            "host_omp_ms": host_ms,
+            "pyscf_pbc_ms": pyscf_ms,
+            "speedup_vs_host_omp": sp_host,
+            "speedup_ace_vs_uncompressed": sp_ace,
+            "speedup_vs_pyscf_pbc": sp_pyscf,
+        }
+        rows.append(rec)
+        gpu_s = f"{gpu_ms:7.2f} ms" if gpu_ms is not None else "   N/A   "
+        host_sp_s = f"{sp_host:5.2f}x" if sp_host is not None else " N/A "
+        ace_s = f"{sp_ace:4.2f}x ({fft_red:4.1f}x fewer FFTs)" if sp_ace is not None and fft_red is not None else "—"
+        pbc_s = f"{pyscf_ms:7.1f} ms ({sp_pyscf:5.1f}x)" if pyscf_ms is not None and sp_pyscf is not None else "—"
+        print(
+            f"  {label:20s} [{xc_name.upper():4s}, Ecut={ecut:4.1f} Ha, {rec['fft_grid']}, NPW={npw:4d}]: "
+            f"GPU={gpu_s} | Host={host_ms:7.1f} ms ({host_sp_s}) | ACE={ace_s} | PySCF-PBC={pbc_s} | |dE|={abs_de:.2e} Eh"
+        )
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Markdown Report Formatter
 # ---------------------------------------------------------------------------
 
@@ -920,7 +1449,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
         "| Matrix N | FP64 (TFLOPS) | Ozaki INT8 (TFLOPS) | Speedup vs FP64 | FP32 TC (TFLOPS) | Ozaki Rel. Frobenius Error |",
         "| ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
-    for r in payload["gemm_benchmarks"]:
+    for r in payload.get("gemm_benchmarks", []):
         lines.append(
             f"| {r['n']} | {r['fp64_tflops']:.2f} | **{r['ozaki_int8_tflops']:.2f}** | "
             f"**{r['ozaki_speedup_vs_fp64']:.2f}x** | {r['fp32_tflops']:.2f} | `{r['ozaki_rel_error']:.2e}` |"
@@ -935,7 +1464,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for r in payload["eri_throughput"]:
+    for r in payload.get("eri_throughput", []):
         lines.append(
             f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | {r['fp64_ms']:.2f} | "
             f"{r['fp64_mquartets_per_s']:.2f} | {r['fp32_ms']:.2f} | {r['fp32_mquartets_per_s']:.2f} | "
@@ -951,7 +1480,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "| :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for r in payload["solver_ablation"]:
+    for r in payload.get("solver_ablation", []):
         lines.append(
             f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | {r['config']} | {r['iterations']} | "
             f"{r['scf_time_s']*1e3:.2f} | {r['per_iter_ms']:.2f} | `{r['diff_vs_diag_fp64_eh']:.2e}` | "
@@ -967,7 +1496,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "| :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
         ]
     )
-    for r in payload["benchmarks"]:
+    for r in payload.get("benchmarks", []):
         de = f"`{r['abs_diff_vs_pyscf_eh']:.2e}`" if r["abs_diff_vs_pyscf_eh"] is not None else "N/A"
         t_cpu = f"{r['pyscf_cpu_time_s']:.3f}" if r["pyscf_cpu_time_s"] is not None else "—"
         t_g4p = f"{r['gpu4pyscf_time_s']:.3f}" if r["gpu4pyscf_time_s"] is not None else "—"
@@ -991,7 +1520,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "| :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for r in payload["gradient_benchmarks"]:
+    for r in payload.get("gradient_benchmarks", []):
         t_g4p = f"{r['gpu4pyscf_grad_s']:.3f}" if r["gpu4pyscf_grad_s"] is not None else "—"
         lines.append(
             f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | `{r['method']}` | "
@@ -999,6 +1528,54 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             f"`{r['net_translation_force_eh_bohr']:.2e}` | {r['pyscf_cpu_grad_s']:.3f} | {t_g4p} | "
             f"**{r['speedup_vs_pyscf_cpu']:.1f}x** |"
         )
+
+    if payload.get("tddft_benchmarks"):
+        lines.extend(
+            [
+                "",
+                "## 6. GPU TDDFT & RI-TDDFT Excited States (Lowest 5 Singlets)",
+                "",
+                "| System | Basis | $N_{\\text{AO}}$ | XC | Mode | Iters (Matvecs) | $E_1$ (eV) | $\\max|\\Delta\\omega|$ ($E_\\text{h}$) | $\\max|\\Delta f_{\\text{osc}}|$ | $T_{\\text{TD}}$ (s) | PySCF CPU $T_{\\text{TD}}$ (s) | GPU4PySCF $T_{\\text{TD}}$ (s) | Speedup vs CPU (TD / E2E) |",
+                "| :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for r in payload["tddft_benchmarks"]:
+            t_g4p = f"{r['gpu4pyscf_td_s']:.3f}" if r["gpu4pyscf_td_s"] is not None else "—"
+            lines.append(
+                f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | `{r['xc']}` | `{r['mode']}` | "
+                f"{r['iterations']} ({r['matvec_count']}) | {r['lowest_excitation_ev']:.3f} | "
+                f"`{r['max_abs_omega_diff_eh']:.2e}` | `{r['max_abs_fosc_diff']:.2e}` | "
+                f"{r['time_td_s']:.3f} | {r['pyscf_cpu_td_s']:.3f} | {t_g4p} | "
+                f"**{r['speedup_td_vs_pyscf_cpu']:.1f}x** / **{r['speedup_e2e_vs_pyscf_cpu']:.1f}x** |"
+            )
+
+    if payload.get("pw_dft_benchmarks"):
+        lines.extend(
+            [
+                "",
+                "## 7. Plane-Wave Kohn-Sham & Lin's ACE Hybrid DFT",
+                "",
+                "| System | XC | $E_{\\text{cut}}$ (Ha) | FFT Grid | $N_{\\text{PW}}$ | $|\\Delta E|$ ($E_\\text{h}$) | GPU CUDA (ms) | Host OpenMP (ms) | Uncomp. GPU (ms) | PySCF-PBC (ms) | Speedup vs Host | ACE Speedup (FFT Red.) | Speedup vs PySCF-PBC |",
+                "| :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for r in payload["pw_dft_benchmarks"]:
+            gpu_s = f"**{r['gpu_cuda_ms']:.2f}**" if r["gpu_cuda_ms"] is not None else "—"
+            unc_s = f"{r['uncompressed_gpu_ms']:.2f}" if r["uncompressed_gpu_ms"] is not None else "—"
+            pbc_s = f"{r['pyscf_pbc_ms']:.1f}" if r["pyscf_pbc_ms"] is not None else "—"
+            sp_h = f"**{r['speedup_vs_host_omp']:.2f}x**" if r["speedup_vs_host_omp"] is not None else "—"
+            sp_ace = (
+                f"**{r['speedup_ace_vs_uncompressed']:.2f}x** ({r['fft_reduction_ace']:.1f}x)"
+                if r["speedup_ace_vs_uncompressed"] is not None and r["fft_reduction_ace"] is not None
+                else "—"
+            )
+            sp_pbc = f"**{r['speedup_vs_pyscf_pbc']:.1f}x**" if r["speedup_vs_pyscf_pbc"] is not None else "—"
+            lines.append(
+                f"| `{r['system']}` | `{r['xc']}` | {r['ecut_ha']:.1f} | `{r['fft_grid']}` | {r['npw']} | "
+                f"`{r['abs_diff_vs_ref_eh']:.2e}` | {gpu_s} | {r['host_omp_ms']:.1f} | {unc_s} | {pbc_s} | "
+                f"{sp_h} | {sp_ace} | {sp_pbc} |"
+            )
+
     lines.append("")
     return "\n".join(lines)
 
@@ -1025,7 +1602,19 @@ def warmup_contexts(backend: str) -> None:
     sync_gpu()
 
 
+def _write_benchmark_outputs(payload: dict[str, Any], json_out: Path, md_out: Path) -> None:
+    json_out.parent.mkdir(parents=True, exist_ok=True)
+    md_out.parent.mkdir(parents=True, exist_ok=True)
+    json_out.write_text(json.dumps(payload, indent=2))
+    md_out.write_text(render_markdown_report(payload))
+
+
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="Run GPU4DFT comprehensive benchmark suite.")
     parser.add_argument(
         "--preset",
@@ -1045,6 +1634,18 @@ def main(argv: list[str] | None = None) -> int:
         help="also run Direct 4-center CPU PySCF on large nao > 260 systems",
     )
     parser.add_argument(
+        "--suites",
+        type=str,
+        default="1,2,3,4,5,6,7",
+        help="comma-separated list of suite IDs (1..7) to run (default: 1,2,3,4,5,6,7)",
+    )
+    parser.add_argument(
+        "--resume-json",
+        type=Path,
+        default=None,
+        help="optional existing JSON report to preload before running selected --suites",
+    )
+    parser.add_argument(
         "--json-out",
         type=Path,
         default=REPO_ROOT / "benchmarks" / "results" / "benchmark_results.json",
@@ -1058,31 +1659,66 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    selected_suites = {int(s.strip()) for s in args.suites.split(",") if s.strip()}
+
     meta = collect_hardware_metadata()
-    print(f"GPU4DFT Benchmark Suite | Preset={args.preset} | Backend={args.backend}")
+    payload: dict[str, Any] = {
+        "metadata": meta,
+        "gemm_benchmarks": [],
+        "eri_throughput": [],
+        "solver_ablation": [],
+        "benchmarks": [],
+        "gradient_benchmarks": [],
+        "tddft_benchmarks": [],
+        "pw_dft_benchmarks": [],
+    }
+    if args.resume_json is not None and args.resume_json.exists():
+        prev = json.loads(args.resume_json.read_text())
+        for k in (
+            "gemm_benchmarks",
+            "eri_throughput",
+            "solver_ablation",
+            "benchmarks",
+            "gradient_benchmarks",
+            "tddft_benchmarks",
+            "pw_dft_benchmarks",
+        ):
+            if k in prev:
+                payload[k] = prev[k]
+        payload["metadata"] = meta
+
+    print(
+        f"GPU4DFT Benchmark Suite | Preset={args.preset} | Backend={args.backend} | Suites={sorted(selected_suites)}"
+    )
     print(f"Hardware: {meta['gpu_name']} ({meta['vram_total_mib']} MiB) | CPUs={meta['cpu_count']}")
     print("Running CUDA / cuBLAS / cuSOLVER / PTX JIT warmup...")
     warmup_contexts(args.backend)
 
-    gemm_rows = run_gemm_suite(args.backend)
-    eri_rows = run_eri_throughput_suite(args.backend)
-    solver_rows = run_solver_ablation_suite(args.backend)
-    scf_rows = run_end_to_end_scf_suite(args.backend, args.preset, args.include_slow_cpu)
-    grad_rows = run_gradient_suite(args.backend, args.preset)
+    if 1 in selected_suites:
+        payload["gemm_benchmarks"] = run_gemm_suite(args.backend)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 2 in selected_suites:
+        payload["eri_throughput"] = run_eri_throughput_suite(args.backend)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 3 in selected_suites:
+        payload["solver_ablation"] = run_solver_ablation_suite(args.backend)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 4 in selected_suites:
+        payload["benchmarks"] = run_end_to_end_scf_suite(
+            args.backend, args.preset, args.include_slow_cpu
+        )
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 5 in selected_suites:
+        payload["gradient_benchmarks"] = run_gradient_suite(args.backend, args.preset)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 6 in selected_suites:
+        payload["tddft_benchmarks"] = run_tddft_suite(args.backend, args.preset)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+    if 7 in selected_suites:
+        payload["pw_dft_benchmarks"] = run_pw_dft_suite(args.backend, args.preset)
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
 
-    payload = {
-        "metadata": meta,
-        "gemm_benchmarks": gemm_rows,
-        "eri_throughput": eri_rows,
-        "solver_ablation": solver_rows,
-        "benchmarks": scf_rows,
-        "gradient_benchmarks": grad_rows,
-    }
-
-    args.json_out.parent.mkdir(parents=True, exist_ok=True)
-    args.md_out.parent.mkdir(parents=True, exist_ok=True)
-    args.json_out.write_text(json.dumps(payload, indent=2))
-    args.md_out.write_text(render_markdown_report(payload))
+    _write_benchmark_outputs(payload, args.json_out, args.md_out)
 
     print(f"\nSaved JSON report     -> {args.json_out}")
     print(f"Saved Markdown report -> {args.md_out}")
