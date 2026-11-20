@@ -33,9 +33,10 @@ import platform
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -71,20 +72,55 @@ except Exception:
     HAVE_GPU4PYSCF = False
 
 
+try:
+    import pynvml  # type: ignore
+
+    HAVE_PYNVML = True
+except Exception:
+    pynvml = None
+    HAVE_PYNVML = False
+
+GEOMETRIES_DIR = REPO_ROOT / "benchmarks" / "geometries"
+
+
 # ---------------------------------------------------------------------------
-# Synchronized Timing & Hardware Metadata Helpers
+# Synchronized Timing, Peak VRAM Monitor, Memory Cleanup & Metadata Helpers
 # ---------------------------------------------------------------------------
 
 
 def sync_gpu() -> None:
     if HAVE_CUPY and cp is not None:
         try:
-            cp.cuda.Stream.null.synchronize()
+            cp.cuda.Device().synchronize()
+        except Exception:
+            try:
+                cp.cuda.Stream.null.synchronize()
+            except Exception:
+                pass
+
+
+def release_gpu_memory(mf: Any = None, gm: Any = None) -> None:
+    """Explicitly destroy SCF/grad objects and trim CuPy memory pools between runs."""
+    del gm, mf
+    gc.collect()
+    if HAVE_CUPY and cp is not None:
+        try:
+            cp.cuda.Device().synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
         except Exception:
             pass
 
 
-def get_peak_vram_mib() -> float | None:
+def _query_vram_used_mib() -> float | None:
+    if HAVE_PYNVML and pynvml is not None:
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return float(info.used) / (1024.0 * 1024.0)
+        except Exception:
+            pass
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
@@ -97,7 +133,77 @@ def get_peak_vram_mib() -> float | None:
         return None
 
 
-def collect_hardware_metadata() -> dict[str, Any]:
+def get_peak_vram_mib() -> float | None:
+    return _query_vram_used_mib()
+
+
+class VramPeakMonitor:
+    """Background polling context manager capturing genuine per-run peak VRAM."""
+
+    def __init__(self, poll_gpu: bool = True, poll_interval_s: float | None = None) -> None:
+        self.poll_gpu = bool(poll_gpu)
+        if poll_interval_s is not None:
+            self.poll_interval_s = float(poll_interval_s)
+        else:
+            self.poll_interval_s = 0.015 if HAVE_PYNVML else 0.050
+        self.baseline_mib: float | None = None
+        self.peak_vram_mib: float | None = None
+        self.peak_vram_delta_mib: float | None = None
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._lock = threading.Lock()
+
+    def _sample(self) -> None:
+        val = _query_vram_used_mib()
+        if val is not None:
+            with self._lock:
+                if self.peak_vram_mib is None or val > self.peak_vram_mib:
+                    self.peak_vram_mib = val
+
+    def _poll_loop(self) -> None:
+        while not self._stop_event.wait(self.poll_interval_s):
+            self._sample()
+
+    def __enter__(self) -> "VramPeakMonitor":
+        if not self.poll_gpu:
+            return self
+        self.baseline_mib = _query_vram_used_mib()
+        self.peak_vram_mib = self.baseline_mib
+        if self.baseline_mib is not None:
+            self._stop_event.clear()
+            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if not self.poll_gpu:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+        self._sample()
+        if self.peak_vram_mib is not None and self.baseline_mib is not None:
+            self.peak_vram_delta_mib = max(0.0, float(self.peak_vram_mib - self.baseline_mib))
+
+
+def _summarize_samples(samples: list[float]) -> dict[str, float]:
+    if not samples:
+        return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "mean": float(statistics.mean(samples)),
+        "std": float(statistics.stdev(samples)) if len(samples) >= 2 else 0.0,
+        "min": float(min(samples)),
+        "max": float(max(samples)),
+    }
+
+
+def collect_hardware_metadata(
+    n_repeats: int = 5,
+    grids_level: int = 3,
+    auxbasis: str = "def2-universal-jkfit",
+    warmup_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     gpu_name = "CPU-only"
     vram_total_mib = 0
     driver_ver = "N/A"
@@ -133,7 +239,7 @@ def collect_hardware_metadata() -> dict[str, Any]:
     git_rev = "unknown"
     try:
         git_rev = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
+            ["git", "-c", "safe.directory=*", "rev-parse", "--short", "HEAD"],
             cwd=REPO_ROOT,
             text=True,
             stderr=subprocess.DEVNULL,
@@ -150,6 +256,7 @@ def collect_hardware_metadata() -> dict[str, Any]:
 
     import pyscf as _pyscf
 
+    w_info = warmup_info or {}
     return {
         "git_revision": git_rev,
         "gpu_name": gpu_name,
@@ -162,6 +269,16 @@ def collect_hardware_metadata() -> dict[str, Any]:
         "pyscf_version": getattr(_pyscf, "__version__", "unknown"),
         "gpu4pyscf_available": HAVE_GPU4PYSCF,
         "gpu4pyscf_version": gpu4pyscf_ver,
+        "shared_grids": False,
+        "n_repeats": int(n_repeats),
+        "warmup_performed": bool(w_info.get("warmup_performed", False)),
+        "warmup_backends": list(w_info.get("warmup_backends", [])),
+        "warmup_paths": list(w_info.get("warmup_paths", [])),
+        "grids_level": int(grids_level),
+        "auxbasis": str(auxbasis),
+        "precision": "fp64",
+        "conv_tol_scf": 1e-9,
+        "conv_tol_grad": 1e-10,
         "timestamp_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
 
@@ -314,6 +431,40 @@ def _aspirin_geom() -> str:
     return "; ".join(f"{sym} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f}" for sym, p in atoms)
 
 
+def _c60_geom(bond_length_ang: float = 1.425) -> str:
+    """Deterministic I_h truncated icosahedron C60 geometry (60 carbon atoms)."""
+    phi = (1.0 + math.sqrt(5.0)) / 2.0
+    pts: set[tuple[float, float, float]] = set()
+
+    def _add_even_perms(base: tuple[float, float, float]) -> None:
+        for perm in ((0, 1, 2), (1, 2, 0), (2, 0, 1)):
+            pts.add((round(base[perm[0]], 12), round(base[perm[1]], 12), round(base[perm[2]], 12)))
+
+    for s1 in (-1.0, 1.0):
+        for s2 in (-1.0, 1.0):
+            _add_even_perms((0.0, s1 * 1.0, s2 * 3.0 * phi))
+            for s3 in (-1.0, 1.0):
+                _add_even_perms((s1 * 1.0, s2 * (2.0 + phi), s3 * 2.0 * phi))
+                _add_even_perms((s1 * phi, s2 * 2.0, s3 * (2.0 * phi + 1.0)))
+
+    scale = bond_length_ang / 2.0
+    return "; ".join(f"C {x * scale:.6f} {y * scale:.6f} {z * scale:.6f}" for x, y, z in sorted(pts))
+
+
+def _load_xyz_geom(xyz_path: Path) -> str:
+    """Load an XYZ file (2-line header) into a PySCF semicolon-delimited atom string."""
+    lines = [ln.strip() for ln in xyz_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    natm = int(lines[0])
+    atom_lines = lines[2 : 2 + natm]
+    parsed: list[str] = []
+    for ln in atom_lines:
+        parts = ln.split()
+        sym = parts[0]
+        x, y, z = float(parts[1]), float(parts[2]), float(parts[3])
+        parsed.append(f"{sym} {x:.6f} {y:.6f} {z:.6f}")
+    return "; ".join(parsed)
+
+
 MOLECULE_CATALOG: dict[str, str] = {
     "(H2O)_2": _water_cluster_geom(2, 1, 1),
     "C6H6": _benzene_geom(),
@@ -322,6 +473,10 @@ MOLECULE_CATALOG: dict[str, str] = {
     "aspirin": _aspirin_geom(),
     "C12H26": _alkane_chain_geom(12),
     "(H2O)_16": _water_cluster_geom(2, 2, 4),
+    "(H2O)_32": _water_cluster_geom(4, 2, 4),
+    "C60": _c60_geom(),
+    "Taxol": _load_xyz_geom(GEOMETRIES_DIR / "taxol.xyz"),
+    "Valinomycin": _load_xyz_geom(GEOMETRIES_DIR / "valinomycin.xyz"),
 }
 
 
@@ -386,8 +541,9 @@ def run_eri_throughput_suite(backend: str) -> list[dict[str, Any]]:
     for sys_name, basis_name, label in cases:
         mol = build_mol(sys_name, basis_name)
         basis = gpu4dft.basis_from_pyscf(mol)
-        # Warmup
+        # Warmup both FP64 and FP32 ERI kernels symmetrically
         _ = gpu4dft.eri_tensor(basis, backend=backend, precision="fp64")
+        _ = gpu4dft.eri_tensor(basis, backend=backend, precision="fp32")
         sync_gpu()
 
         times_fp64 = []
@@ -506,7 +662,12 @@ def run_solver_ablation_suite(backend: str) -> list[dict[str, Any]]:
 
 
 def _run_pyscf_cpu_scf(
-    mol: gto.Mole, method: str, dm0: np.ndarray, density_fit: bool, grids_level: int = 3
+    mol: gto.Mole,
+    method: str,
+    dm0: np.ndarray,
+    density_fit: bool,
+    grids_level: int = 3,
+    auxbasis: str = "def2-universal-jkfit",
 ) -> dict[str, Any]:
     is_hf = method.lower() == "rhf"
     if is_hf:
@@ -515,7 +676,7 @@ def _run_pyscf_cpu_scf(
         mf = dft.RKS(mol, xc=method)
         mf.grids.level = grids_level
     if density_fit:
-        mf = mf.density_fit(auxbasis="def2-universal-jkfit")
+        mf = mf.density_fit(auxbasis=auxbasis)
     mf.conv_tol = 1e-9
     mf.diis_space = 8
     mf.direct_scf_tol = 1e-13
@@ -525,21 +686,31 @@ def _run_pyscf_cpu_scf(
         mf.grids.build()
     e_tot = float(mf.kernel(dm0=dm0))
     t_e2e = time.perf_counter() - t0
+    converged = bool(mf.converged)
+    del mf
+    gc.collect()
     return {
         "engine": "PySCF (CPU)" + (" [DF]" if density_fit else " [Direct]"),
-        "converged": bool(mf.converged),
+        "converged": converged,
         "energy_hartree": e_tot,
         "time_e2e_s": t_e2e,
-        "mf_obj": mf,
     }
 
 
 def _run_gpu4pyscf_scf(
-    mol: gto.Mole, method: str, dm0: np.ndarray, density_fit: bool, grids_level: int = 3
+    mol: gto.Mole,
+    method: str,
+    dm0: np.ndarray,
+    density_fit: bool,
+    grids_level: int = 3,
+    auxbasis: str = "def2-universal-jkfit",
+    poll_gpu: bool = True,
 ) -> dict[str, Any] | None:
     if not HAVE_GPU4PYSCF:
         return None
+    mf = None
     try:
+        release_gpu_memory()
         is_hf = method.lower() == "rhf"
         if is_hf:
             mf = gpu4pyscf_scf.RHF(mol)
@@ -547,43 +718,146 @@ def _run_gpu4pyscf_scf(
             mf = gpu4pyscf_dft.RKS(mol, xc=method)
             mf.grids.level = grids_level
         if density_fit:
-            mf = mf.density_fit(auxbasis="def2-universal-jkfit")
+            mf = mf.density_fit(auxbasis=auxbasis)
         mf.conv_tol = 1e-9
         mf.diis_space = 8
         mf.direct_scf_tol = 1e-13
 
-        sync_gpu()
-        t0 = time.perf_counter()
-        e_tot = float(mf.kernel(dm0=dm0))
-        sync_gpu()
-        t_e2e = time.perf_counter() - t0
+        with VramPeakMonitor(poll_gpu=poll_gpu) as vmon:
+            sync_gpu()
+            t0 = time.perf_counter()
+            e_tot = float(mf.kernel(dm0=dm0))
+            sync_gpu()
+            t_e2e = time.perf_counter() - t0
+        converged = bool(mf.converged)
+        release_gpu_memory(mf)
+        mf = None
         return {
             "engine": "GPU4PySCF" + (" [DF]" if density_fit else " [Direct]"),
-            "converged": bool(mf.converged),
+            "converged": converged,
             "energy_hartree": e_tot,
             "time_e2e_s": t_e2e,
-            "mf_obj": mf,
+            "peak_vram_mib": vmon.peak_vram_mib,
+            "peak_vram_delta_mib": vmon.peak_vram_delta_mib,
         }
     except Exception as exc:
+        release_gpu_memory(mf)
         return {
             "engine": "GPU4PySCF" + (" [DF]" if density_fit else " [Direct]"),
             "error": str(exc),
         }
 
 
+def _run_repeat_stats_cpu_scf(
+    mol: gto.Mole,
+    method: str,
+    dm0: np.ndarray,
+    density_fit: bool,
+    repeats: int,
+    grids_level: int,
+    auxbasis: str,
+) -> dict[str, Any] | None:
+    if repeats <= 0:
+        return None
+    times: list[float] = []
+    energies: list[float] = []
+    converged_all = True
+    for _ in range(repeats):
+        res = _run_pyscf_cpu_scf(
+            mol, method, dm0, density_fit=density_fit, grids_level=grids_level, auxbasis=auxbasis
+        )
+        times.append(float(res["time_e2e_s"]))
+        energies.append(float(res["energy_hartree"]))
+        converged_all = converged_all and bool(res["converged"])
+    stats = _summarize_samples(times)
+    return {
+        "energy_hartree": energies[-1],
+        "converged": converged_all,
+        "samples": len(times),
+        "samples_s": [round(x, 6) for x in times],
+        **stats,
+    }
+
+
+def _run_repeat_stats_gpu4pyscf_scf(
+    mol: gto.Mole,
+    method: str,
+    dm0: np.ndarray,
+    density_fit: bool,
+    repeats: int,
+    grids_level: int,
+    auxbasis: str,
+    poll_gpu: bool,
+) -> dict[str, Any] | None:
+    if not HAVE_GPU4PYSCF or repeats <= 0:
+        return None
+    times: list[float] = []
+    energies: list[float] = []
+    vram_peaks: list[float] = []
+    vram_deltas: list[float] = []
+    converged_all = True
+    for _ in range(repeats):
+        res = _run_gpu4pyscf_scf(
+            mol,
+            method,
+            dm0,
+            density_fit=density_fit,
+            grids_level=grids_level,
+            auxbasis=auxbasis,
+            poll_gpu=poll_gpu,
+        )
+        if res is None or "error" in res:
+            return {"error": res["error"] if res else "unavailable"}
+        times.append(float(res["time_e2e_s"]))
+        energies.append(float(res["energy_hartree"]))
+        converged_all = converged_all and bool(res["converged"])
+        if res.get("peak_vram_mib") is not None:
+            vram_peaks.append(float(res["peak_vram_mib"]))
+        if res.get("peak_vram_delta_mib") is not None:
+            vram_deltas.append(float(res["peak_vram_delta_mib"]))
+    stats = _summarize_samples(times)
+    return {
+        "energy_hartree": energies[-1],
+        "converged": converged_all,
+        "samples": len(times),
+        "samples_s": [round(x, 6) for x in times],
+        "peak_vram_mib": max(vram_peaks) if vram_peaks else None,
+        "peak_vram_delta_mib": max(vram_deltas) if vram_deltas else None,
+        **stats,
+    }
+
+
 def run_end_to_end_scf_suite(
-    backend: str, preset: str, include_slow_cpu: bool
+    backend: str,
+    preset: str,
+    include_slow_cpu: bool,
+    n_repeats: int = 5,
+    grids_level: int = 3,
+    auxbasis: str = "def2-universal-jkfit",
+    cpu_max_nao: int = 400,
+    checkpoint_cb: Callable[[list[dict[str, Any]]], None] | None = None,
+    existing_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     print("\n=== [4/7] Head-to-Head SCF Benchmarks (GPU4DFT vs GPU4PySCF vs CPU PySCF) ===")
 
-    # Matrix of (system, basis, method) covering all requested molecules & basis sets
     if preset == "quick":
         cases = [
             ("(H2O)_2", "6-31g*", "b3lyp"),
             ("C6H6", "def2-svp", "b3lyp"),
             ("(H2O)_8", "def2-svp", "b3lyp"),
             ("aspirin", "def2-svp", "b3lyp"),
-            ("(H2O)_2", "def2-tzvp", "b3lyp"),
+        ]
+    elif preset == "standard":
+        cases = [
+            ("(H2O)_2", "6-31g*", "b3lyp"),
+            ("C6H6", "def2-svp", "b3lyp"),
+            ("(H2O)_8", "def2-svp", "b3lyp"),
+            ("aspirin", "6-31g*", "b3lyp"),
+            ("(H2O)_16", "def2-svp", "b3lyp"),
+            ("(H2O)_32", "def2-svp", "b3lyp"),
+            ("C60", "def2-svp", "b3lyp"),
+            ("Taxol", "6-31g*", "b3lyp"),
+            ("Valinomycin", "6-31g*", "b3lyp"),
         ]
     else:
         cases = [
@@ -599,66 +873,30 @@ def run_end_to_end_scf_suite(
             ("(H2O)_8", "def2-tzvp", "pbe"),
             ("aspirin", "6-31g*", "b3lyp"),
             ("aspirin", "def2-svp", "b3lyp"),
+            ("aspirin", "def2-tzvp", "b3lyp"),
             ("C12H26", "def2-svp", "b3lyp"),
             ("(H2O)_16", "6-31g*", "b3lyp"),
             ("(H2O)_16", "def2-svp", "b3lyp"),
+            ("(H2O)_16", "def2-tzvp", "pbe"),
+            ("(H2O)_32", "def2-svp", "b3lyp"),
+            ("C60", "def2-svp", "b3lyp"),
+            ("Taxol", "6-31g*", "b3lyp"),
+            ("Valinomycin", "6-31g*", "b3lyp"),
         ]
-        if preset == "full":
-            cases.extend(
-                [
-                    ("aspirin", "def2-tzvp", "b3lyp"),
-                    ("(H2O)_16", "def2-tzvp", "pbe"),
-                ]
-            )
 
-    rows: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = list(existing_rows) if existing_rows else []
+    done_keys = {
+        (str(r.get("system")), str(r.get("basis")), str(r.get("method", "")).lower(), str(r.get("jk_mode")))
+        for r in rows
+    }
+    poll_gpu = backend == "cuda"
 
     for sys_name, basis_name, method in cases:
         mol = build_mol(sys_name, basis_name)
         nao = mol.nao
-        dm0 = gpu4dft.minao_init_guess(mol)
-        is_hf = method.lower() == "rhf"
 
-        # Prebuild PySCF level-3 quadrature grid once for exact 1:1 grid apple-to-apple accuracy check
-        shared_grids = None
-        if not is_hf:
-            g_ref = dft.Grids(mol)
-            g_ref.level = 3
-            g_ref.build()
-            shared_grids = (
-                np.ascontiguousarray(g_ref.coords, dtype=np.float64),
-                np.ascontiguousarray(g_ref.weights, dtype=np.float64),
-            )
-
-        # Run CPU PySCF Direct on moderate systems (nao <= 260 unless --include-slow-cpu)
-        cpu_direct = None
-        if nao <= 260 or include_slow_cpu:
-            cpu_direct = _run_pyscf_cpu_scf(mol, method, dm0, density_fit=False)
-        cpu_df = _run_pyscf_cpu_scf(mol, method, dm0, density_fit=True)
-
-        # Run GPU4PySCF Direct & DF
-        g4p_direct = _run_gpu4pyscf_scf(mol, method, dm0, density_fit=False)
-        g4p_df = _run_gpu4pyscf_scf(mol, method, dm0, density_fit=True)
-
-        ref_exact_e = (
-            cpu_direct["energy_hartree"]
-            if cpu_direct is not None
-            else (
-                g4p_direct["energy_hartree"]
-                if g4p_direct and "energy_hartree" in g4p_direct
-                else None
-            )
-        )
-        ref_df_e = cpu_df["energy_hartree"]
-
-        cpu_dir_t = cpu_direct["time_e2e_s"] if cpu_direct else None
-        cpu_df_t = cpu_df["time_e2e_s"]
-        g4p_dir_t = g4p_direct["time_e2e_s"] if g4p_direct and "time_e2e_s" in g4p_direct else None
-        g4p_df_t = g4p_df["time_e2e_s"] if g4p_df and "time_e2e_s" in g4p_df else None
-
-        # GPU4DFT configurations
         g4d_modes: list[tuple[str, dict[str, Any], bool, bool]] = []
-        if nao <= 400:
+        if nao <= 400 and (backend == "cuda" or nao <= 120):
             g4d_modes.append(
                 (
                     "Direct_FP64",
@@ -675,23 +913,24 @@ def run_end_to_end_scf_suite(
                     False,
                 )
             )
-        g4d_modes.extend(
-            [
-                (
-                    "RI_JK_FP64",
-                    dict(precision="fp64", dynamic_precision=False, gemm_mode="fp64"),
-                    True,
-                    False,
-                ),
+        g4d_modes.append(
+            (
+                "RI_JK_FP64",
+                dict(precision="fp64", dynamic_precision=False, gemm_mode="fp64"),
+                True,
+                False,
+            )
+        )
+        if (backend == "cuda" or nao <= 120) and (nao <= 400 or preset == "full"):
+            g4d_modes.append(
                 (
                     "RI_JK_OzakiInt8",
                     dict(precision="mixed", dynamic_precision=True, gemm_mode="ozaki_int8"),
                     True,
                     False,
-                ),
-            ]
-        )
-        if method.lower() in ("rhf", "b3lyp", "pbe0") and nao <= 300:
+                )
+            )
+        if preset == "full" and backend == "cuda" and method.lower() in ("rhf", "b3lyp", "pbe0") and nao <= 300:
             g4d_modes.append(
                 (
                     "RIJCOSX_snK",
@@ -701,45 +940,169 @@ def run_end_to_end_scf_suite(
                 )
             )
 
-        print(f"\n  --- {sys_name} / {basis_name} ({method.upper()}, nao={nao}, nelec={mol.nelectron}) ---")
-        if cpu_dir_t is not None:
-            print(f"    PySCF CPU [Direct] : {cpu_dir_t:7.3f} s  (E = {ref_exact_e:.10f} Eh)")
-        print(f"    PySCF CPU [DF]     : {cpu_df_t:7.3f} s  (E = {ref_df_e:.10f} Eh)")
-        if g4p_dir_t is not None:
-            print(f"    GPU4PySCF [Direct] : {g4p_dir_t:7.3f} s  (E = {g4p_direct['energy_hartree']:.10f} Eh)")
-        if g4p_df_t is not None:
-            print(f"    GPU4PySCF [DF]     : {g4p_df_t:7.3f} s  (E = {g4p_df['energy_hartree']:.10f} Eh)")
+        pending_modes = [
+            m for m in g4d_modes if (sys_name, basis_name, method.lower(), m[0]) not in done_keys
+        ]
+        if not pending_modes:
+            print(f"\n  --- {sys_name} / {basis_name} ({method.upper()}, nao={nao}) [RESUME: already complete, skipping] ---")
+            continue
 
-        for mode_label, kw, use_df, use_snk in g4d_modes:
-            mf = (
-                gpu4dft.RHF(mol, backend=backend, conv_tol=1e-9, **kw)
-                if is_hf
-                else gpu4dft.RKS(
-                    mol, xc=method, backend=backend, grids=shared_grids, conv_tol=1e-9, **kw
-                )
+        dm0 = gpu4dft.minao_init_guess(mol)
+        is_hf = method.lower() == "rhf"
+
+        need_direct = any(not use_df for _, _, use_df, _ in pending_modes)
+        need_df = any(use_df for _, _, use_df, _ in pending_modes)
+        cpu_dir_reps = n_repeats if (need_direct and (nao <= 260 or include_slow_cpu)) else 0
+        cpu_df_reps = n_repeats if (need_df and (nao <= cpu_max_nao or include_slow_cpu)) else (0 if HAVE_GPU4PYSCF else (1 if need_df else 0))
+        g4p_dir_reps = n_repeats if (need_direct and HAVE_GPU4PYSCF and nao <= 400) else 0
+        g4p_df_reps = n_repeats if (need_df and HAVE_GPU4PYSCF) else 0
+
+        cpu_direct = _run_repeat_stats_cpu_scf(
+            mol, method, dm0, density_fit=False, repeats=cpu_dir_reps, grids_level=grids_level, auxbasis=auxbasis
+        )
+        cpu_df = _run_repeat_stats_cpu_scf(
+            mol, method, dm0, density_fit=True, repeats=cpu_df_reps, grids_level=grids_level, auxbasis=auxbasis
+        )
+        g4p_direct = _run_repeat_stats_gpu4pyscf_scf(
+            mol,
+            method,
+            dm0,
+            density_fit=False,
+            repeats=g4p_dir_reps,
+            grids_level=grids_level,
+            auxbasis=auxbasis,
+            poll_gpu=poll_gpu,
+        )
+        g4p_df = _run_repeat_stats_gpu4pyscf_scf(
+            mol,
+            method,
+            dm0,
+            density_fit=True,
+            repeats=g4p_df_reps,
+            grids_level=grids_level,
+            auxbasis=auxbasis,
+            poll_gpu=poll_gpu,
+        )
+
+        ref_exact_e = (
+            cpu_direct["energy_hartree"]
+            if cpu_direct is not None
+            else (
+                g4p_direct["energy_hartree"]
+                if g4p_direct and "energy_hartree" in g4p_direct
+                else None
             )
-            if use_df:
-                mf.density_fit(auxbasis="def2-universal-jkfit")
-            if use_snk:
-                mf.snk()
+        )
+        ref_df_e = cpu_df["energy_hartree"] if cpu_df is not None else None
+        g4p_df_e = g4p_df["energy_hartree"] if (g4p_df and "energy_hartree" in g4p_df) else None
 
-            sync_gpu()
-            t0 = time.perf_counter()
-            e_got = mf.kernel(dm0=dm0)
-            sync_gpu()
-            t_e2e = time.perf_counter() - t0
+        cpu_dir_t = cpu_direct["mean"] if cpu_direct else None
+        cpu_df_t = cpu_df["mean"] if cpu_df else None
+        g4p_dir_t = g4p_direct["mean"] if (g4p_direct and "mean" in g4p_direct) else None
+        g4p_df_t = g4p_df["mean"] if (g4p_df and "mean" in g4p_df) else None
 
-            wres = mf.result
-            ref_cmp = ref_df_e if (use_df and not use_snk) else (ref_exact_e or ref_df_e)
-            abs_diff = abs(e_got - ref_cmp) if ref_cmp is not None else None
+        print(f"\n  --- {sys_name} / {basis_name} ({method.upper()}, nao={nao}, nelec={mol.nelectron}) ---")
+        if cpu_dir_t is not None and cpu_direct is not None:
+            print(
+                f"    PySCF CPU [Direct] : {cpu_dir_t:7.3f} ± {cpu_direct['std']:.3f} s "
+                f"(n={cpu_direct['samples']}, E={ref_exact_e:.10f} Eh)"
+            )
+        if cpu_df_t is not None and cpu_df is not None:
+            print(
+                f"    PySCF CPU [DF]     : {cpu_df_t:7.3f} ± {cpu_df['std']:.3f} s "
+                f"(n={cpu_df['samples']}, E={ref_df_e:.10f} Eh)"
+            )
+        if g4p_dir_t is not None and g4p_direct is not None:
+            print(
+                f"    GPU4PySCF [Direct] : {g4p_dir_t:7.3f} ± {g4p_direct['std']:.3f} s "
+                f"(n={g4p_direct['samples']}, VRAM={g4p_direct.get('peak_vram_mib')})"
+            )
+        if g4p_df_t is not None and g4p_df is not None:
+            print(
+                f"    GPU4PySCF [DF]     : {g4p_df_t:7.3f} ± {g4p_df['std']:.3f} s "
+                f"(n={g4p_df['samples']}, VRAM={g4p_df.get('peak_vram_mib')})"
+            )
+
+        for mode_label, kw, use_df, use_snk in pending_modes:
+            e2e_samples: list[float] = []
+            scf_samples: list[float] = []
+            setup_samples: list[float] = []
+            vram_peaks: list[float] = []
+            vram_deltas: list[float] = []
+            last_e = 0.0
+            last_iters = 0
+            last_active_ao = 0.0
+            last_ss_allocs = 0
+            converged_all = True
+
+            for _ in range(n_repeats):
+                release_gpu_memory()
+                mf = (
+                    gpu4dft.RHF(mol, backend=backend, conv_tol=1e-9, **kw)
+                    if is_hf
+                    else gpu4dft.RKS(
+                        mol,
+                        xc=method,
+                        backend=backend,
+                        grids_level=grids_level,
+                        conv_tol=1e-9,
+                        **kw,
+                    )
+                )
+                if use_df:
+                    mf.density_fit(auxbasis=auxbasis)
+                if use_snk:
+                    mf.snk()
+
+                with VramPeakMonitor(poll_gpu=poll_gpu) as vmon:
+                    sync_gpu()
+                    t0 = time.perf_counter()
+                    e_got = float(mf.kernel(dm0=dm0))
+                    sync_gpu()
+                    t_e2e = time.perf_counter() - t0
+
+                wres = mf.result
+                e2e_samples.append(t_e2e)
+                scf_samples.append(float(wres.scf_time_s))
+                setup_samples.append(float(wres.setup_time_s))
+                if vmon.peak_vram_mib is not None:
+                    vram_peaks.append(float(vmon.peak_vram_mib))
+                if vmon.peak_vram_delta_mib is not None:
+                    vram_deltas.append(float(vmon.peak_vram_delta_mib))
+                last_e = e_got
+                last_iters = int(mf.iterations)
+                last_active_ao = float(wres.active_ao_ratio)
+                last_ss_allocs = int(wres.scf.steady_state_allocations)
+                converged_all = converged_all and bool(mf.converged)
+                release_gpu_memory(mf)
+
+            e2e_stats = _summarize_samples(e2e_samples)
+            scf_stats = _summarize_samples(scf_samples)
+            setup_stats = _summarize_samples(setup_samples)
+            t_e2e_mean = e2e_stats["mean"]
+            t_scf_mean = scf_stats["mean"]
+            t_setup_mean = setup_stats["mean"]
+
+            if use_df and not use_snk:
+                ref_cmp = ref_df_e if ref_df_e is not None else g4p_df_e
+                ref_backend_label = "PySCF CPU [DF]" if ref_df_e is not None else "GPU4PySCF [DF]"
+            else:
+                ref_cmp = ref_exact_e if ref_exact_e is not None else ref_df_e
+                ref_backend_label = "PySCF CPU [Direct]" if cpu_direct is not None else "PySCF CPU [DF]"
+            abs_diff = abs(last_e - ref_cmp) if ref_cmp is not None else None
 
             base_cpu_t = cpu_df_t if use_df else cpu_dir_t
             base_g4p_t = g4p_df_t if use_df else g4p_dir_t
-            sp_cpu = (base_cpu_t / t_e2e) if (base_cpu_t and t_e2e > 0) else None
-            sp_g4p = (base_g4p_t / t_e2e) if (base_g4p_t and t_e2e > 0) else None
+            ref_cpu_obj = cpu_df if use_df else cpu_direct
+            ref_g4p_obj = g4p_df if use_df else g4p_direct
+            sp_cpu = (base_cpu_t / t_e2e_mean) if (base_cpu_t and t_e2e_mean > 0) else None
+            sp_g4p = (base_g4p_t / t_e2e_mean) if (base_g4p_t and t_e2e_mean > 0) else None
             sp_scf_vs_g4p = (
-                (base_g4p_t / wres.scf_time_s) if (base_g4p_t and wres.scf_time_s > 0) else None
+                (base_g4p_t / t_scf_mean) if (base_g4p_t and t_scf_mean > 0) else None
             )
+
+            peak_vram = max(vram_peaks) if vram_peaks else None
+            peak_vram_delta = max(vram_deltas) if vram_deltas else None
 
             rec = {
                 "system": sys_name,
@@ -749,157 +1112,349 @@ def run_end_to_end_scf_suite(
                 "method": method.upper(),
                 "jk_mode": mode_label,
                 "gemm_mode": kw["gemm_mode"],
+                "precision": kw["precision"],
+                "auxbasis": auxbasis if use_df else None,
+                "grids_level": grids_level,
                 "solver": "Diag_CudaGraph",
-                "converged": mf.converged,
-                "iterations": mf.iterations,
-                "energy_hartree": e_got,
+                "n_repeats": int(n_repeats),
+                "repeat_times_s": [round(x, 6) for x in e2e_samples],
+                "scf_times_s": [round(x, 6) for x in scf_samples],
+                "setup_times_s": [round(x, 6) for x in setup_samples],
+                "converged": converged_all,
+                "iterations": last_iters,
+                "energy_hartree": last_e,
                 "abs_diff_vs_pyscf_eh": abs_diff,
-                "time_setup_s": wres.setup_time_s,
-                "time_scf_s": wres.scf_time_s,
-                "time_e2e_s": t_e2e,
-                "time_per_iter_ms": (wres.scf_time_s * 1e3) / max(1, mf.iterations),
-                "active_ao_ratio": wres.active_ao_ratio,
-                "steady_state_allocations": int(wres.scf.steady_state_allocations),
-                "peak_vram_mib": get_peak_vram_mib(),
+                "abs_diff_vs_ref_eh": abs_diff,
+                "reference_backend": ref_backend_label,
+                "time_setup_s": t_setup_mean,
+                "time_setup_mean_s": t_setup_mean,
+                "time_setup_std_s": setup_stats["std"],
+                "time_scf_s": t_scf_mean,
+                "time_scf_mean_s": t_scf_mean,
+                "time_scf_std_s": scf_stats["std"],
+                "time_scf_min_s": scf_stats["min"],
+                "time_scf_max_s": scf_stats["max"],
+                "time_e2e_s": t_e2e_mean,
+                "time_e2e_mean_s": t_e2e_mean,
+                "time_e2e_std_s": e2e_stats["std"],
+                "time_e2e_min_s": e2e_stats["min"],
+                "time_e2e_max_s": e2e_stats["max"],
+                "time_per_iter_ms": (t_scf_mean * 1e3) / max(1, last_iters),
+                "active_ao_ratio": last_active_ao,
+                "steady_state_allocations": last_ss_allocs,
+                "peak_vram_mib": peak_vram,
+                "peak_vram_delta_mib": peak_vram_delta,
                 "pyscf_cpu_time_s": base_cpu_t,
+                "pyscf_cpu_stats": ref_cpu_obj,
                 "gpu4pyscf_time_s": base_g4p_t,
+                "gpu4pyscf_stats": ref_g4p_obj,
+                "gpu4pyscf_peak_vram_mib": ref_g4p_obj.get("peak_vram_mib") if isinstance(ref_g4p_obj, dict) else None,
                 "speedup_vs_pyscf_cpu": sp_cpu,
                 "speedup_e2e_vs_gpu4pyscf": sp_g4p,
                 "speedup_scf_loop_vs_gpu4pyscf": sp_scf_vs_g4p,
             }
             rows.append(rec)
+            if checkpoint_cb is not None:
+                checkpoint_cb(rows)
             diff_str = f"{abs_diff:.2e}" if abs_diff is not None else "N/A"
             cpu_str = f"{sp_cpu:5.2f}x" if sp_cpu is not None else "  N/A "
             g4p_str = f"{sp_g4p:5.2f}x" if sp_g4p is not None else "  N/A "
+            vram_str = f"{peak_vram:.1f} MiB" if peak_vram is not None else "N/A"
             print(
-                f"    GPU4DFT [{mode_label:22s}]: E2E={t_e2e:7.3f} s "
-                f"(setup={wres.setup_time_s:6.3f}s, scf={wres.scf_time_s:6.3f}s, {mf.iterations:2d} it) | "
-                f"|dE|={diff_str} Eh | vs CPU={cpu_str} | vs GPU4PySCF={g4p_str}"
+                f"    GPU4DFT [{mode_label:22s}]: E2E={t_e2e_mean:7.3f}±{e2e_stats['std']:.3f}s "
+                f"(min/max={e2e_stats['min']:.3f}/{e2e_stats['max']:.3f}, scf={t_scf_mean:6.3f}s, {last_iters:2d} it) | "
+                f"VRAM={vram_str} | |dE|={diff_str} Eh | vs CPU={cpu_str} | vs GPU4PySCF={g4p_str}"
             )
-            del mf
-            gc.collect()
     return rows
 
 
 # ---------------------------------------------------------------------------
-# Suite 5: Analytical Nuclear Gradients Benchmark
+# Suite 5: Analytical Nuclear Gradients Benchmark (RI-JK & Direct, FP64)
 # ---------------------------------------------------------------------------
 
 
-def run_gradient_suite(backend: str, preset: str) -> list[dict[str, Any]]:
+def run_gradient_suite(
+    backend: str,
+    preset: str,
+    include_slow_cpu: bool = False,
+    n_repeats: int = 5,
+    grids_level: int = 3,
+    auxbasis: str = "def2-universal-jkfit",
+    cpu_max_nao: int = 400,
+    checkpoint_cb: Callable[[list[dict[str, Any]]], None] | None = None,
+    existing_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     print("\n=== [5/7] Analytical Nuclear Gradients Benchmark ===")
-    cases = [
-        ("C6H6", "def2-svp", "rhf"),
-        ("C6H6", "def2-svp", "b3lyp"),
-        ("(H2O)_8", "6-31g*", "b3lyp"),
-        ("aspirin", "6-31g*", "b3lyp"),
-    ]
-    if preset != "quick":
-        cases.append(("C8H18", "def2-svp", "pbe"))
+    if preset == "quick":
+        cases = [
+            ("C6H6", "def2-svp", "rhf", True),
+            ("C6H6", "def2-svp", "b3lyp", True),
+            ("(H2O)_8", "6-31g*", "b3lyp", True),
+        ]
+    elif preset == "standard":
+        cases = [
+            ("C6H6", "def2-svp", "rhf", False),
+            ("C6H6", "def2-svp", "rhf", True),
+            ("C6H6", "def2-svp", "b3lyp", True),
+            ("(H2O)_8", "6-31g*", "b3lyp", True),
+            ("aspirin", "6-31g*", "b3lyp", True),
+            ("(H2O)_32", "def2-svp", "b3lyp", True),
+            ("C60", "def2-svp", "b3lyp", True),
+            ("Taxol", "6-31g*", "b3lyp", True),
+            ("Valinomycin", "6-31g*", "b3lyp", True),
+        ]
+    else:
+        cases = [
+            ("C6H6", "def2-svp", "rhf", False),
+            ("C6H6", "def2-svp", "rhf", True),
+            ("C6H6", "def2-svp", "b3lyp", True),
+            ("(H2O)_8", "6-31g*", "b3lyp", True),
+            ("C8H18", "def2-svp", "pbe", True),
+            ("aspirin", "6-31g*", "b3lyp", True),
+            ("aspirin", "def2-svp", "wb97x", True),
+            ("(H2O)_32", "def2-svp", "b3lyp", True),
+            ("C60", "def2-svp", "b3lyp", True),
+            ("Taxol", "6-31g*", "b3lyp", True),
+            ("Valinomycin", "6-31g*", "b3lyp", True),
+        ]
 
-    rows: list[dict[str, Any]] = []
-    for sys_name, basis_name, method in cases:
+    rows: list[dict[str, Any]] = list(existing_rows) if existing_rows else []
+    done_keys = {
+        (str(r.get("system")), str(r.get("basis")), str(r.get("method", "")).lower(), str(r.get("jk_mode")))
+        for r in rows
+    }
+    poll_gpu = backend == "cuda"
+
+    for sys_name, basis_name, method, use_df in cases:
+        jk_label = "RI_JK_FP64" if use_df else "Direct_FP64"
+        if (sys_name, basis_name, method.lower(), jk_label) in done_keys:
+            print(f"  {sys_name}/{basis_name} ({method.upper()} {jk_label}) [RESUME: already complete, skipping]")
+            continue
         mol = build_mol(sys_name, basis_name)
+        nao = mol.nao
         dm0 = gpu4dft.minao_init_guess(mol)
         is_hf = method.lower() == "rhf"
 
-        # Reference PySCF CPU SCF + Gradients
-        if is_hf:
-            mf_cpu = scf.RHF(mol)
-        else:
-            mf_cpu = dft.RKS(mol, xc=method)
-            mf_cpu.grids.level = 3
-            mf_cpu.grids.build()
-        mf_cpu.conv_tol = 1e-10
-        mf_cpu.kernel(dm0=dm0)
+        # 1. Reference PySCF CPU SCF + Gradients
+        cpu_reps = n_repeats if (nao <= cpu_max_nao or include_slow_cpu) else (0 if HAVE_GPU4PYSCF else 1)
+        cpu_grad_samples: list[float] = []
+        cpu_scf_samples: list[float] = []
+        g_cpu: np.ndarray | None = None
+        for _ in range(cpu_reps):
+            if is_hf:
+                mf_cpu = scf.RHF(mol)
+            else:
+                mf_cpu = dft.RKS(mol, xc=method)
+                mf_cpu.grids.level = grids_level
+            if use_df:
+                mf_cpu = mf_cpu.density_fit(auxbasis=auxbasis)
+            mf_cpu.conv_tol = 1e-10
+            t0 = time.perf_counter()
+            if not is_hf:
+                mf_cpu.grids.build()
+            mf_cpu.kernel(dm0=dm0)
+            t_scf_c = time.perf_counter() - t0
+            gm_cpu = mf_cpu.nuc_grad_method()
+            if not is_hf and hasattr(gm_cpu, "grid_response"):
+                gm_cpu.grid_response = True
+            if use_df and hasattr(gm_cpu, "auxbasis_response"):
+                gm_cpu.auxbasis_response = True
+            t0 = time.perf_counter()
+            g_cpu = np.asarray(gm_cpu.kernel(), dtype=np.float64)
+            t_grad_c = time.perf_counter() - t0
+            cpu_scf_samples.append(t_scf_c)
+            cpu_grad_samples.append(t_grad_c)
+            del gm_cpu, mf_cpu
+            gc.collect()
+        cpu_grad_stats = _summarize_samples(cpu_grad_samples)
+        t_grad_cpu = cpu_grad_stats["mean"] if cpu_grad_samples else None
 
-        t0 = time.perf_counter()
-        g_cpu = (
-            pyscf_grad_rhf.Gradients(mf_cpu).kernel()
-            if is_hf
-            else pyscf_grad_rks.Gradients(mf_cpu).kernel()
-        )
-        t_grad_cpu = time.perf_counter() - t0
-
-        # Optional GPU4PySCF Gradients
-        t_grad_g4p = None
+        # 2. Optional GPU4PySCF SCF + Gradients
+        g4p_grad_samples: list[float] = []
+        g4p_scf_samples: list[float] = []
+        g4p_vram_peaks: list[float] = []
+        g_g4p: np.ndarray | None = None
         if HAVE_GPU4PYSCF:
             try:
-                mf_g = (
-                    gpu4pyscf_scf.RHF(mol)
-                    if is_hf
-                    else gpu4pyscf_dft.RKS(mol, xc=method)
+                for _ in range(n_repeats):
+                    release_gpu_memory()
+                    mf_g = (
+                        gpu4pyscf_scf.RHF(mol)
+                        if is_hf
+                        else gpu4pyscf_dft.RKS(mol, xc=method)
+                    )
+                    if not is_hf:
+                        mf_g.grids.level = grids_level
+                    if use_df:
+                        mf_g = mf_g.density_fit(auxbasis=auxbasis)
+                    mf_g.conv_tol = 1e-10
+                    with VramPeakMonitor(poll_gpu=poll_gpu) as vmon_g:
+                        sync_gpu()
+                        t0 = time.perf_counter()
+                        mf_g.kernel(dm0=dm0)
+                        sync_gpu()
+                        t_scf_g = time.perf_counter() - t0
+                        gm_g = mf_g.nuc_grad_method()
+                        if not is_hf and hasattr(gm_g, "grid_response"):
+                            gm_g.grid_response = True
+                        if use_df and hasattr(gm_g, "auxbasis_response"):
+                            gm_g.auxbasis_response = True
+                        sync_gpu()
+                        t0 = time.perf_counter()
+                        g_g4p = np.asarray(gm_g.kernel(), dtype=np.float64)
+                        sync_gpu()
+                        t_grad_g = time.perf_counter() - t0
+                    g4p_scf_samples.append(t_scf_g)
+                    g4p_grad_samples.append(t_grad_g)
+                    if vmon_g.peak_vram_mib is not None:
+                        g4p_vram_peaks.append(float(vmon_g.peak_vram_mib))
+                    release_gpu_memory(mf_g, gm_g)
+            except Exception:
+                g4p_grad_samples = []
+                release_gpu_memory()
+        g4p_grad_stats = _summarize_samples(g4p_grad_samples) if g4p_grad_samples else None
+        t_grad_g4p = g4p_grad_stats["mean"] if g4p_grad_stats else None
+
+        # 3. GPU4DFT FP64 SCF + Analytical Nuclear Gradients (5 repeats)
+        g4d_scf_samples: list[float] = []
+        g4d_grad_samples: list[float] = []
+        g4d_e2e_samples: list[float] = []
+        g4d_vram_peaks: list[float] = []
+        g4d_vram_deltas: list[float] = []
+        g_got: np.ndarray | None = None
+        last_1e = 0.0
+        last_2e = 0.0
+        last_xc = 0.0
+
+        for _ in range(n_repeats):
+            release_gpu_memory()
+            mf = (
+                gpu4dft.RHF(
+                    mol,
+                    backend=backend,
+                    precision="fp64",
+                    dynamic_precision=False,
+                    gemm_mode="fp64",
+                    conv_tol=1e-10,
                 )
-                if not is_hf:
-                    mf_g.grids.level = 3
-                mf_g.conv_tol = 1e-10
-                mf_g.kernel(dm0=dm0)
+                if is_hf
+                else gpu4dft.RKS(
+                    mol,
+                    xc=method,
+                    backend=backend,
+                    precision="fp64",
+                    dynamic_precision=False,
+                    gemm_mode="fp64",
+                    grids_level=grids_level,
+                    conv_tol=1e-10,
+                )
+            )
+            if use_df:
+                mf.density_fit(auxbasis=auxbasis)
+
+            with VramPeakMonitor(poll_gpu=poll_gpu) as vmon:
                 sync_gpu()
                 t0 = time.perf_counter()
-                _ = mf_g.nuc_grad_method().kernel()
+                mf.kernel(dm0=dm0)
                 sync_gpu()
-                t_grad_g4p = time.perf_counter() - t0
-            except Exception:
-                t_grad_g4p = None
+                t_scf_g4d = time.perf_counter() - t0
 
-        # GPU4DFT SCF + Analytical Nuclear Gradients
-        mf = (
-            gpu4dft.RHF(mol, backend=backend, precision="mixed", gemm_mode="ozaki_int8", conv_tol=1e-10)
-            if is_hf
-            else gpu4dft.RKS(
-                mol,
-                xc=method,
-                backend=backend,
-                precision="mixed",
-                gemm_mode="ozaki_int8",
-                grids=(mf_cpu.grids.coords, mf_cpu.grids.weights),
-                conv_tol=1e-10,
-            )
-        )
-        sync_gpu()
-        t0 = time.perf_counter()
-        mf.kernel(dm0=dm0)
-        sync_gpu()
-        t_scf_g4d = time.perf_counter() - t0
+                g_driver = mf.nuc_grad_method()
+                sync_gpu()
+                t0 = time.perf_counter()
+                g_got = np.asarray(g_driver.kernel(), dtype=np.float64)
+                sync_gpu()
+                t_grad_g4d = time.perf_counter() - t0
 
-        g_driver = mf.nuc_grad_method()
-        sync_gpu()
-        t0 = time.perf_counter()
-        g_got = g_driver.kernel()
-        sync_gpu()
-        t_grad_g4d = time.perf_counter() - t0
+            last_1e = float(g_driver.result.one_electron_time_s)
+            last_2e = float(g_driver.result.two_electron_time_s)
+            last_xc = float(g_driver.result.xc_time_s)
+            g4d_scf_samples.append(t_scf_g4d)
+            g4d_grad_samples.append(t_grad_g4d)
+            g4d_e2e_samples.append(t_scf_g4d + t_grad_g4d)
+            if vmon.peak_vram_mib is not None:
+                g4d_vram_peaks.append(float(vmon.peak_vram_mib))
+            if vmon.peak_vram_delta_mib is not None:
+                g4d_vram_deltas.append(float(vmon.peak_vram_delta_mib))
+            release_gpu_memory(mf, g_driver)
 
-        max_grad_diff = float(np.max(np.abs(g_got - g_cpu)))
-        net_force = float(np.max(np.abs(np.sum(g_got, axis=0))))
-        ratio_grad_scf = t_grad_g4d / max(t_scf_g4d, 1e-12)
-        sp_cpu = t_grad_cpu / max(t_grad_g4d, 1e-12)
-        sp_g4p = (t_grad_g4p / max(t_grad_g4d, 1e-12)) if t_grad_g4p is not None else None
+        grad_stats = _summarize_samples(g4d_grad_samples)
+        scf_stats = _summarize_samples(g4d_scf_samples)
+        e2e_stats = _summarize_samples(g4d_e2e_samples)
+        t_grad_mean = grad_stats["mean"]
+        t_scf_mean = scf_stats["mean"]
+
+        ref_g = g_cpu if g_cpu is not None else g_g4p
+        max_grad_diff = float(np.max(np.abs(g_got - ref_g))) if (g_got is not None and ref_g is not None) else None
+        net_force = float(np.max(np.abs(np.sum(g_got, axis=0)))) if g_got is not None else None
+        ratio_grad_scf = t_grad_mean / max(t_scf_mean, 1e-12)
+        sp_cpu = (t_grad_cpu / max(t_grad_mean, 1e-12)) if t_grad_cpu is not None else None
+        sp_g4p = (t_grad_g4p / max(t_grad_mean, 1e-12)) if t_grad_g4p is not None else None
+        peak_vram = max(g4d_vram_peaks) if g4d_vram_peaks else None
+        peak_vram_delta = max(g4d_vram_deltas) if g4d_vram_deltas else None
 
         rec = {
             "system": sys_name,
             "basis": basis_name,
-            "nao": mol.nao,
+            "nao": nao,
             "natom": mol.natm,
             "method": method.upper(),
-            "time_scf_s": t_scf_g4d,
-            "time_grad_s": t_grad_g4d,
-            "time_grad_1e_s": g_driver.result.one_electron_time_s,
-            "time_grad_2e_s": g_driver.result.two_electron_time_s,
-            "time_grad_xc_s": g_driver.result.xc_time_s,
+            "jk_mode": jk_label,
+            "precision": "fp64",
+            "auxbasis": auxbasis if use_df else None,
+            "grids_level": grids_level,
+            "n_repeats": int(n_repeats),
+            "repeat_times_s": [round(x, 6) for x in g4d_grad_samples],
+            "scf_times_s": [round(x, 6) for x in g4d_scf_samples],
+            "e2e_times_s": [round(x, 6) for x in g4d_e2e_samples],
+            "time_scf_s": t_scf_mean,
+            "time_grad_s": t_grad_mean,
+            "time_grad_mean_s": t_grad_mean,
+            "time_grad_std_s": grad_stats["std"],
+            "time_grad_min_s": grad_stats["min"],
+            "time_grad_max_s": grad_stats["max"],
+            "time_e2e_mean_s": e2e_stats["mean"],
+            "time_e2e_std_s": e2e_stats["std"],
+            "time_grad_1e_s": last_1e,
+            "time_grad_2e_s": last_2e,
+            "time_grad_xc_s": last_xc,
             "grad_to_scf_ratio": ratio_grad_scf,
+            "peak_vram_mib": peak_vram,
+            "peak_vram_delta_mib": peak_vram_delta,
             "max_grad_diff_eh_bohr": max_grad_diff,
             "net_translation_force_eh_bohr": net_force,
             "pyscf_cpu_grad_s": t_grad_cpu,
+            "pyscf_cpu_grad_stats": (
+                {"samples": len(cpu_grad_samples), "samples_s": [round(x, 6) for x in cpu_grad_samples], **cpu_grad_stats}
+                if cpu_grad_samples
+                else None
+            ),
             "gpu4pyscf_grad_s": t_grad_g4p,
+            "gpu4pyscf_grad_stats": (
+                {
+                    "samples": len(g4p_grad_samples),
+                    "samples_s": [round(x, 6) for x in g4p_grad_samples],
+                    "peak_vram_mib": max(g4p_vram_peaks) if g4p_vram_peaks else None,
+                    **g4p_grad_stats,
+                }
+                if g4p_grad_stats
+                else None
+            ),
             "speedup_vs_pyscf_cpu": sp_cpu,
             "speedup_vs_gpu4pyscf": sp_g4p,
         }
         rows.append(rec)
-        g4p_str = f"{t_grad_g4p:6.3f}s ({sp_g4p:4.2f}x)" if t_grad_g4p is not None else "N/A"
+        if checkpoint_cb is not None:
+            checkpoint_cb(rows)
+        g4p_str = f"{t_grad_g4p:6.3f}s ({sp_g4p:4.2f}x)" if (t_grad_g4p is not None and sp_g4p is not None) else "N/A"
+        cpu_str = f"{t_grad_cpu:6.3f}s ({sp_cpu:5.2f}x)" if (t_grad_cpu is not None and sp_cpu is not None) else "N/A"
+        dg_str = f"{max_grad_diff:.2e}" if max_grad_diff is not None else "N/A"
+        nf_str = f"{net_force:.2e}" if net_force is not None else "N/A"
+        vram_str = f"{peak_vram:.1f} MiB" if peak_vram is not None else "N/A"
         print(
-            f"  {sys_name}/{basis_name} ({method.upper()}, nao={mol.nao}): "
-            f"T_grad={t_grad_g4d:6.3f}s (T_grad/T_scf={ratio_grad_scf:.2f}) | "
-            f"max|dg|={max_grad_diff:.2e} Eh/Bohr | CPU={t_grad_cpu:6.3f}s ({sp_cpu:5.2f}x) | GPU4PySCF={g4p_str}"
+            f"  {sys_name}/{basis_name} ({method.upper()} {jk_label}, nao={nao}): "
+            f"T_grad={t_grad_mean:6.3f}±{grad_stats['std']:.3f}s (min/max={grad_stats['min']:.3f}/{grad_stats['max']:.3f}) | "
+            f"VRAM={vram_str} | max|dg|={dg_str} | net={nf_str} | CPU={cpu_str} | GPU4PySCF={g4p_str}"
         )
     return rows
 
@@ -1025,13 +1580,6 @@ def run_tddft_suite(backend: str, preset: str) -> list[dict[str, Any]]:
     for sys_name, basis_name, xc_name, specs in groups:
         mol = build_mol(sys_name, basis_name)
         dm0 = gpu4dft.minao_init_guess(mol)
-        g_ref = dft.Grids(mol)
-        g_ref.level = 3
-        g_ref.build()
-        shared_grids = (
-            np.ascontiguousarray(g_ref.coords, dtype=np.float64),
-            np.ascontiguousarray(g_ref.weights, dtype=np.float64),
-        )
 
         # Cache CPU PySCF SCF + TD references per (use_df, resp_kind)
         cpu_scf_cache: dict[bool, dict[str, Any]] = {}
@@ -1075,7 +1623,7 @@ def run_tddft_suite(backend: str, preset: str) -> list[dict[str, Any]]:
                 precision="mixed" if gmode == "ozaki_int8" else "fp64",
                 dynamic_precision=(gmode == "ozaki_int8"),
                 gemm_mode=gmode,
-                grids=shared_grids,
+                grids_level=3,
                 conv_tol=1e-10,
             )
             if use_df:
@@ -1437,12 +1985,15 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
         "# GPU4DFT Benchmark Summary Report",
         "",
         "## Hardware & Software Environment",
-        f"- **GPU**: `{meta['gpu_name']}` ({meta['vram_total_mib']} MiB VRAM, Driver `{meta['nvidia_driver']}`)",
-        f"- **CUDA**: `{meta['cuda_compiler']}`",
-        f"- **Host**: `{meta['cpu_count']}` logical CPUs (`{meta['platform']}`)",
-        f"- **Software**: Python `{meta['python_version']}`, PySCF `{meta['pyscf_version']}`, "
-        f"GPU4PySCF `{meta['gpu4pyscf_version']}` (commit `{meta['git_revision']}`)",
-        f"- **Timestamp (UTC)**: `{meta['timestamp_utc']}`",
+        f"- **GPU**: `{meta.get('gpu_name', 'unknown')}` ({meta.get('vram_total_mib', 0)} MiB VRAM, Driver `{meta.get('nvidia_driver', 'N/A')}`)",
+        f"- **CUDA**: `{meta.get('cuda_compiler', 'N/A')}`",
+        f"- **Host**: `{meta.get('cpu_count', 1)}` logical CPUs (`{meta.get('platform', 'unknown')}`)",
+        f"- **Software**: Python `{meta.get('python_version', 'unknown')}`, PySCF `{meta.get('pyscf_version', 'unknown')}`, "
+        f"GPU4PySCF `{meta.get('gpu4pyscf_version', 'N/A')}` (commit `{meta.get('git_revision', 'unknown')}`)",
+        f"- **Protocol**: `shared_grids={meta.get('shared_grids', False)}`, `n_repeats={meta.get('n_repeats', 5)}`, "
+        f"`warmup_performed={meta.get('warmup_performed', True)}`, `grids_level={meta.get('grids_level', 3)}`, "
+        f"`auxbasis={meta.get('auxbasis', 'def2-universal-jkfit')}`, `precision={meta.get('precision', 'fp64')}`",
+        f"- **Timestamp (UTC)**: `{meta.get('timestamp_utc', '')}`",
         "",
         "## 1. Ozaki INT8 Tensor Core vs Native FP64 GEMM",
         "",
@@ -1492,23 +2043,30 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "",
             "## 4. End-to-End SCF Head-to-Head (GPU4DFT vs GPU4PySCF vs CPU PySCF)",
             "",
-            "| System | Basis | $N_{\\text{AO}}$ | Method | GPU4DFT Mode | Iters | $|\\Delta E|$ vs PySCF ($E_\\text{h}$) | $T_{\\text{setup}}$ (s) | $T_{\\text{SCF}}$ (s) | $T_{\\text{E2E}}$ (s) | PySCF CPU (s) | GPU4PySCF (s) | Speedup vs CPU | Speedup vs GPU4PySCF (SCF / E2E) |",
+            "| System | Basis | $N_{\\text{AO}}$ | Method | GPU4DFT Mode | Iters | $|\\Delta E|$ vs Ref ($E_\\text{h}$) | Mean ± Std (s) | Min / Max (s) | Peak VRAM (MiB) | PySCF CPU (s) | GPU4PySCF (s) | Speedup vs CPU | Speedup vs GPU4PySCF (SCF / E2E) |",
             "| :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |",
         ]
     )
     for r in payload.get("benchmarks", []):
-        de = f"`{r['abs_diff_vs_pyscf_eh']:.2e}`" if r["abs_diff_vs_pyscf_eh"] is not None else "N/A"
-        t_cpu = f"{r['pyscf_cpu_time_s']:.3f}" if r["pyscf_cpu_time_s"] is not None else "—"
-        t_g4p = f"{r['gpu4pyscf_time_s']:.3f}" if r["gpu4pyscf_time_s"] is not None else "—"
-        sp_cpu = f"**{r['speedup_vs_pyscf_cpu']:.1f}x**" if r["speedup_vs_pyscf_cpu"] is not None else "—"
-        if r["speedup_e2e_vs_gpu4pyscf"] is not None and r["speedup_scf_loop_vs_gpu4pyscf"] is not None:
+        de_val = r.get("abs_diff_vs_pyscf_eh", r.get("abs_diff_vs_ref_eh"))
+        de = f"`{de_val:.2e}`" if de_val is not None else "N/A"
+        e2e_mean = r.get("time_e2e_mean_s", r.get("time_e2e_s", 0.0))
+        e2e_std = r.get("time_e2e_std_s", 0.0)
+        e2e_min = r.get("time_e2e_min_s", e2e_mean)
+        e2e_max = r.get("time_e2e_max_s", e2e_mean)
+        vram = r.get("peak_vram_mib")
+        vram_s = f"{vram:.1f}" if vram is not None else "—"
+        t_cpu = f"{r['pyscf_cpu_time_s']:.3f}" if r.get("pyscf_cpu_time_s") is not None else "—"
+        t_g4p = f"{r['gpu4pyscf_time_s']:.3f}" if r.get("gpu4pyscf_time_s") is not None else "—"
+        sp_cpu = f"**{r['speedup_vs_pyscf_cpu']:.1f}x**" if r.get("speedup_vs_pyscf_cpu") is not None else "—"
+        if r.get("speedup_e2e_vs_gpu4pyscf") is not None and r.get("speedup_scf_loop_vs_gpu4pyscf") is not None:
             sp_g4p = f"{r['speedup_scf_loop_vs_gpu4pyscf']:.2f}x / {r['speedup_e2e_vs_gpu4pyscf']:.2f}x"
         else:
             sp_g4p = "—"
         lines.append(
             f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | `{r['method']}` | `{r['jk_mode']}` | "
-            f"{r['iterations']} | {de} | {r['time_setup_s']:.3f} | {r['time_scf_s']:.3f} | "
-            f"{r['time_e2e_s']:.3f} | {t_cpu} | {t_g4p} | {sp_cpu} | {sp_g4p} |"
+            f"{r['iterations']} | {de} | {e2e_mean:.3f} ± {e2e_std:.3f} | "
+            f"{e2e_min:.3f} / {e2e_max:.3f} | {vram_s} | {t_cpu} | {t_g4p} | {sp_cpu} | {sp_g4p} |"
         )
 
     lines.extend(
@@ -1516,17 +2074,32 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
             "",
             "## 5. Analytical Nuclear Gradients",
             "",
-            "| System | Basis | $N_{\\text{AO}}$ | Method | $T_{\\text{grad}}$ (s) | $T_{\\text{grad}} / T_{\\text{SCF}}$ | $\\max|\\Delta \\mathbf{g}|$ vs PySCF ($E_\\text{h}/a_0$) | Net Force ($E_\\text{h}/a_0$) | PySCF CPU (s) | GPU4PySCF (s) | Speedup vs CPU |",
-            "| :--- | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| System | Basis | $N_{\\text{AO}}$ | Method | JK Mode | Mean ± Std (s) | Min / Max (s) | $T_{\\text{grad}} / T_{\\text{SCF}}$ | Peak VRAM (MiB) | $\\max|\\Delta \\mathbf{g}|$ vs Ref ($E_\\text{h}/a_0$) | Net Force ($E_\\text{h}/a_0$) | PySCF CPU (s) | GPU4PySCF (s) | Speedup vs CPU | Speedup vs GPU4PySCF |",
+            "| :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for r in payload.get("gradient_benchmarks", []):
-        t_g4p = f"{r['gpu4pyscf_grad_s']:.3f}" if r["gpu4pyscf_grad_s"] is not None else "—"
+        jk_m = r.get("jk_mode", "Direct")
+        g_mean = r.get("time_grad_mean_s", r.get("time_grad_s", 0.0))
+        g_std = r.get("time_grad_std_s", 0.0)
+        g_min = r.get("time_grad_min_s", g_mean)
+        g_max = r.get("time_grad_max_s", g_mean)
+        vram = r.get("peak_vram_mib")
+        vram_s = f"{vram:.1f}" if vram is not None else "—"
+        dg = f"`{r['max_grad_diff_eh_bohr']:.2e}`" if r.get("max_grad_diff_eh_bohr") is not None else "N/A"
+        nf = (
+            f"`{r['net_translation_force_eh_bohr']:.2e}`"
+            if r.get("net_translation_force_eh_bohr") is not None
+            else "N/A"
+        )
+        t_cpu = f"{r['pyscf_cpu_grad_s']:.3f}" if r.get("pyscf_cpu_grad_s") is not None else "—"
+        t_g4p = f"{r['gpu4pyscf_grad_s']:.3f}" if r.get("gpu4pyscf_grad_s") is not None else "—"
+        sp_cpu = f"**{r['speedup_vs_pyscf_cpu']:.1f}x**" if r.get("speedup_vs_pyscf_cpu") is not None else "—"
+        sp_g4p = f"**{r['speedup_vs_gpu4pyscf']:.2f}x**" if r.get("speedup_vs_gpu4pyscf") is not None else "—"
         lines.append(
-            f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | `{r['method']}` | "
-            f"{r['time_grad_s']:.3f} | {r['grad_to_scf_ratio']:.2f} | `{r['max_grad_diff_eh_bohr']:.2e}` | "
-            f"`{r['net_translation_force_eh_bohr']:.2e}` | {r['pyscf_cpu_grad_s']:.3f} | {t_g4p} | "
-            f"**{r['speedup_vs_pyscf_cpu']:.1f}x** |"
+            f"| `{r['system']}` | `{r['basis']}` | {r['nao']} | `{r['method']}` | `{jk_m}` | "
+            f"{g_mean:.3f} ± {g_std:.3f} | {g_min:.3f} / {g_max:.3f} | {r['grad_to_scf_ratio']:.2f} | "
+            f"{vram_s} | {dg} | {nf} | {t_cpu} | {t_g4p} | {sp_cpu} | {sp_g4p} |"
         )
 
     if payload.get("tddft_benchmarks"):
@@ -1580,7 +2153,12 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def warmup_contexts(backend: str) -> None:
+def warmup_contexts(
+    backend: str,
+    auxbasis: str = "def2-universal-jkfit",
+    grids_level: int = 3,
+) -> dict[str, Any]:
+    """Symmetrically warm up GPU4DFT, GPU4PySCF, and CPU PySCF across Direct, DF/RI-JK, and Gradients."""
     mol_w = gto.M(
         atom="O 0 0 0.1173; H 0 0.7572 -0.4692; H 0 -0.7572 -0.4692",
         basis="6-31g*",
@@ -1588,18 +2166,91 @@ def warmup_contexts(backend: str) -> None:
         cart=False,
         verbose=0,
     )
-    mf_w = gpu4dft.RKS(
-        mol_w, xc="b3lyp", backend=backend, precision="mixed", gemm_mode="ozaki_int8"
-    )
-    mf_w.kernel()
-    mf_w.nuc_grad_method().kernel()
+    warmed_backends: list[str] = []
+    warmed_paths: list[str] = []
+
+    # 1. GPU4DFT warmup: Direct + RI-JK (FP64 and Mixed/OzakiInt8), SCF + analytical gradients
+    g4d_configs = [
+        ("direct_fp64", False, dict(precision="fp64", dynamic_precision=False, gemm_mode="fp64")),
+        ("direct_mixed", False, dict(precision="mixed", dynamic_precision=True, gemm_mode="ozaki_int8")),
+        ("rijk_fp64", True, dict(precision="fp64", dynamic_precision=False, gemm_mode="fp64")),
+        ("rijk_mixed", True, dict(precision="mixed", dynamic_precision=True, gemm_mode="ozaki_int8")),
+    ]
+    for tag, use_df, kw in g4d_configs:
+        mf_rhf = gpu4dft.RHF(mol_w, backend=backend, **kw)
+        if use_df:
+            mf_rhf = mf_rhf.density_fit(auxbasis=auxbasis)
+        mf_rhf.kernel()
+        gm_rhf = mf_rhf.nuc_grad_method()
+        gm_rhf.kernel()
+        release_gpu_memory(mf_rhf, gm_rhf)
+
+        mf_rks = gpu4dft.RKS(mol_w, xc="b3lyp", backend=backend, grids_level=grids_level, **kw)
+        if use_df:
+            mf_rks = mf_rks.density_fit(auxbasis=auxbasis)
+        mf_rks.kernel()
+        gm_rks = mf_rks.nuc_grad_method()
+        gm_rks.kernel()
+        release_gpu_memory(mf_rks, gm_rks)
+        warmed_paths.append(f"gpu4dft_{tag}_scf_grad")
+    warmed_backends.append(f"GPU4DFT ({backend})")
+
+    # 2. GPU4PySCF warmup: Direct + DF, SCF + analytical gradients
     if HAVE_GPU4PYSCF:
         try:
-            g4p_w = gpu4pyscf_dft.RKS(mol_w, xc="b3lyp")
-            g4p_w.kernel()
+            for tag, use_df in (("direct", False), ("df", True)):
+                g4p_w = gpu4pyscf_dft.RKS(mol_w, xc="b3lyp")
+                g4p_w.grids.level = grids_level
+                if use_df:
+                    g4p_w = g4p_w.density_fit(auxbasis=auxbasis)
+                g4p_w.kernel()
+                gm_g4p = g4p_w.nuc_grad_method()
+                if hasattr(gm_g4p, "grid_response"):
+                    gm_g4p.grid_response = True
+                if use_df and hasattr(gm_g4p, "auxbasis_response"):
+                    gm_g4p.auxbasis_response = True
+                gm_g4p.kernel()
+                release_gpu_memory(g4p_w, gm_g4p)
+                warmed_paths.append(f"gpu4pyscf_{tag}_scf_grad")
+            warmed_backends.append("GPU4PySCF")
         except Exception:
-            pass
+            release_gpu_memory()
+
+    # 3. CPU PySCF warmup: Direct + DF, SCF + analytical gradients
+    for tag, use_df in (("direct", False), ("df", True)):
+        cpu_hf = scf.RHF(mol_w)
+        if use_df:
+            cpu_hf = cpu_hf.density_fit(auxbasis=auxbasis)
+        cpu_hf.kernel()
+        gm_cpu_hf = cpu_hf.nuc_grad_method()
+        if use_df and hasattr(gm_cpu_hf, "auxbasis_response"):
+            gm_cpu_hf.auxbasis_response = True
+        gm_cpu_hf.kernel()
+        del gm_cpu_hf, cpu_hf
+
+        cpu_w = dft.RKS(mol_w, xc="b3lyp")
+        cpu_w.grids.level = grids_level
+        if use_df:
+            cpu_w = cpu_w.density_fit(auxbasis=auxbasis)
+        cpu_w.grids.build()
+        cpu_w.kernel()
+        gm_cpu = cpu_w.nuc_grad_method()
+        if hasattr(gm_cpu, "grid_response"):
+            gm_cpu.grid_response = True
+        if use_df and hasattr(gm_cpu, "auxbasis_response"):
+            gm_cpu.auxbasis_response = True
+        gm_cpu.kernel()
+        del gm_cpu, cpu_w
+        warmed_paths.append(f"pyscf_cpu_{tag}_scf_grad")
+    warmed_backends.append("PySCF (CPU)")
+
+    gc.collect()
     sync_gpu()
+    return {
+        "warmup_performed": True,
+        "warmup_backends": warmed_backends,
+        "warmup_paths": warmed_paths,
+    }
 
 
 def _write_benchmark_outputs(payload: dict[str, Any], json_out: Path, md_out: Path) -> None:
@@ -1631,7 +2282,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--include-slow-cpu",
         action="store_true",
-        help="also run Direct 4-center CPU PySCF on large nao > 260 systems",
+        help="also run Direct 4-center & full 5-repeat DF CPU PySCF on large nao > 400 systems",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="number of independent timed repeats per system/backend in Suites 4 & 5 (default: 5)",
+    )
+    parser.add_argument(
+        "--grids-level",
+        type=int,
+        default=3,
+        help="DFT quadrature grid level applied independently on every backend (default: 3)",
+    )
+    parser.add_argument(
+        "--auxbasis",
+        type=str,
+        default="def2-universal-jkfit",
+        help="auxiliary RI-JK / DF basis set (default: def2-universal-jkfit)",
+    )
+    parser.add_argument(
+        "--cpu-max-nao",
+        type=int,
+        default=400,
+        help="max NAO for full 5-repeat CPU DF runs when GPU4PySCF is available (default: 400)",
     )
     parser.add_argument(
         "--suites",
@@ -1659,9 +2334,33 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    selected_suites = {int(s.strip()) for s in args.suites.split(",") if s.strip()}
+    if args.repeats < 1:
+        parser.error("--repeats must be >= 1")
+    if args.grids_level < 0 or args.grids_level > 9:
+        parser.error("--grids-level must be in [0, 9]")
 
-    meta = collect_hardware_metadata()
+    try:
+        selected_suites = {int(s.strip()) for s in args.suites.split(",") if s.strip()}
+    except ValueError as exc:
+        parser.error(f"invalid --suites value: {exc}")
+    if not selected_suites or any(s < 1 or s > 7 for s in selected_suites):
+        parser.error("--suites must contain integers in 1..7")
+
+    print(
+        f"GPU4DFT Benchmark Suite | Preset={args.preset} | Backend={args.backend} | "
+        f"Suites={sorted(selected_suites)} | Repeats={args.repeats} | Grids={args.grids_level}"
+    )
+    print("Running symmetric GPU4DFT / GPU4PySCF / CPU PySCF warmup...")
+    warmup_info = warmup_contexts(args.backend, auxbasis=args.auxbasis, grids_level=args.grids_level)
+
+    meta = collect_hardware_metadata(
+        n_repeats=args.repeats,
+        grids_level=args.grids_level,
+        auxbasis=args.auxbasis,
+        warmup_info=warmup_info,
+    )
+    print(f"Hardware: {meta['gpu_name']} ({meta['vram_total_mib']} MiB) | CPUs={meta['cpu_count']}")
+
     payload: dict[str, Any] = {
         "metadata": meta,
         "gemm_benchmarks": [],
@@ -1687,12 +2386,13 @@ def main(argv: list[str] | None = None) -> int:
                 payload[k] = prev[k]
         payload["metadata"] = meta
 
-    print(
-        f"GPU4DFT Benchmark Suite | Preset={args.preset} | Backend={args.backend} | Suites={sorted(selected_suites)}"
-    )
-    print(f"Hardware: {meta['gpu_name']} ({meta['vram_total_mib']} MiB) | CPUs={meta['cpu_count']}")
-    print("Running CUDA / cuBLAS / cuSOLVER / PTX JIT warmup...")
-    warmup_contexts(args.backend)
+    def _ckpt_suite4(rows: list[dict[str, Any]]) -> None:
+        payload["benchmarks"] = rows
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
+
+    def _ckpt_suite5(rows: list[dict[str, Any]]) -> None:
+        payload["gradient_benchmarks"] = rows
+        _write_benchmark_outputs(payload, args.json_out, args.md_out)
 
     if 1 in selected_suites:
         payload["gemm_benchmarks"] = run_gemm_suite(args.backend)
@@ -1705,11 +2405,29 @@ def main(argv: list[str] | None = None) -> int:
         _write_benchmark_outputs(payload, args.json_out, args.md_out)
     if 4 in selected_suites:
         payload["benchmarks"] = run_end_to_end_scf_suite(
-            args.backend, args.preset, args.include_slow_cpu
+            args.backend,
+            args.preset,
+            args.include_slow_cpu,
+            n_repeats=args.repeats,
+            grids_level=args.grids_level,
+            auxbasis=args.auxbasis,
+            cpu_max_nao=args.cpu_max_nao,
+            checkpoint_cb=_ckpt_suite4,
+            existing_rows=payload["benchmarks"] if args.resume_json is not None else None,
         )
         _write_benchmark_outputs(payload, args.json_out, args.md_out)
     if 5 in selected_suites:
-        payload["gradient_benchmarks"] = run_gradient_suite(args.backend, args.preset)
+        payload["gradient_benchmarks"] = run_gradient_suite(
+            args.backend,
+            args.preset,
+            include_slow_cpu=args.include_slow_cpu,
+            n_repeats=args.repeats,
+            grids_level=args.grids_level,
+            auxbasis=args.auxbasis,
+            cpu_max_nao=args.cpu_max_nao,
+            checkpoint_cb=_ckpt_suite5,
+            existing_rows=payload["gradient_benchmarks"] if args.resume_json is not None else None,
+        )
         _write_benchmark_outputs(payload, args.json_out, args.md_out)
     if 6 in selected_suites:
         payload["tddft_benchmarks"] = run_tddft_suite(args.backend, args.preset)

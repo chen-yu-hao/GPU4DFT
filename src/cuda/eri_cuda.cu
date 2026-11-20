@@ -155,4 +155,16 @@ void run_eri_general_cuda(GeneralEriLaunchFn launch, int la, int lb, int lc, int
   device_out.download(out);
 }
 
+void run_eri_general_omega_cuda(GeneralEriOmegaLaunchFn launch, int la, int lb, int lc, int ld,
+                                const ShellPairData& bra, const ShellPairData& ket, double omega,
+                                std::vector<double>& out) {
+  const DeviceShellPairs device_bra(bra);
+  const DeviceShellPairs device_ket(ket);
+  DeviceArray<double> device_out(out.size());
+  launch(la, lb, lc, ld, device_bra.view(), device_ket.view(), omega, device_out.data(), nullptr);
+  check(cudaGetLastError(), "ERI general omega kernel launch");
+  check(cudaDeviceSynchronize(), "ERI general omega kernel execution");
+  device_out.download(out);
+}
+
 }  // namespace gpu4dft::detail

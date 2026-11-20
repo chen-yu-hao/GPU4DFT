@@ -59,6 +59,17 @@ void symmetrize_host_square(int n, std::vector<double>& A) {
   }
 }
 
+void slice_cols_host(int rows, int total_cols, int occ_cols, const std::vector<double>& C_full,
+                     std::vector<double>& C_occ_out) {
+  C_occ_out.resize(static_cast<std::size_t>(rows) * std::max(0, occ_cols));
+  if (rows <= 0 || occ_cols <= 0) return;
+  for (int r = 0; r < rows; ++r) {
+    const double* src = C_full.data() + static_cast<std::size_t>(r) * total_cols;
+    double* dst = C_occ_out.data() + static_cast<std::size_t>(r) * occ_cols;
+    std::copy(src, src + occ_cols, dst);
+  }
+}
+
 ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
                        const double* S_host, const double* H_core_host,
                        const FockCallbacks& callbacks, const double* initial_dm_host) {
@@ -73,17 +84,25 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
   ScfResult res;
   res.nao = nao;
   res.nmo = nmo;
+  res.n_alpha = n_occ;
+  res.n_beta = n_occ;
   res.nuclear_repulsion = e_nuc;
   res.density_matrix.assign(n2, 0.0);
   res.energy_weighted_dm.assign(n2, 0.0);
   res.fock_matrix.assign(n2, 0.0);
 
+  std::vector<double> C_occ;
+  bool has_c_occ = false;
   if (initial_dm_host != nullptr) {
     std::copy(initial_dm_host, initial_dm_host + n2, res.density_matrix.begin());
   } else if (opts.solver == DensitySolver::Diag) {
     auto init_diag = solve_fock_diag(nao, nmo, n_occ, H_core_host, ortho.X.data(), Backend::Host,
                                      opts.gemm_mode, opts.ozaki_slices);
     res.density_matrix = std::move(init_diag.dm);
+    if (n_occ > 0) {
+      slice_cols_host(nao, nmo, n_occ, init_diag.mo_coeff, C_occ);
+      has_c_occ = true;
+    }
   } else {
     Sp2Options sp2_opts = opts.sp2_options;
     sp2_opts.gemm_mode = opts.gemm_mode;
@@ -102,7 +121,8 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
   diis_opts.gemm_mode = opts.gemm_mode;
   GpuDiis diis(nao, nmo, diis_opts);
 
-  const bool has_separate_jk = static_cast<bool>(callbacks.build_jk);
+  const bool has_mo_jk = static_cast<bool>(callbacks.build_jk_mo);
+  const bool has_separate_jk = static_cast<bool>(callbacks.build_jk) || has_mo_jk;
   const bool has_vhf = static_cast<bool>(callbacks.build_vhf);
   if (!has_separate_jk && !has_vhf) {
     throw std::invalid_argument(
@@ -139,8 +159,13 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
       if (has_separate_jk) {
         std::fill(dJ.begin(), dJ.end(), 0.0);
         std::fill(dK.begin(), dK.end(), 0.0);
-        callbacks.build_jk(delta_D.data(), true, cur_int_prec, dJ.data(),
-                           need_k ? dK.data() : nullptr, nullptr);
+        if (has_mo_jk) {
+          callbacks.build_jk_mo(delta_D.data(), nullptr, n_occ, true, cur_int_prec, dJ.data(),
+                                need_k ? dK.data() : nullptr, nullptr);
+        } else {
+          callbacks.build_jk(delta_D.data(), true, cur_int_prec, dJ.data(),
+                             need_k ? dK.data() : nullptr, nullptr);
+        }
         for (std::size_t i = 0; i < n2; ++i) {
           J_acc[i] += dJ[i];
           if (need_k) K_acc[i] += dK[i];
@@ -156,8 +181,15 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
       if (has_separate_jk) {
         std::fill(J_acc.begin(), J_acc.end(), 0.0);
         std::fill(K_acc.begin(), K_acc.end(), 0.0);
-        callbacks.build_jk(res.density_matrix.data(), false, cur_int_prec, J_acc.data(),
-                           need_k ? K_acc.data() : nullptr, nullptr);
+        if (has_mo_jk) {
+          callbacks.build_jk_mo(res.density_matrix.data(),
+                                (has_c_occ && n_occ > 0) ? C_occ.data() : nullptr, n_occ, false,
+                                cur_int_prec, J_acc.data(), need_k ? K_acc.data() : nullptr,
+                                nullptr);
+        } else {
+          callbacks.build_jk(res.density_matrix.data(), false, cur_int_prec, J_acc.data(),
+                             need_k ? K_acc.data() : nullptr, nullptr);
+        }
       } else {
         std::fill(Vhf_acc.begin(), Vhf_acc.end(), 0.0);
         callbacks.build_vhf(res.density_matrix.data(), false, cur_int_prec, Vhf_acc.data(), nullptr);
@@ -238,6 +270,10 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
       res.energy_weighted_dm = std::move(diag.energy_dm);
       res.mo_energies = std::move(diag.mo_energies);
       res.mo_coefficients = std::move(diag.mo_coeff);
+      if (n_occ > 0) {
+        slice_cols_host(nao, nmo, n_occ, res.mo_coefficients, C_occ);
+        has_c_occ = true;
+      }
     } else {
       Sp2Options sp2_opts = opts.sp2_options;
       sp2_opts.gemm_mode = cur_gemm;
@@ -265,10 +301,934 @@ ScfResult run_scf_host(const ScfOptions& opts, int nao, int n_occ, double e_nuc,
     gemm(nao, nao, nao, 0.5, DF.data(), false, res.density_matrix.data(), false, 0.0,
          res.energy_weighted_dm.data(), Backend::Host, opts.gemm_mode, opts.ozaki_slices);
     symmetrize_host_square(nao, res.energy_weighted_dm);
+
+    auto post_diag = solve_fock_diag(nao, nmo, n_occ, res.fock_matrix.data(), ortho.X.data(),
+                                     Backend::Host, opts.gemm_mode, opts.ozaki_slices);
+    res.mo_energies = std::move(post_diag.mo_energies);
+    res.mo_coefficients = std::move(post_diag.mo_coeff);
   }
 
   return res;
 }
+
+void compute_s2_and_multiplicity(int nao, int n_alpha, int n_beta, const double* Da_host,
+                                 const double* Db_host, const double* S_host, double& s2_out,
+                                 double& mult_out) {
+  const double sz = 0.5 * static_cast<double>(n_alpha - n_beta);
+  double tr_dsds = 0.0;
+  if (n_alpha > 0 && n_beta > 0 && nao > 0) {
+    const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+    std::vector<double> DaS(n2, 0.0);
+    std::vector<double> DbS(n2, 0.0);
+    gemm(nao, nao, nao, 1.0, Da_host, false, S_host, false, 0.0, DaS.data(), Backend::Host);
+    gemm(nao, nao, nao, 1.0, Db_host, false, S_host, false, 0.0, DbS.data(), Backend::Host);
+    for (int i = 0; i < nao; ++i) {
+      for (int k = 0; k < nao; ++k) {
+        tr_dsds += DaS[static_cast<std::size_t>(i) * nao + k] *
+                   DbS[static_cast<std::size_t>(k) * nao + i];
+      }
+    }
+  }
+  s2_out = sz * (sz + 1.0) + static_cast<double>(n_beta) - tr_dsds;
+  mult_out = std::sqrt(1.0 + 4.0 * std::max(0.0, s2_out));
+}
+
+void validate_unrestricted_counts(int n_elec, int spin, int& n_alpha_out, int& n_beta_out) {
+  if (n_elec < 0 || spin < 0 || spin > n_elec || ((n_elec - spin) % 2) != 0) {
+    throw std::invalid_argument(
+        "ScfDriver::run: invalid (n_elec, spin) for unrestricted SCF (require 0 <= spin <= n_elec and (n_elec - spin) even)");
+  }
+  n_alpha_out = (n_elec + spin) / 2;
+  n_beta_out = (n_elec - spin) / 2;
+}
+
+ScfResult run_scf_host_uks(const ScfOptions& opts, int nao, int n_alpha, int n_beta, double e_nuc,
+                           const double* S_host, const double* H_core_host,
+                           const FockCallbacks& callbacks, const double* initial_dm_alpha_host,
+                           const double* initial_dm_beta_host) {
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  const CanonicalOrthoResult ortho =
+      canonical_orthogonalization(nao, S_host, opts.lindep_tol, Backend::Host);
+  const int nmo = ortho.nmo;
+  if (n_alpha > nmo || n_beta > nmo) {
+    throw std::invalid_argument(
+        "ScfDriver::run: n_alpha/n_beta exceeds linearly independent basis size nmo");
+  }
+
+  ScfResult res;
+  res.nao = nao;
+  res.nmo = nmo;
+  res.unrestricted = true;
+  res.n_alpha = n_alpha;
+  res.n_beta = n_beta;
+  res.nuclear_repulsion = e_nuc;
+  res.density_matrix.assign(n2, 0.0);
+  res.energy_weighted_dm.assign(n2, 0.0);
+  res.fock_matrix.assign(n2, 0.0);
+  res.density_alpha.assign(n2, 0.0);
+  res.density_beta.assign(n2, 0.0);
+  res.energy_weighted_dm_alpha.assign(n2, 0.0);
+  res.energy_weighted_dm_beta.assign(n2, 0.0);
+  res.fock_alpha.assign(n2, 0.0);
+  res.fock_beta.assign(n2, 0.0);
+  res.mo_occ_alpha.assign(static_cast<std::size_t>(nmo), 0.0);
+  res.mo_occ_beta.assign(static_cast<std::size_t>(nmo), 0.0);
+  for (int i = 0; i < n_alpha; ++i) res.mo_occ_alpha[static_cast<std::size_t>(i)] = 1.0;
+  for (int i = 0; i < n_beta; ++i) res.mo_occ_beta[static_cast<std::size_t>(i)] = 1.0;
+
+  std::vector<double> C_occ_a, C_occ_b;
+  bool has_c_occ_a = false;
+  bool has_c_occ_b = false;
+  if (initial_dm_alpha_host != nullptr && initial_dm_beta_host != nullptr) {
+    std::copy(initial_dm_alpha_host, initial_dm_alpha_host + n2, res.density_alpha.begin());
+    std::copy(initial_dm_beta_host, initial_dm_beta_host + n2, res.density_beta.begin());
+  } else if (opts.solver == DensitySolver::Diag) {
+    auto init_a = solve_fock_diag(nao, nmo, n_alpha, H_core_host, ortho.X.data(), Backend::Host,
+                                  opts.gemm_mode, opts.ozaki_slices, 1.0);
+    auto init_b = solve_fock_diag(nao, nmo, n_beta, H_core_host, ortho.X.data(), Backend::Host,
+                                  opts.gemm_mode, opts.ozaki_slices, 1.0);
+    res.density_alpha = std::move(init_a.dm);
+    res.density_beta = std::move(init_b.dm);
+    if (n_alpha > 0) {
+      slice_cols_host(nao, nmo, n_alpha, init_a.mo_coeff, C_occ_a);
+      has_c_occ_a = true;
+    }
+    if (n_beta > 0) {
+      slice_cols_host(nao, nmo, n_beta, init_b.mo_coeff, C_occ_b);
+      has_c_occ_b = true;
+    }
+  } else {
+    Sp2Options sp2_opts = opts.sp2_options;
+    sp2_opts.gemm_mode = opts.gemm_mode;
+    sp2_opts.ozaki_slices = opts.ozaki_slices;
+    auto init_a = solve_fock_sp2(nao, nmo, n_alpha, H_core_host, ortho.X.data(), Backend::Host,
+                                 sp2_opts, 1.0);
+    auto init_b = solve_fock_sp2(nao, nmo, n_beta, H_core_host, ortho.X.data(), Backend::Host,
+                                 sp2_opts, 1.0);
+    res.density_alpha = std::move(init_a.dm);
+    res.density_beta = std::move(init_b.dm);
+  }
+
+  DiisOptions diis_opts;
+  diis_opts.max_vec = opts.diis_max_vec;
+  diis_opts.n_spin = 2;
+  diis_opts.damping = opts.damping;
+  diis_opts.damping_steps = opts.damping_steps;
+  diis_opts.level_shift = opts.level_shift;
+  diis_opts.use_cuda_graph = false;
+  diis_opts.gemm_mode = opts.gemm_mode;
+  GpuDiis diis(nao, nmo, diis_opts);
+
+  const bool has_uks_mo_jk = static_cast<bool>(callbacks.build_jk_uks_mo);
+  const bool has_uks_jk = static_cast<bool>(callbacks.build_jk_uks) || has_uks_mo_jk;
+  const bool has_mo_jk = static_cast<bool>(callbacks.build_jk_mo);
+  const bool has_jk = static_cast<bool>(callbacks.build_jk) || has_mo_jk;
+  if (!has_uks_jk && !has_jk) {
+    throw std::invalid_argument(
+        "ScfDriver::run (unrestricted): FockCallbacks must provide build_jk_uks or build_jk");
+  }
+  const bool need_k = (opts.exact_exchange_fraction != 0.0);
+  const double eff_diis_tol = std::min(opts.diis_tol, std::max(1e-10, opts.conv_tol * 100.0));
+
+  std::vector<double> Da_ref(n2, 0.0), Db_ref(n2, 0.0);
+  std::vector<double> dDa(n2, 0.0), dDb(n2, 0.0), D_tot(n2, 0.0);
+  std::vector<double> J_acc(n2, 0.0), Ka_acc(n2, 0.0), Kb_acc(n2, 0.0);
+  std::vector<double> dJ(n2, 0.0), dKa(n2, 0.0), dKb(n2, 0.0), dJ_dummy(n2, 0.0);
+  std::vector<double> Vxca(n2, 0.0), Vxcb(n2, 0.0);
+
+  bool in_final_fp64 =
+      !opts.dynamic_precision ||
+      (opts.early_integral_precision == Precision::FP64 && opts.early_gemm_mode == opts.gemm_mode);
+  Precision cur_int_prec = in_final_fp64 ? Precision::FP64 : opts.early_integral_precision;
+  GemmMode cur_gemm = in_final_fp64 ? opts.gemm_mode : opts.early_gemm_mode;
+
+  bool force_full_reset = true;
+  bool verified_full_build = false;
+  int steps_since_reset = 0;
+  double prev_energy = 0.0;
+
+  auto eval_jk_host = [&](const double* da, const double* db, bool is_inc, Precision prec,
+                          double* j_out, double* ka_out, double* kb_out) {
+    const bool allow_mo = !is_inc;
+    const double* ca_ptr = (allow_mo && has_c_occ_a && n_alpha > 0) ? C_occ_a.data() : nullptr;
+    const double* cb_ptr = (allow_mo && has_c_occ_b && n_beta > 0) ? C_occ_b.data() : nullptr;
+    if (has_uks_jk) {
+      if (has_uks_mo_jk) {
+        callbacks.build_jk_uks_mo(da, db, ca_ptr, n_alpha, cb_ptr, n_beta, is_inc, prec, j_out,
+                                  need_k ? ka_out : nullptr, need_k ? kb_out : nullptr, nullptr);
+      } else {
+        callbacks.build_jk_uks(da, db, is_inc, prec, j_out, need_k ? ka_out : nullptr,
+                               need_k ? kb_out : nullptr, nullptr);
+      }
+    } else {
+      for (std::size_t i = 0; i < n2; ++i) D_tot[i] = da[i] + db[i];
+      if (has_mo_jk) {
+        callbacks.build_jk_mo(D_tot.data(), nullptr, -1, is_inc, prec, j_out, nullptr, nullptr);
+      } else {
+        callbacks.build_jk(D_tot.data(), is_inc, prec, j_out, nullptr, nullptr);
+      }
+      if (need_k) {
+        std::fill(dJ_dummy.begin(), dJ_dummy.end(), 0.0);
+        if (has_mo_jk) {
+          callbacks.build_jk_mo(da, ca_ptr, n_alpha, is_inc, prec, dJ_dummy.data(), ka_out, nullptr);
+          std::fill(dJ_dummy.begin(), dJ_dummy.end(), 0.0);
+          callbacks.build_jk_mo(db, cb_ptr, n_beta, is_inc, prec, dJ_dummy.data(), kb_out, nullptr);
+        } else {
+          callbacks.build_jk(da, is_inc, prec, dJ_dummy.data(), ka_out, nullptr);
+          std::fill(dJ_dummy.begin(), dJ_dummy.end(), 0.0);
+          callbacks.build_jk(db, is_inc, prec, dJ_dummy.data(), kb_out, nullptr);
+        }
+      }
+    }
+  };
+
+  for (int iter = 0; iter < opts.max_iter; ++iter) {
+    const bool do_inc = opts.incremental_fock && !force_full_reset && iter > 0 &&
+                        (steps_since_reset < std::max(1, opts.fock_reset_interval));
+
+    if (do_inc) {
+      for (std::size_t i = 0; i < n2; ++i) {
+        dDa[i] = res.density_alpha[i] - Da_ref[i];
+        dDb[i] = res.density_beta[i] - Db_ref[i];
+      }
+      std::fill(dJ.begin(), dJ.end(), 0.0);
+      if (need_k) {
+        std::fill(dKa.begin(), dKa.end(), 0.0);
+        std::fill(dKb.begin(), dKb.end(), 0.0);
+      }
+      eval_jk_host(dDa.data(), dDb.data(), true, cur_int_prec, dJ.data(), dKa.data(), dKb.data());
+      for (std::size_t i = 0; i < n2; ++i) {
+        J_acc[i] += dJ[i];
+        if (need_k) {
+          Ka_acc[i] += dKa[i];
+          Kb_acc[i] += dKb[i];
+        }
+      }
+      Da_ref = res.density_alpha;
+      Db_ref = res.density_beta;
+      steps_since_reset += 1;
+    } else {
+      std::fill(J_acc.begin(), J_acc.end(), 0.0);
+      if (need_k) {
+        std::fill(Ka_acc.begin(), Ka_acc.end(), 0.0);
+        std::fill(Kb_acc.begin(), Kb_acc.end(), 0.0);
+      }
+      eval_jk_host(res.density_alpha.data(), res.density_beta.data(), false, cur_int_prec,
+                   J_acc.data(), Ka_acc.data(), Kb_acc.data());
+      Da_ref = res.density_alpha;
+      Db_ref = res.density_beta;
+      force_full_reset = false;
+      steps_since_reset = 0;
+    }
+
+    double e_xc = 0.0;
+    if (callbacks.build_vxc_uks) {
+      std::fill(Vxca.begin(), Vxca.end(), 0.0);
+      std::fill(Vxcb.begin(), Vxcb.end(), 0.0);
+      e_xc = callbacks.build_vxc_uks(res.density_alpha.data(), res.density_beta.data(), cur_int_prec,
+                                     Vxca.data(), Vxcb.data(), nullptr);
+    }
+
+    for (std::size_t i = 0; i < n2; ++i) {
+      D_tot[i] = res.density_alpha[i] + res.density_beta[i];
+      res.fock_alpha[i] =
+          H_core_host[i] + J_acc[i] - opts.exact_exchange_fraction * Ka_acc[i] + Vxca[i];
+      res.fock_beta[i] =
+          H_core_host[i] + J_acc[i] - opts.exact_exchange_fraction * Kb_acc[i] + Vxcb[i];
+    }
+    symmetrize_host_square(nao, res.fock_alpha);
+    symmetrize_host_square(nao, res.fock_beta);
+
+    const double e_1e = dot_host(n2, D_tot.data(), H_core_host);
+    const double e_2e =
+        0.5 * dot_host(n2, D_tot.data(), J_acc.data()) -
+        0.5 * opts.exact_exchange_fraction *
+            (dot_host(n2, res.density_alpha.data(), Ka_acc.data()) +
+             dot_host(n2, res.density_beta.data(), Kb_acc.data()));
+
+    const double e_elec = e_1e + e_2e + e_xc;
+    const double e_tot = e_nuc + e_elec;
+    const double delta_e = (iter == 0) ? e_tot : (e_tot - prev_energy);
+    prev_energy = e_tot;
+
+    diis.set_gemm_mode(cur_gemm);
+    const DiisHostUksResult diis_res =
+        diis.update_uks(res.fock_alpha.data(), res.fock_beta.data(), res.density_alpha.data(),
+                        res.density_beta.data(), S_host, ortho.X.data(), Backend::Host);
+    const double rms_err = diis_res.info.rms_error;
+
+    res.iterations = iter + 1;
+    res.total_energy = e_tot;
+    res.electronic_energy = e_elec;
+    res.one_electron_energy = e_1e;
+    res.two_electron_energy = e_2e;
+    res.xc_energy = e_xc;
+    res.final_diis_rms = rms_err;
+    res.history.push_back(
+        ScfIterationLog{iter + 1, e_tot, delta_e, rms_err, do_inc, cur_int_prec, cur_gemm});
+
+    if (!in_final_fp64 &&
+        (rms_err < opts.fp64_switch_rms ||
+         (iter > 0 && std::abs(delta_e) < std::max(100.0 * opts.conv_tol, 1e-6)))) {
+      in_final_fp64 = true;
+      if (opts.early_gemm_mode == GemmMode::FP32 ||
+          opts.early_integral_precision != Precision::FP64) {
+        diis.reset();
+      }
+      cur_int_prec = Precision::FP64;
+      cur_gemm = opts.gemm_mode;
+      force_full_reset = true;
+    } else if (iter >= 1 && in_final_fp64 && std::abs(delta_e) < opts.conv_tol &&
+               rms_err < eff_diis_tol) {
+      if (opts.incremental_fock && steps_since_reset >= 4 && !verified_full_build) {
+        force_full_reset = true;
+        verified_full_build = true;
+      } else {
+        res.converged = true;
+        break;
+      }
+    }
+
+    if (opts.solver == DensitySolver::Diag) {
+      auto da = solve_fock_diag(nao, nmo, n_alpha, diis_res.fock_alpha_extrapolated.data(),
+                                ortho.X.data(), Backend::Host, cur_gemm, opts.ozaki_slices, 1.0);
+      auto db = solve_fock_diag(nao, nmo, n_beta, diis_res.fock_beta_extrapolated.data(),
+                                ortho.X.data(), Backend::Host, cur_gemm, opts.ozaki_slices, 1.0);
+      res.density_alpha = std::move(da.dm);
+      res.energy_weighted_dm_alpha = std::move(da.energy_dm);
+      res.mo_energies = std::move(da.mo_energies);
+      res.mo_coefficients = std::move(da.mo_coeff);
+
+      res.density_beta = std::move(db.dm);
+      res.energy_weighted_dm_beta = std::move(db.energy_dm);
+      res.mo_energies_beta = std::move(db.mo_energies);
+      res.mo_coefficients_beta = std::move(db.mo_coeff);
+      if (n_alpha > 0) {
+        slice_cols_host(nao, nmo, n_alpha, res.mo_coefficients, C_occ_a);
+        has_c_occ_a = true;
+      }
+      if (n_beta > 0) {
+        slice_cols_host(nao, nmo, n_beta, res.mo_coefficients_beta, C_occ_b);
+        has_c_occ_b = true;
+      }
+    } else {
+      Sp2Options sp2_opts = opts.sp2_options;
+      sp2_opts.gemm_mode = cur_gemm;
+      sp2_opts.ozaki_slices = opts.ozaki_slices;
+      sp2_opts.use_cuda_graph = false;
+      auto sa = solve_fock_sp2(nao, nmo, n_alpha, diis_res.fock_alpha_extrapolated.data(),
+                               ortho.X.data(), Backend::Host, sp2_opts, 1.0);
+      auto sb = solve_fock_sp2(nao, nmo, n_beta, diis_res.fock_beta_extrapolated.data(),
+                               ortho.X.data(), Backend::Host, sp2_opts, 1.0);
+      res.density_alpha = std::move(sa.dm);
+      res.energy_weighted_dm_alpha = std::move(sa.energy_dm);
+      res.density_beta = std::move(sb.dm);
+      res.energy_weighted_dm_beta = std::move(sb.energy_dm);
+    }
+  }
+
+  if (opts.solver == DensitySolver::Diag) {
+    auto fa = solve_fock_diag(nao, nmo, n_alpha, res.fock_alpha.data(), ortho.X.data(),
+                              Backend::Host, opts.gemm_mode, opts.ozaki_slices, 1.0);
+    auto fb = solve_fock_diag(nao, nmo, n_beta, res.fock_beta.data(), ortho.X.data(),
+                              Backend::Host, opts.gemm_mode, opts.ozaki_slices, 1.0);
+    res.density_alpha = std::move(fa.dm);
+    res.energy_weighted_dm_alpha = std::move(fa.energy_dm);
+    res.mo_energies = std::move(fa.mo_energies);
+    res.mo_coefficients = std::move(fa.mo_coeff);
+
+    res.density_beta = std::move(fb.dm);
+    res.energy_weighted_dm_beta = std::move(fb.energy_dm);
+    res.mo_energies_beta = std::move(fb.mo_energies);
+    res.mo_coefficients_beta = std::move(fb.mo_coeff);
+  } else {
+    std::vector<double> DF(n2, 0.0);
+    gemm(nao, nao, nao, 1.0, res.density_alpha.data(), false, res.fock_alpha.data(), false, 0.0,
+         DF.data(), Backend::Host, opts.gemm_mode, opts.ozaki_slices);
+    gemm(nao, nao, nao, 1.0, DF.data(), false, res.density_alpha.data(), false, 0.0,
+         res.energy_weighted_dm_alpha.data(), Backend::Host, opts.gemm_mode, opts.ozaki_slices);
+    symmetrize_host_square(nao, res.energy_weighted_dm_alpha);
+
+    if (n_beta > 0) {
+      gemm(nao, nao, nao, 1.0, res.density_beta.data(), false, res.fock_beta.data(), false, 0.0,
+           DF.data(), Backend::Host, opts.gemm_mode, opts.ozaki_slices);
+      gemm(nao, nao, nao, 1.0, DF.data(), false, res.density_beta.data(), false, 0.0,
+           res.energy_weighted_dm_beta.data(), Backend::Host, opts.gemm_mode, opts.ozaki_slices);
+      symmetrize_host_square(nao, res.energy_weighted_dm_beta);
+    } else {
+      std::fill(res.energy_weighted_dm_beta.begin(), res.energy_weighted_dm_beta.end(), 0.0);
+    }
+
+    auto fa = solve_fock_diag(nao, nmo, n_alpha, res.fock_alpha.data(), ortho.X.data(),
+                              Backend::Host, opts.gemm_mode, opts.ozaki_slices, 1.0);
+    auto fb = solve_fock_diag(nao, nmo, n_beta, res.fock_beta.data(), ortho.X.data(),
+                              Backend::Host, opts.gemm_mode, opts.ozaki_slices, 1.0);
+    res.mo_energies = std::move(fa.mo_energies);
+    res.mo_coefficients = std::move(fa.mo_coeff);
+    res.mo_energies_beta = std::move(fb.mo_energies);
+    res.mo_coefficients_beta = std::move(fb.mo_coeff);
+  }
+
+  for (std::size_t i = 0; i < n2; ++i) {
+    res.density_matrix[i] = res.density_alpha[i] + res.density_beta[i];
+    res.energy_weighted_dm[i] = res.energy_weighted_dm_alpha[i] + res.energy_weighted_dm_beta[i];
+  }
+  res.fock_matrix = res.fock_alpha;
+
+  compute_s2_and_multiplicity(nao, n_alpha, n_beta, res.density_alpha.data(),
+                              res.density_beta.data(), S_host, res.s2, res.multiplicity);
+  return res;
+}
+
+#if defined(GPU4DFT_HAVE_CUDA)
+ScfResult run_scf_cuda_uks(const ScfOptions& opts, DeviceMemoryPool& pool, int nao, int n_alpha,
+                           int n_beta, double e_nuc, const double* S_host,
+                           const double* H_core_host, const FockCallbacks& callbacks,
+                           const double* initial_dm_alpha_host,
+                           const double* initial_dm_beta_host) {
+  const bool has_uks_mo_jk = static_cast<bool>(callbacks.build_jk_uks_mo);
+  const bool has_uks_jk = static_cast<bool>(callbacks.build_jk_uks) || has_uks_mo_jk;
+  const bool has_mo_jk = static_cast<bool>(callbacks.build_jk_mo);
+  const bool has_jk = static_cast<bool>(callbacks.build_jk) || has_mo_jk;
+  if (!has_uks_jk && !has_jk) {
+    throw std::invalid_argument(
+        "ScfDriver::run (unrestricted): FockCallbacks must provide build_jk_uks or build_jk");
+  }
+
+  GpuLinalgContext ctx(&pool);
+  StreamHandle scf_stream = ctx.graph_executor().stream();
+
+  const CanonicalOrthoResult ortho =
+      canonical_orthogonalization(nao, S_host, opts.lindep_tol, Backend::Cuda);
+  const int nmo = ortho.nmo;
+  if (n_alpha > nmo || n_beta > nmo) {
+    throw std::invalid_argument(
+        "ScfDriver::run: n_alpha/n_beta exceeds linearly independent basis size nmo");
+  }
+
+  const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+  const std::size_t nm = static_cast<std::size_t>(nao) * nmo;
+  const std::size_t m2 = static_cast<std::size_t>(nmo) * nmo;
+  const bool need_k = (opts.exact_exchange_fraction != 0.0);
+  const double eff_diis_tol = std::min(opts.diis_tol, std::max(1e-10, opts.conv_tol * 100.0));
+
+  PooledBuffer<double> d_S(pool, n2, scf_stream);
+  PooledBuffer<double> d_H(pool, n2, scf_stream);
+  PooledBuffer<double> d_X(pool, nm, scf_stream);
+  PooledBuffer<double> d_Da(pool, n2, scf_stream);
+  PooledBuffer<double> d_Db(pool, n2, scf_stream);
+  PooledBuffer<double> d_Da_ref(pool, n2, scf_stream);
+  PooledBuffer<double> d_Db_ref(pool, n2, scf_stream);
+  PooledBuffer<double> d_delta_Da(pool, n2, scf_stream);
+  PooledBuffer<double> d_delta_Db(pool, n2, scf_stream);
+  PooledBuffer<double> d_D_tot(pool, n2, scf_stream);
+  PooledBuffer<double> d_J(pool, n2, scf_stream);
+  PooledBuffer<double> d_dJ(pool, n2, scf_stream);
+  PooledBuffer<double> d_Ka(pool, n2, scf_stream);
+  PooledBuffer<double> d_Kb(pool, n2, scf_stream);
+  PooledBuffer<double> d_dKa(pool, n2, scf_stream);
+  PooledBuffer<double> d_dKb(pool, n2, scf_stream);
+  PooledBuffer<double> d_J_scratch(pool, n2, scf_stream);
+  PooledBuffer<double> d_Vxca(pool, n2, scf_stream);
+  PooledBuffer<double> d_Vxcb(pool, n2, scf_stream);
+  PooledBuffer<double> d_Fa(pool, n2, scf_stream);
+  PooledBuffer<double> d_Fb(pool, n2, scf_stream);
+  PooledBuffer<double> d_Fa_extrap(pool, n2, scf_stream);
+  PooledBuffer<double> d_Fb_extrap(pool, n2, scf_stream);
+  PooledBuffer<double> d_Ca(pool, nm, scf_stream);
+  PooledBuffer<double> d_Cb(pool, nm, scf_stream);
+  PooledBuffer<double> d_Ca_occ(pool, static_cast<std::size_t>(nao) * std::max(0, n_alpha),
+                                scf_stream);
+  PooledBuffer<double> d_Cb_occ(pool, static_cast<std::size_t>(nao) * std::max(0, n_beta),
+                                scf_stream);
+  PooledBuffer<double> d_epsa(pool, static_cast<std::size_t>(nmo), scf_stream);
+  PooledBuffer<double> d_epsb(pool, static_cast<std::size_t>(nmo), scf_stream);
+  PooledBuffer<double> d_Wa(pool, n2, scf_stream);
+  PooledBuffer<double> d_Wb(pool, n2, scf_stream);
+  PooledBuffer<double> d_P_sp2(pool, m2, scf_stream);
+  PooledBuffer<double> d_traces4(pool, 4, scf_stream);
+
+  copy_h2d_async(d_S.data(), S_host, n2 * sizeof(double), scf_stream);
+  copy_h2d_async(d_H.data(), H_core_host, n2 * sizeof(double), scf_stream);
+  copy_h2d_async(d_X.data(), ortho.X.data(), nm * sizeof(double), scf_stream);
+  memset_zero_async(d_J.data(), n2 * sizeof(double), scf_stream);
+  memset_zero_async(d_Ka.data(), n2 * sizeof(double), scf_stream);
+  memset_zero_async(d_Kb.data(), n2 * sizeof(double), scf_stream);
+  memset_zero_async(d_Vxca.data(), n2 * sizeof(double), scf_stream);
+  memset_zero_async(d_Vxcb.data(), n2 * sizeof(double), scf_stream);
+
+  bool has_c_occ_a = false;
+  bool has_c_occ_b = false;
+  if (initial_dm_alpha_host != nullptr && initial_dm_beta_host != nullptr) {
+    copy_h2d_async(d_Da.data(), initial_dm_alpha_host, n2 * sizeof(double), scf_stream);
+    copy_h2d_async(d_Db.data(), initial_dm_beta_host, n2 * sizeof(double), scf_stream);
+  } else if (opts.solver == DensitySolver::Diag) {
+    solve_fock_diag_device(ctx, nao, nmo, n_alpha, d_H.data(), d_X.data(), d_epsa.data(),
+                           d_Ca.data(), d_Da.data(), nullptr, opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    solve_fock_diag_device(ctx, nao, nmo, n_beta, d_H.data(), d_X.data(), d_epsb.data(),
+                           d_Cb.data(), d_Db.data(), nullptr, opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    if (n_alpha > 0) {
+      slice_cols_device(nao, nmo, n_alpha, d_Ca.data(), d_Ca_occ.data(), scf_stream);
+      has_c_occ_a = true;
+    }
+    if (n_beta > 0) {
+      slice_cols_device(nao, nmo, n_beta, d_Cb.data(), d_Cb_occ.data(), scf_stream);
+      has_c_occ_b = true;
+    }
+  } else {
+    Sp2Options sp2_init = opts.sp2_options;
+    sp2_init.gemm_mode = opts.gemm_mode;
+    sp2_init.ozaki_slices = opts.ozaki_slices;
+    sp2_init.use_cuda_graph = opts.use_cuda_graphs;
+    (void)solve_fock_sp2_device(ctx, nao, nmo, n_alpha, d_H.data(), d_X.data(), d_P_sp2.data(),
+                                d_Da.data(), nullptr, sp2_init, scf_stream, 1.0);
+    (void)solve_fock_sp2_device(ctx, nao, nmo, n_beta, d_H.data(), d_X.data(), d_P_sp2.data(),
+                                d_Db.data(), nullptr, sp2_init, scf_stream, 1.0);
+  }
+
+  DiisOptions diis_opts;
+  diis_opts.max_vec = opts.diis_max_vec;
+  diis_opts.n_spin = 2;
+  diis_opts.damping = opts.damping;
+  diis_opts.damping_steps = opts.damping_steps;
+  diis_opts.level_shift = opts.level_shift;
+  diis_opts.use_cuda_graph = opts.use_cuda_graphs;
+  diis_opts.gemm_mode = opts.gemm_mode;
+  GpuDiis diis(nao, nmo, diis_opts, &pool);
+
+  std::vector<double> h_stage_da, h_stage_db, h_stage_dtot;
+  std::vector<double> h_stage_vj, h_stage_vka, h_stage_vkb;
+  std::vector<double> h_stage_vxca, h_stage_vxcb;
+  if (!callbacks.device_resident) {
+    h_stage_da.resize(n2, 0.0);
+    h_stage_db.resize(n2, 0.0);
+    h_stage_dtot.resize(n2, 0.0);
+    h_stage_vj.resize(n2, 0.0);
+    if (need_k) {
+      h_stage_vka.resize(n2, 0.0);
+      h_stage_vkb.resize(n2, 0.0);
+    }
+  }
+  if (callbacks.build_vxc_uks && !callbacks.vxc_device_resident) {
+    if (h_stage_da.empty()) h_stage_da.resize(n2, 0.0);
+    if (h_stage_db.empty()) h_stage_db.resize(n2, 0.0);
+    h_stage_vxca.resize(n2, 0.0);
+    h_stage_vxcb.resize(n2, 0.0);
+  }
+
+  bool in_final_fp64 =
+      !opts.dynamic_precision ||
+      (opts.early_integral_precision == Precision::FP64 && opts.early_gemm_mode == opts.gemm_mode);
+  Precision cur_int_prec = in_final_fp64 ? Precision::FP64 : opts.early_integral_precision;
+  GemmMode cur_gemm = in_final_fp64 ? opts.gemm_mode : opts.early_gemm_mode;
+
+  bool force_full_reset = true;
+  bool verified_full_build = false;
+  int steps_since_reset = 0;
+  double prev_energy = 0.0;
+
+  ScfResult res;
+  res.nao = nao;
+  res.nmo = nmo;
+  res.unrestricted = true;
+  res.n_alpha = n_alpha;
+  res.n_beta = n_beta;
+  res.nuclear_repulsion = e_nuc;
+  res.mo_occ_alpha.assign(static_cast<std::size_t>(nmo), 0.0);
+  res.mo_occ_beta.assign(static_cast<std::size_t>(nmo), 0.0);
+  for (int i = 0; i < n_alpha; ++i) res.mo_occ_alpha[static_cast<std::size_t>(i)] = 1.0;
+  for (int i = 0; i < n_beta; ++i) res.mo_occ_beta[static_cast<std::size_t>(i)] = 1.0;
+
+  std::size_t allocs_after_warmup_baseline = 0;
+  bool baseline_recorded = false;
+
+  for (int iter = 0; iter < opts.max_iter; ++iter) {
+    const bool do_inc = opts.incremental_fock && !force_full_reset && iter > 0 &&
+                        (steps_since_reset < std::max(1, opts.fock_reset_interval));
+
+    const double* d_jka_in = d_Da.data();
+    const double* d_jkb_in = d_Db.data();
+    if (do_inc) {
+      compute_delta_and_norm_device(n2, d_Da.data(), d_Da_ref.data(), d_delta_Da.data(), nullptr,
+                                    scf_stream);
+      compute_delta_and_norm_device(n2, d_Db.data(), d_Db_ref.data(), d_delta_Db.data(), nullptr,
+                                    scf_stream);
+      d_jka_in = d_delta_Da.data();
+      d_jkb_in = d_delta_Db.data();
+    }
+
+    if (callbacks.device_resident) {
+      double* target_j = do_inc ? d_dJ.data() : d_J.data();
+      double* target_ka = do_inc ? d_dKa.data() : d_Ka.data();
+      double* target_kb = do_inc ? d_dKb.data() : d_Kb.data();
+      memset_zero_async(target_j, n2 * sizeof(double), scf_stream);
+      if (need_k) {
+        memset_zero_async(target_ka, n2 * sizeof(double), scf_stream);
+        memset_zero_async(target_kb, n2 * sizeof(double), scf_stream);
+      }
+      if (has_uks_jk) {
+        if (has_uks_mo_jk) {
+          const double* ca_ptr = (!do_inc && has_c_occ_a && n_alpha > 0) ? d_Ca_occ.data() : nullptr;
+          const double* cb_ptr = (!do_inc && has_c_occ_b && n_beta > 0) ? d_Cb_occ.data() : nullptr;
+          callbacks.build_jk_uks_mo(d_jka_in, d_jkb_in, ca_ptr, n_alpha, cb_ptr, n_beta, do_inc,
+                                    cur_int_prec, target_j, need_k ? target_ka : nullptr,
+                                    need_k ? target_kb : nullptr, scf_stream);
+        } else {
+          callbacks.build_jk_uks(d_jka_in, d_jkb_in, do_inc, cur_int_prec, target_j,
+                                 need_k ? target_ka : nullptr, need_k ? target_kb : nullptr,
+                                 scf_stream);
+        }
+      } else {
+        copy_d2d_async(d_D_tot.data(), d_jka_in, n2 * sizeof(double), scf_stream);
+        axpby_device(n2, 1.0, d_jkb_in, 1.0, d_D_tot.data(), scf_stream);
+        if (has_mo_jk) {
+          callbacks.build_jk_mo(d_D_tot.data(), nullptr, -1, do_inc, cur_int_prec, target_j,
+                                nullptr, scf_stream);
+        } else {
+          callbacks.build_jk(d_D_tot.data(), do_inc, cur_int_prec, target_j, nullptr, scf_stream);
+        }
+        if (need_k) {
+          memset_zero_async(d_J_scratch.data(), n2 * sizeof(double), scf_stream);
+          if (has_mo_jk) {
+            const double* ca_ptr =
+                (!do_inc && has_c_occ_a && n_alpha > 0) ? d_Ca_occ.data() : nullptr;
+            const double* cb_ptr =
+                (!do_inc && has_c_occ_b && n_beta > 0) ? d_Cb_occ.data() : nullptr;
+            callbacks.build_jk_mo(d_jka_in, ca_ptr, n_alpha, do_inc, cur_int_prec,
+                                  d_J_scratch.data(), target_ka, scf_stream);
+            memset_zero_async(d_J_scratch.data(), n2 * sizeof(double), scf_stream);
+            callbacks.build_jk_mo(d_jkb_in, cb_ptr, n_beta, do_inc, cur_int_prec,
+                                  d_J_scratch.data(), target_kb, scf_stream);
+          } else {
+            callbacks.build_jk(d_jka_in, do_inc, cur_int_prec, d_J_scratch.data(), target_ka,
+                               scf_stream);
+            memset_zero_async(d_J_scratch.data(), n2 * sizeof(double), scf_stream);
+            callbacks.build_jk(d_jkb_in, do_inc, cur_int_prec, d_J_scratch.data(), target_kb,
+                               scf_stream);
+          }
+        }
+      }
+      if (do_inc) {
+        axpby_device(n2, 1.0, d_dJ.data(), 1.0, d_J.data(), scf_stream);
+        if (need_k) {
+          axpby_device(n2, 1.0, d_dKa.data(), 1.0, d_Ka.data(), scf_stream);
+          axpby_device(n2, 1.0, d_dKb.data(), 1.0, d_Kb.data(), scf_stream);
+        }
+      }
+    } else {
+      copy_d2h_async(h_stage_da.data(), d_jka_in, n2 * sizeof(double), scf_stream);
+      copy_d2h_async(h_stage_db.data(), d_jkb_in, n2 * sizeof(double), scf_stream);
+      synchronize_stream(scf_stream);
+      std::fill(h_stage_vj.begin(), h_stage_vj.end(), 0.0);
+      if (need_k) {
+        std::fill(h_stage_vka.begin(), h_stage_vka.end(), 0.0);
+        std::fill(h_stage_vkb.begin(), h_stage_vkb.end(), 0.0);
+      }
+      if (has_uks_jk) {
+        if (has_uks_mo_jk) {
+          std::vector<double> h_ca, h_cb;
+          const double* ca_ptr = nullptr;
+          const double* cb_ptr = nullptr;
+          if (!do_inc && has_c_occ_a && n_alpha > 0) {
+            h_ca.resize(static_cast<std::size_t>(nao) * n_alpha);
+            copy_d2h_async(h_ca.data(), d_Ca_occ.data(), h_ca.size() * sizeof(double), scf_stream);
+            ca_ptr = h_ca.data();
+          }
+          if (!do_inc && has_c_occ_b && n_beta > 0) {
+            h_cb.resize(static_cast<std::size_t>(nao) * n_beta);
+            copy_d2h_async(h_cb.data(), d_Cb_occ.data(), h_cb.size() * sizeof(double), scf_stream);
+            cb_ptr = h_cb.data();
+          }
+          if (ca_ptr != nullptr || cb_ptr != nullptr) synchronize_stream(scf_stream);
+          callbacks.build_jk_uks_mo(h_stage_da.data(), h_stage_db.data(), ca_ptr, n_alpha, cb_ptr,
+                                    n_beta, do_inc, cur_int_prec, h_stage_vj.data(),
+                                    need_k ? h_stage_vka.data() : nullptr,
+                                    need_k ? h_stage_vkb.data() : nullptr, nullptr);
+        } else {
+          callbacks.build_jk_uks(h_stage_da.data(), h_stage_db.data(), do_inc, cur_int_prec,
+                                 h_stage_vj.data(), need_k ? h_stage_vka.data() : nullptr,
+                                 need_k ? h_stage_vkb.data() : nullptr, nullptr);
+        }
+      } else {
+        for (std::size_t i = 0; i < n2; ++i) h_stage_dtot[i] = h_stage_da[i] + h_stage_db[i];
+        if (has_mo_jk) {
+          callbacks.build_jk_mo(h_stage_dtot.data(), nullptr, -1, do_inc, cur_int_prec,
+                                h_stage_vj.data(), nullptr, nullptr);
+        } else {
+          callbacks.build_jk(h_stage_dtot.data(), do_inc, cur_int_prec, h_stage_vj.data(), nullptr,
+                             nullptr);
+        }
+        if (need_k) {
+          std::vector<double> h_j_dummy(n2, 0.0);
+          if (has_mo_jk) {
+            std::vector<double> h_ca, h_cb;
+            const double* ca_ptr = nullptr;
+            const double* cb_ptr = nullptr;
+            if (!do_inc && has_c_occ_a && n_alpha > 0) {
+              h_ca.resize(static_cast<std::size_t>(nao) * n_alpha);
+              copy_d2h_async(h_ca.data(), d_Ca_occ.data(), h_ca.size() * sizeof(double),
+                             scf_stream);
+              ca_ptr = h_ca.data();
+            }
+            if (!do_inc && has_c_occ_b && n_beta > 0) {
+              h_cb.resize(static_cast<std::size_t>(nao) * n_beta);
+              copy_d2h_async(h_cb.data(), d_Cb_occ.data(), h_cb.size() * sizeof(double),
+                             scf_stream);
+              cb_ptr = h_cb.data();
+            }
+            if (ca_ptr != nullptr || cb_ptr != nullptr) synchronize_stream(scf_stream);
+            callbacks.build_jk_mo(h_stage_da.data(), ca_ptr, n_alpha, do_inc, cur_int_prec,
+                                  h_j_dummy.data(), h_stage_vka.data(), nullptr);
+            std::fill(h_j_dummy.begin(), h_j_dummy.end(), 0.0);
+            callbacks.build_jk_mo(h_stage_db.data(), cb_ptr, n_beta, do_inc, cur_int_prec,
+                                  h_j_dummy.data(), h_stage_vkb.data(), nullptr);
+          } else {
+            callbacks.build_jk(h_stage_da.data(), do_inc, cur_int_prec, h_j_dummy.data(),
+                               h_stage_vka.data(), nullptr);
+            std::fill(h_j_dummy.begin(), h_j_dummy.end(), 0.0);
+            callbacks.build_jk(h_stage_db.data(), do_inc, cur_int_prec, h_j_dummy.data(),
+                               h_stage_vkb.data(), nullptr);
+          }
+        }
+      }
+      if (do_inc) {
+        copy_h2d_async(d_dJ.data(), h_stage_vj.data(), n2 * sizeof(double), scf_stream);
+        axpby_device(n2, 1.0, d_dJ.data(), 1.0, d_J.data(), scf_stream);
+        if (need_k) {
+          copy_h2d_async(d_dKa.data(), h_stage_vka.data(), n2 * sizeof(double), scf_stream);
+          axpby_device(n2, 1.0, d_dKa.data(), 1.0, d_Ka.data(), scf_stream);
+          copy_h2d_async(d_dKb.data(), h_stage_vkb.data(), n2 * sizeof(double), scf_stream);
+          axpby_device(n2, 1.0, d_dKb.data(), 1.0, d_Kb.data(), scf_stream);
+        }
+      } else {
+        copy_h2d_async(d_J.data(), h_stage_vj.data(), n2 * sizeof(double), scf_stream);
+        if (need_k) {
+          copy_h2d_async(d_Ka.data(), h_stage_vka.data(), n2 * sizeof(double), scf_stream);
+          copy_h2d_async(d_Kb.data(), h_stage_vkb.data(), n2 * sizeof(double), scf_stream);
+        }
+      }
+    }
+
+    copy_d2d_async(d_Da_ref.data(), d_Da.data(), n2 * sizeof(double), scf_stream);
+    copy_d2d_async(d_Db_ref.data(), d_Db.data(), n2 * sizeof(double), scf_stream);
+    if (do_inc) {
+      steps_since_reset += 1;
+    } else {
+      force_full_reset = false;
+      steps_since_reset = 0;
+    }
+
+    double e_xc = 0.0;
+    if (callbacks.build_vxc_uks) {
+      if (callbacks.vxc_device_resident) {
+        memset_zero_async(d_Vxca.data(), n2 * sizeof(double), scf_stream);
+        memset_zero_async(d_Vxcb.data(), n2 * sizeof(double), scf_stream);
+        e_xc = callbacks.build_vxc_uks(d_Da.data(), d_Db.data(), cur_int_prec, d_Vxca.data(),
+                                       d_Vxcb.data(), scf_stream);
+      } else {
+        copy_d2h_async(h_stage_da.data(), d_Da.data(), n2 * sizeof(double), scf_stream);
+        copy_d2h_async(h_stage_db.data(), d_Db.data(), n2 * sizeof(double), scf_stream);
+        synchronize_stream(scf_stream);
+        std::fill(h_stage_vxca.begin(), h_stage_vxca.end(), 0.0);
+        std::fill(h_stage_vxcb.begin(), h_stage_vxcb.end(), 0.0);
+        e_xc = callbacks.build_vxc_uks(h_stage_da.data(), h_stage_db.data(), cur_int_prec,
+                                       h_stage_vxca.data(), h_stage_vxcb.data(), nullptr);
+        copy_h2d_async(d_Vxca.data(), h_stage_vxca.data(), n2 * sizeof(double), scf_stream);
+        copy_h2d_async(d_Vxcb.data(), h_stage_vxcb.data(), n2 * sizeof(double), scf_stream);
+      }
+    }
+
+    assemble_fock_and_traces_uks_device(
+        nao, d_Da.data(), d_Db.data(), d_H.data(), d_J.data(), need_k ? d_Ka.data() : nullptr,
+        need_k ? d_Kb.data() : nullptr, opts.exact_exchange_fraction,
+        callbacks.build_vxc_uks ? d_Vxca.data() : nullptr,
+        callbacks.build_vxc_uks ? d_Vxcb.data() : nullptr, d_Fa.data(), d_Fb.data(),
+        d_traces4.data(), scf_stream);
+    symmetrize_matrix_device(nao, d_Fa.data(), scf_stream);
+    symmetrize_matrix_device(nao, d_Fb.data(), scf_stream);
+
+    double h_traces[4] = {0.0, 0.0, 0.0, 0.0};
+    copy_d2h_async(h_traces, d_traces4.data(), 4 * sizeof(double), scf_stream);
+    synchronize_stream(scf_stream);
+
+    const double e_1e = h_traces[0];
+    const double e_2e =
+        0.5 * h_traces[1] - 0.5 * opts.exact_exchange_fraction * (h_traces[2] + h_traces[3]);
+    const double e_elec = e_1e + e_2e + e_xc;
+    const double e_tot = e_nuc + e_elec;
+    const double delta_e = (iter == 0) ? e_tot : (e_tot - prev_energy);
+    prev_energy = e_tot;
+
+    diis.set_gemm_mode(cur_gemm);
+    const DiisStepInfo diis_info = diis.update_device_uks(
+        ctx, d_Fa.data(), d_Fb.data(), d_Da.data(), d_Db.data(), d_S.data(), d_X.data(),
+        d_Fa_extrap.data(), d_Fb_extrap.data(), scf_stream);
+    const double rms_err = diis_info.rms_error;
+
+    res.iterations = iter + 1;
+    res.total_energy = e_tot;
+    res.electronic_energy = e_elec;
+    res.one_electron_energy = e_1e;
+    res.two_electron_energy = e_2e;
+    res.xc_energy = e_xc;
+    res.final_diis_rms = rms_err;
+    res.history.push_back(
+        ScfIterationLog{iter + 1, e_tot, delta_e, rms_err, do_inc, cur_int_prec, cur_gemm});
+
+    bool promoted_this_step = false;
+    if (!in_final_fp64 &&
+        (rms_err < opts.fp64_switch_rms ||
+         (iter > 0 && std::abs(delta_e) < std::max(100.0 * opts.conv_tol, 1e-6)))) {
+      in_final_fp64 = true;
+      promoted_this_step = true;
+      if (opts.early_gemm_mode == GemmMode::FP32 ||
+          opts.early_integral_precision != Precision::FP64) {
+        diis.reset(scf_stream);
+      }
+      cur_int_prec = Precision::FP64;
+      cur_gemm = opts.gemm_mode;
+      force_full_reset = true;
+      baseline_recorded = false;
+    } else if (iter >= 1 && in_final_fp64 && std::abs(delta_e) < opts.conv_tol &&
+               rms_err < eff_diis_tol) {
+      if (opts.incremental_fock && steps_since_reset >= 4 && !verified_full_build) {
+        force_full_reset = true;
+        verified_full_build = true;
+      } else {
+        res.converged = true;
+        break;
+      }
+    }
+
+    const GemmMode step_gemm = promoted_this_step ? opts.gemm_mode : cur_gemm;
+    if (opts.solver == DensitySolver::Diag) {
+      solve_fock_diag_device(ctx, nao, nmo, n_alpha, d_Fa_extrap.data(), d_X.data(), d_epsa.data(),
+                             d_Ca.data(), d_Da.data(), nullptr, step_gemm, scf_stream,
+                             opts.ozaki_slices, 1.0);
+      solve_fock_diag_device(ctx, nao, nmo, n_beta, d_Fb_extrap.data(), d_X.data(), d_epsb.data(),
+                             d_Cb.data(), d_Db.data(), nullptr, step_gemm, scf_stream,
+                             opts.ozaki_slices, 1.0);
+      if (n_alpha > 0) {
+        slice_cols_device(nao, nmo, n_alpha, d_Ca.data(), d_Ca_occ.data(), scf_stream);
+        has_c_occ_a = true;
+      }
+      if (n_beta > 0) {
+        slice_cols_device(nao, nmo, n_beta, d_Cb.data(), d_Cb_occ.data(), scf_stream);
+        has_c_occ_b = true;
+      }
+    } else {
+      Sp2Options sp2_opts = opts.sp2_options;
+      sp2_opts.gemm_mode = step_gemm;
+      sp2_opts.ozaki_slices = opts.ozaki_slices;
+      sp2_opts.use_cuda_graph = opts.use_cuda_graphs;
+      (void)solve_fock_sp2_device(ctx, nao, nmo, n_alpha, d_Fa_extrap.data(), d_X.data(),
+                                  d_P_sp2.data(), d_Da.data(), nullptr, sp2_opts, scf_stream, 1.0);
+      (void)solve_fock_sp2_device(ctx, nao, nmo, n_beta, d_Fb_extrap.data(), d_X.data(),
+                                  d_P_sp2.data(), d_Db.data(), nullptr, sp2_opts, scf_stream, 1.0);
+    }
+
+    if (!baseline_recorded && iter >= 1 && !promoted_this_step) {
+      synchronize_stream(scf_stream);
+      allocs_after_warmup_baseline = pool.stats().async_allocations;
+      baseline_recorded = true;
+    }
+  }
+
+  synchronize_stream(scf_stream);
+  if (baseline_recorded) {
+    const std::size_t post_loop_allocs = pool.stats().async_allocations;
+    res.steady_state_allocations =
+        (post_loop_allocs >= allocs_after_warmup_baseline)
+            ? (post_loop_allocs - allocs_after_warmup_baseline)
+            : 0;
+  }
+
+  if (opts.solver == DensitySolver::Diag) {
+    solve_fock_diag_device(ctx, nao, nmo, n_alpha, d_Fa.data(), d_X.data(), d_epsa.data(),
+                           d_Ca.data(), d_Da.data(), d_Wa.data(), opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    solve_fock_diag_device(ctx, nao, nmo, n_beta, d_Fb.data(), d_X.data(), d_epsb.data(),
+                           d_Cb.data(), d_Db.data(), d_Wb.data(), opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    res.mo_energies.resize(static_cast<std::size_t>(nmo), 0.0);
+    res.mo_coefficients.resize(nm, 0.0);
+    res.mo_energies_beta.resize(static_cast<std::size_t>(nmo), 0.0);
+    res.mo_coefficients_beta.resize(nm, 0.0);
+    copy_d2h_async(res.mo_energies.data(), d_epsa.data(),
+                   static_cast<std::size_t>(nmo) * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_coefficients.data(), d_Ca.data(), nm * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_energies_beta.data(), d_epsb.data(),
+                   static_cast<std::size_t>(nmo) * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_coefficients_beta.data(), d_Cb.data(), nm * sizeof(double), scf_stream);
+  } else {
+    PooledBuffer<double> d_DF(pool, n2, scf_stream);
+    gemm_device(ctx, nao, nao, nao, 1.0, d_Da.data(), nao, false, d_Fa.data(), nao, false, 0.0,
+                d_DF.data(), nao, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+    gemm_device(ctx, nao, nao, nao, 1.0, d_DF.data(), nao, false, d_Da.data(), nao, false, 0.0,
+                d_Wa.data(), nao, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+    symmetrize_matrix_device(nao, d_Wa.data(), scf_stream);
+
+    if (n_beta > 0) {
+      gemm_device(ctx, nao, nao, nao, 1.0, d_Db.data(), nao, false, d_Fb.data(), nao, false, 0.0,
+                  d_DF.data(), nao, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+      gemm_device(ctx, nao, nao, nao, 1.0, d_DF.data(), nao, false, d_Db.data(), nao, false, 0.0,
+                  d_Wb.data(), nao, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+      symmetrize_matrix_device(nao, d_Wb.data(), scf_stream);
+    } else {
+      memset_zero_async(d_Wb.data(), n2 * sizeof(double), scf_stream);
+    }
+
+    solve_fock_diag_device(ctx, nao, nmo, n_alpha, d_Fa.data(), d_X.data(), d_epsa.data(),
+                           d_Ca.data(), d_DF.data(), nullptr, opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    solve_fock_diag_device(ctx, nao, nmo, n_beta, d_Fb.data(), d_X.data(), d_epsb.data(),
+                           d_Cb.data(), d_DF.data(), nullptr, opts.gemm_mode, scf_stream,
+                           opts.ozaki_slices, 1.0);
+    res.mo_energies.resize(static_cast<std::size_t>(nmo), 0.0);
+    res.mo_coefficients.resize(nm, 0.0);
+    res.mo_energies_beta.resize(static_cast<std::size_t>(nmo), 0.0);
+    res.mo_coefficients_beta.resize(nm, 0.0);
+    copy_d2h_async(res.mo_energies.data(), d_epsa.data(),
+                   static_cast<std::size_t>(nmo) * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_coefficients.data(), d_Ca.data(), nm * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_energies_beta.data(), d_epsb.data(),
+                   static_cast<std::size_t>(nmo) * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_coefficients_beta.data(), d_Cb.data(), nm * sizeof(double), scf_stream);
+  }
+
+  res.density_alpha.resize(n2, 0.0);
+  res.density_beta.resize(n2, 0.0);
+  res.energy_weighted_dm_alpha.resize(n2, 0.0);
+  res.energy_weighted_dm_beta.resize(n2, 0.0);
+  res.fock_alpha.resize(n2, 0.0);
+  res.fock_beta.resize(n2, 0.0);
+  copy_d2h_async(res.density_alpha.data(), d_Da.data(), n2 * sizeof(double), scf_stream);
+  copy_d2h_async(res.density_beta.data(), d_Db.data(), n2 * sizeof(double), scf_stream);
+  copy_d2h_async(res.energy_weighted_dm_alpha.data(), d_Wa.data(), n2 * sizeof(double), scf_stream);
+  copy_d2h_async(res.energy_weighted_dm_beta.data(), d_Wb.data(), n2 * sizeof(double), scf_stream);
+  copy_d2h_async(res.fock_alpha.data(), d_Fa.data(), n2 * sizeof(double), scf_stream);
+  copy_d2h_async(res.fock_beta.data(), d_Fb.data(), n2 * sizeof(double), scf_stream);
+  synchronize_stream(scf_stream);
+
+  res.density_matrix.resize(n2, 0.0);
+  res.energy_weighted_dm.resize(n2, 0.0);
+  for (std::size_t i = 0; i < n2; ++i) {
+    res.density_matrix[i] = res.density_alpha[i] + res.density_beta[i];
+    res.energy_weighted_dm[i] = res.energy_weighted_dm_alpha[i] + res.energy_weighted_dm_beta[i];
+  }
+  res.fock_matrix = res.fock_alpha;
+
+  compute_s2_and_multiplicity(nao, n_alpha, n_beta, res.density_alpha.data(),
+                              res.density_beta.data(), S_host, res.s2, res.multiplicity);
+
+  res.cuda_graph_captures = ctx.graph_executor().capture_count();
+  res.cuda_graph_replays = ctx.graph_executor().replay_count();
+  res.pool_cache_hits = pool.stats().cache_hits;
+  return res;
+}
+#endif
 
 }  // namespace
 
@@ -276,11 +1236,32 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
                          const double* H_core_host, const FockCallbacks& callbacks,
                          const double* initial_dm_host) {
   if (nao <= 0) throw std::invalid_argument("ScfDriver::run: nao must be positive");
+  const ScfOptions& opts = impl_->opts;
+  if (opts.unrestricted) {
+    int n_alpha = 0, n_beta = 0;
+    validate_unrestricted_counts(n_elec, opts.spin, n_alpha, n_beta);
+    if (initial_dm_host == nullptr) {
+      return run(nao, n_elec, e_nuc, S_host, H_core_host, callbacks, nullptr, nullptr);
+    }
+    const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+    std::vector<double> dm_a(n2, 0.0), dm_b(n2, 0.0);
+    if (n_elec > 0) {
+      const double fa = static_cast<double>(n_alpha) / static_cast<double>(n_elec);
+      const double fb = static_cast<double>(n_beta) / static_cast<double>(n_elec);
+      for (std::size_t i = 0; i < n2; ++i) {
+        dm_a[i] = fa * initial_dm_host[i];
+        dm_b[i] = fb * initial_dm_host[i];
+      }
+    }
+    return run(nao, n_elec, e_nuc, S_host, H_core_host, callbacks, dm_a.data(), dm_b.data());
+  }
+  if (opts.spin != 0) {
+    throw std::invalid_argument("ScfDriver::run: restricted SCF requires spin == 0");
+  }
   if (n_elec < 0 || (n_elec % 2) != 0) {
     throw std::invalid_argument("ScfDriver::run: closed-shell n_elec must be non-negative and even");
   }
   const int n_occ = n_elec / 2;
-  const ScfOptions& opts = impl_->opts;
 
   if (opts.backend == Backend::Host) {
     return run_scf_host(opts, nao, n_occ, e_nuc, S_host, H_core_host, callbacks, initial_dm_host);
@@ -292,7 +1273,8 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
 #if !defined(GPU4DFT_HAVE_CUDA)
   throw std::runtime_error("ScfDriver::run: CUDA backend requested, but GPU4DFT was built without CUDA");
 #else
-  const bool has_separate_jk = static_cast<bool>(callbacks.build_jk);
+  const bool has_mo_jk = static_cast<bool>(callbacks.build_jk_mo);
+  const bool has_separate_jk = static_cast<bool>(callbacks.build_jk) || has_mo_jk;
   const bool has_vhf = static_cast<bool>(callbacks.build_vhf);
   if (!has_separate_jk && !has_vhf) {
     throw std::invalid_argument(
@@ -333,6 +1315,8 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
   PooledBuffer<double> d_F(pool, n2, scf_stream);
   PooledBuffer<double> d_F_extrap(pool, n2, scf_stream);
   PooledBuffer<double> d_C(pool, nm, scf_stream);
+  PooledBuffer<double> d_C_occ(pool, static_cast<std::size_t>(nao) * std::max(0, n_occ),
+                               scf_stream);
   PooledBuffer<double> d_eps(pool, static_cast<std::size_t>(nmo), scf_stream);
   PooledBuffer<double> d_W(pool, n2, scf_stream);
   PooledBuffer<double> d_P_sp2(pool, m2, scf_stream);
@@ -347,11 +1331,16 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
   memset_zero_async(d_Vxc.data(), n2 * sizeof(double), scf_stream);
 
   // Initial density matrix guess on GPU
+  bool has_c_occ = false;
   if (initial_dm_host != nullptr) {
     copy_h2d_async(d_D.data(), initial_dm_host, n2 * sizeof(double), scf_stream);
   } else if (opts.solver == DensitySolver::Diag) {
     solve_fock_diag_device(ctx, nao, nmo, n_occ, d_H.data(), d_X.data(), d_eps.data(), d_C.data(),
                            d_D.data(), nullptr, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+    if (n_occ > 0) {
+      slice_cols_device(nao, nmo, n_occ, d_C.data(), d_C_occ.data(), scf_stream);
+      has_c_occ = true;
+    }
   } else {
     Sp2Options sp2_init = opts.sp2_options;
     sp2_init.gemm_mode = opts.gemm_mode;
@@ -402,6 +1391,8 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
   ScfResult res;
   res.nao = nao;
   res.nmo = nmo;
+  res.n_alpha = n_occ;
+  res.n_beta = n_occ;
   res.nuclear_repulsion = e_nuc;
 
   std::size_t allocs_after_warmup_baseline = 0;
@@ -428,8 +1419,14 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
         memset_zero_async(target_k, n2 * sizeof(double), scf_stream);
       }
       if (has_separate_jk) {
-        callbacks.build_jk(d_jk_input, do_inc, cur_int_prec, target_j,
-                           need_k ? target_k : nullptr, scf_stream);
+        if (has_mo_jk) {
+          const double* c_ptr = (!do_inc && has_c_occ && n_occ > 0) ? d_C_occ.data() : nullptr;
+          callbacks.build_jk_mo(d_jk_input, c_ptr, n_occ, do_inc, cur_int_prec, target_j,
+                                need_k ? target_k : nullptr, scf_stream);
+        } else {
+          callbacks.build_jk(d_jk_input, do_inc, cur_int_prec, target_j,
+                             need_k ? target_k : nullptr, scf_stream);
+        }
       } else {
         callbacks.build_vhf(d_jk_input, do_inc, cur_int_prec, target_j, scf_stream);
       }
@@ -445,8 +1442,22 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
       std::fill(h_stage_vj.begin(), h_stage_vj.end(), 0.0);
       if (has_separate_jk) {
         if (need_k) std::fill(h_stage_vk.begin(), h_stage_vk.end(), 0.0);
-        callbacks.build_jk(h_stage_dm.data(), do_inc, cur_int_prec, h_stage_vj.data(),
-                           need_k ? h_stage_vk.data() : nullptr, nullptr);
+        if (has_mo_jk) {
+          std::vector<double> h_c_occ;
+          const double* c_ptr = nullptr;
+          if (!do_inc && has_c_occ && n_occ > 0) {
+            h_c_occ.resize(static_cast<std::size_t>(nao) * n_occ);
+            copy_d2h_async(h_c_occ.data(), d_C_occ.data(), h_c_occ.size() * sizeof(double),
+                           scf_stream);
+            synchronize_stream(scf_stream);
+            c_ptr = h_c_occ.data();
+          }
+          callbacks.build_jk_mo(h_stage_dm.data(), c_ptr, n_occ, do_inc, cur_int_prec,
+                                h_stage_vj.data(), need_k ? h_stage_vk.data() : nullptr, nullptr);
+        } else {
+          callbacks.build_jk(h_stage_dm.data(), do_inc, cur_int_prec, h_stage_vj.data(),
+                             need_k ? h_stage_vk.data() : nullptr, nullptr);
+        }
       } else {
         callbacks.build_vhf(h_stage_dm.data(), do_inc, cur_int_prec, h_stage_vj.data(), nullptr);
       }
@@ -557,6 +1568,10 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
       solve_fock_diag_device(ctx, nao, nmo, n_occ, d_F_extrap.data(), d_X.data(), d_eps.data(),
                              d_C.data(), d_D.data(), nullptr, step_gemm, scf_stream,
                              opts.ozaki_slices);
+      if (n_occ > 0) {
+        slice_cols_device(nao, nmo, n_occ, d_C.data(), d_C_occ.data(), scf_stream);
+        has_c_occ = true;
+      }
     } else {
       Sp2Options sp2_opts = opts.sp2_options;
       sp2_opts.gemm_mode = step_gemm;
@@ -601,6 +1616,14 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
     gemm_device(ctx, nao, nao, nao, 0.5, d_DF.data(), nao, false, d_D.data(), nao, false, 0.0,
                 d_W.data(), nao, opts.gemm_mode, scf_stream, opts.ozaki_slices);
     symmetrize_matrix_device(nao, d_W.data(), scf_stream);
+
+    solve_fock_diag_device(ctx, nao, nmo, n_occ, d_F.data(), d_X.data(), d_eps.data(), d_C.data(),
+                           d_DF.data(), nullptr, opts.gemm_mode, scf_stream, opts.ozaki_slices);
+    res.mo_energies.resize(static_cast<std::size_t>(nmo), 0.0);
+    res.mo_coefficients.resize(nm, 0.0);
+    copy_d2h_async(res.mo_energies.data(), d_eps.data(),
+                   static_cast<std::size_t>(nmo) * sizeof(double), scf_stream);
+    copy_d2h_async(res.mo_coefficients.data(), d_C.data(), nm * sizeof(double), scf_stream);
   }
 
   res.density_matrix.resize(n2, 0.0);
@@ -615,6 +1638,50 @@ ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host
   res.cuda_graph_replays = ctx.graph_executor().replay_count();
   res.pool_cache_hits = pool.stats().cache_hits;
   return res;
+#endif
+}
+
+ScfResult ScfDriver::run(int nao, int n_elec, double e_nuc, const double* S_host,
+                         const double* H_core_host, const FockCallbacks& callbacks,
+                         const double* initial_dm_alpha_host, const double* initial_dm_beta_host) {
+  if (nao <= 0) throw std::invalid_argument("ScfDriver::run: nao must be positive");
+  const ScfOptions& opts = impl_->opts;
+  if (!opts.unrestricted) {
+    if (opts.spin != 0) {
+      throw std::invalid_argument("ScfDriver::run: restricted SCF requires spin == 0");
+    }
+    if (initial_dm_alpha_host == nullptr && initial_dm_beta_host == nullptr) {
+      return run(nao, n_elec, e_nuc, S_host, H_core_host, callbacks, nullptr);
+    }
+    if (initial_dm_alpha_host == nullptr || initial_dm_beta_host == nullptr) {
+      throw std::invalid_argument(
+          "ScfDriver::run: both initial_dm_alpha_host and initial_dm_beta_host must be non-null or both null");
+    }
+    const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+    std::vector<double> dm_tot(n2, 0.0);
+    for (std::size_t i = 0; i < n2; ++i) {
+      dm_tot[i] = initial_dm_alpha_host[i] + initial_dm_beta_host[i];
+    }
+    return run(nao, n_elec, e_nuc, S_host, H_core_host, callbacks, dm_tot.data());
+  }
+
+  int n_alpha = 0, n_beta = 0;
+  validate_unrestricted_counts(n_elec, opts.spin, n_alpha, n_beta);
+
+  if (opts.backend == Backend::Host) {
+    return run_scf_host_uks(opts, nao, n_alpha, n_beta, e_nuc, S_host, H_core_host, callbacks,
+                            initial_dm_alpha_host, initial_dm_beta_host);
+  }
+  if (opts.backend != Backend::Cuda) {
+    throw NotImplemented("ScfDriver::run: requested backend is not compiled into this build");
+  }
+#if !defined(GPU4DFT_HAVE_CUDA)
+  throw std::runtime_error("ScfDriver::run: CUDA backend requested, but GPU4DFT was built without CUDA");
+#else
+  DeviceMemoryPool& pool =
+      (impl_->ext_pool != nullptr) ? *impl_->ext_pool : default_device_pool();
+  return run_scf_cuda_uks(opts, pool, nao, n_alpha, n_beta, e_nuc, S_host, H_core_host, callbacks,
+                          initial_dm_alpha_host, initial_dm_beta_host);
 #endif
 }
 
@@ -644,12 +1711,21 @@ std::vector<double> ScfDriver::compute_nuclear_gradient(
                                                         scf_res.energy_weighted_dm.data()),
                     "one_electron_grad_fn");
   }
-  if (grad_callbacks.two_electron_grad_fn) {
+  if (scf_res.unrestricted && grad_callbacks.two_electron_grad_uks_fn) {
+    accumulate_term(grad_callbacks.two_electron_grad_uks_fn(scf_res.density_alpha.data(),
+                                                             scf_res.density_beta.data(),
+                                                             impl_->opts.exact_exchange_fraction),
+                    "two_electron_grad_uks_fn");
+  } else if (grad_callbacks.two_electron_grad_fn) {
     accumulate_term(grad_callbacks.two_electron_grad_fn(scf_res.density_matrix.data(),
                                                         impl_->opts.exact_exchange_fraction),
                     "two_electron_grad_fn");
   }
-  if (grad_callbacks.xc_grad_fn) {
+  if (scf_res.unrestricted && grad_callbacks.xc_grad_uks_fn) {
+    accumulate_term(
+        grad_callbacks.xc_grad_uks_fn(scf_res.density_alpha.data(), scf_res.density_beta.data()),
+        "xc_grad_uks_fn");
+  } else if (grad_callbacks.xc_grad_fn) {
     accumulate_term(grad_callbacks.xc_grad_fn(scf_res.density_matrix.data()), "xc_grad_fn");
   }
   return total_grad;

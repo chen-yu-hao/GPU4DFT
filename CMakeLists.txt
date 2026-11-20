@@ -25,6 +25,39 @@ endif()
 find_package(OpenMP COMPONENTS CXX)
 
 # ---------------------------------------------------------------------------
+# Libxc (5.2.3+ C API: supports Config static Libxc::xc, PkgConfig, or manual)
+# ---------------------------------------------------------------------------
+find_package(Libxc QUIET)
+if(TARGET Libxc::xc)
+  set(_gpu4dft_libxc_target Libxc::xc)
+  message(STATUS "Found Libxc via CMake Config: Libxc::xc")
+else()
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(LIBXC QUIET IMPORTED_TARGET libxc)
+  endif()
+  if(TARGET PkgConfig::LIBXC)
+    set(_gpu4dft_libxc_target PkgConfig::LIBXC)
+    message(STATUS "Found Libxc via PkgConfig: PkgConfig::LIBXC (${LIBXC_VERSION})")
+  else()
+    find_path(LIBXC_INCLUDE_DIR NAMES xc.h)
+    find_library(LIBXC_LIBRARY NAMES xc)
+    if(LIBXC_INCLUDE_DIR AND LIBXC_LIBRARY)
+      add_library(Libxc::xc UNKNOWN IMPORTED)
+      set_target_properties(Libxc::xc PROPERTIES
+        IMPORTED_LOCATION "${LIBXC_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${LIBXC_INCLUDE_DIR}")
+      set(_gpu4dft_libxc_target Libxc::xc)
+      message(STATUS "Found Libxc via find_path/find_library: ${LIBXC_LIBRARY}")
+    else()
+      message(FATAL_ERROR
+        "Libxc not found. Install libxc-dev (e.g. `apt-get install -y libxc-dev`) "
+        "or set Libxc_DIR / PKG_CONFIG_PATH.")
+    endif()
+  endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # CUDA & Optional ROCm HIP backends
 # ---------------------------------------------------------------------------
 set(GPU4DFT_HAVE_CUDA OFF)
@@ -139,6 +172,8 @@ add_library(gpu4dft_core SHARED
   src/jk_engine.cpp
   src/xc_grid.cpp
   src/xc_engine.cpp
+  src/dftd3.cpp
+  src/dftd3_tables.cpp
   src/snk.cpp
   src/linalg.cpp
   src/diis.cpp
@@ -182,6 +217,7 @@ target_compile_options(gpu4dft_core PRIVATE
 if(OpenMP_CXX_FOUND)
   target_link_libraries(gpu4dft_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
+target_link_libraries(gpu4dft_core PRIVATE ${_gpu4dft_libxc_target})
 
 if(APPLE)
   set(_gpu4dft_rpath_origin "@loader_path")
@@ -239,6 +275,31 @@ if(GPU4DFT_BUILD_TESTS)
   target_link_libraries(test_rys PRIVATE gpu4dft_core)
   set_target_properties(test_rys PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
   add_test(NAME cpp.rys COMMAND test_rys)
+
+  add_executable(test_xc_libxc tests/cpp/test_xc_libxc.cpp)
+  target_link_libraries(test_xc_libxc PRIVATE gpu4dft_core)
+  set_target_properties(test_xc_libxc PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.xc_libxc COMMAND test_xc_libxc)
+
+  add_executable(test_dftd3 tests/cpp/test_dftd3.cpp)
+  target_link_libraries(test_dftd3 PRIVATE gpu4dft_core)
+  set_target_properties(test_dftd3 PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.dftd3 COMMAND test_dftd3)
+
+  add_executable(test_uhf_uks tests/cpp/test_uhf_uks.cpp)
+  target_link_libraries(test_uhf_uks PRIVATE gpu4dft_core)
+  set_target_properties(test_uhf_uks PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.uhf_uks COMMAND test_uhf_uks)
+
+  add_executable(test_rsh tests/cpp/test_rsh.cpp)
+  target_link_libraries(test_rsh PRIVATE gpu4dft_core)
+  set_target_properties(test_rsh PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.rsh COMMAND test_rsh)
+
+  add_executable(test_ri_jk_grad tests/cpp/test_ri_jk_grad.cpp)
+  target_link_libraries(test_ri_jk_grad PRIVATE gpu4dft_core)
+  set_target_properties(test_ri_jk_grad PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:gpu4dft_core>")
+  add_test(NAME cpp.ri_jk_grad COMMAND test_ri_jk_grad)
 
   if(GPU4DFT_BUILD_PYTHON)
     add_test(NAME python

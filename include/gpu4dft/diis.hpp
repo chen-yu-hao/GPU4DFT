@@ -12,6 +12,7 @@ namespace gpu4dft {
 
 struct DiisOptions {
   int max_vec = 8;
+  int n_spin = 1;              // 1 for restricted (RHF/RKS), 2 for joint alpha/beta (UHF/UKS)
   double damping = 0.0;        // Linear Fock mixing factor in [0, 1) on early iterations
   int damping_steps = 2;       // Apply damping when step_index < damping_steps
   double level_shift = 0.0;    // Virtual-orbital level shift (Hartree) applied after extrapolation
@@ -30,6 +31,14 @@ struct DiisHostResult {
   DiisStepInfo info;
   std::vector<double> fock_extrapolated;  // [nao x nao]
   std::vector<double> residual;           // [nmo x nmo] X^T (F D S - S D F) X
+};
+
+struct DiisHostUksResult {
+  DiisStepInfo info;
+  std::vector<double> fock_alpha_extrapolated;  // [nao x nao]
+  std::vector<double> fock_beta_extrapolated;   // [nao x nao]
+  std::vector<double> residual_alpha;           // [nmo x nmo]
+  std::vector<double> residual_beta;            // [nmo x nmo]
 };
 
 // Solve Pulay's (m + 1) x (m + 1) augmented linear system given an [m x m]
@@ -68,9 +77,19 @@ class GpuDiis {
                              const double* d_S, const double* d_X, double* d_F_out,
                              StreamHandle stream = nullptr);
 
+  // Joint alpha/beta CDIIS update on GPU (packs [F_a|F_b] and [e_a|e_b] with shared Pulay weights).
+  DiisStepInfo update_device_uks(GpuLinalgContext& ctx, const double* d_Fa_in,
+                                 const double* d_Fb_in, const double* d_Da, const double* d_Db,
+                                 const double* d_S, const double* d_X, double* d_Fa_out,
+                                 double* d_Fb_out, StreamHandle stream = nullptr);
+
   // Host/Backend convenience API (runs on GPU when backend == Backend::Cuda, or CPU on Host).
   DiisHostResult update(const double* F_in, const double* D, const double* S, const double* X,
                         Backend backend = Backend::Cuda);
+
+  DiisHostUksResult update_uks(const double* Fa_in, const double* Fb_in, const double* Da,
+                               const double* Db, const double* S, const double* X,
+                               Backend backend = Backend::Cuda);
 
   int nao() const noexcept;
   int nmo() const noexcept;

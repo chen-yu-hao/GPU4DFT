@@ -34,8 +34,14 @@ struct WorkflowOptions {
   //   "svwn" / "lda", "pbe", "blyp", "b3lyp", "b3lyp5", "pbe0", "tpss", ... -> RKS / Hybrid DFT
   std::string xc = "hf";
 
+  // Optional empirical dispersion correction: "" / "none" (disabled), "d3bj" / "d3(bj)" / "d3-bj"
+  std::string dispersion;
+
   JKMode jk_mode = JKMode::Direct;
   ScfOptions scf{};
+
+  bool unrestricted = false;
+  int spin = 0;  // 2*S = n_alpha - n_beta
 
   // Direct J/K & nuclear gradient screening parameters
   double schwarz_cutoff = 1e-13;
@@ -62,6 +68,7 @@ struct WorkflowResult {
   std::size_t grid_npoints = 0;
   std::size_t grid_nbatches = 0;
   double active_ao_ratio = 0.0;
+  double dispersion_energy = 0.0;
 
   // Cached 1-electron matrices [nao * nao] row-major
   std::vector<double> overlap_matrix;
@@ -75,11 +82,13 @@ struct GradientResult {
   std::vector<double> one_electron_grad;       // [natom * 3]
   std::vector<double> two_electron_grad;       // [natom * 3]
   std::vector<double> xc_grad;                 // [natom * 3]
+  std::vector<double> dispersion_grad;         // [natom * 3]
 
   double total_time_s = 0.0;
   double one_electron_time_s = 0.0;
   double two_electron_time_s = 0.0;
   double xc_time_s = 0.0;
+  double dispersion_time_s = 0.0;
 };
 
 struct ResponseOptions;
@@ -113,7 +122,9 @@ class MolecularScf {
   int n_elec() const noexcept;
   bool is_dft() const noexcept;
   double exact_exchange_fraction() const noexcept;
+  const RshCoefficients& rsh_coefficients() const noexcept;
   const WorkflowOptions& options() const noexcept;
+  void set_xc_grid_response(bool enabled) noexcept;
 
   // Precomputes 1e integrals and constructs persistent J/K, grid, and XC engines once.
   // Automatically invoked on the first `run()` if not called explicitly.
@@ -163,7 +174,8 @@ WorkflowResult run_scf(const Basis& basis, std::span<const Atom> atoms, int n_el
 GradientResult run_grad(const Basis& basis, std::span<const Atom> atoms,
                         const ScfResult& scf_res, const WorkflowOptions& opts = {},
                         std::span<const double> external_grid_coords = {},
-                        std::span<const double> external_grid_weights = {});
+                        std::span<const double> external_grid_weights = {},
+                        const Basis* aux_basis = nullptr);
 
 }  // namespace gpu4dft
 

@@ -68,4 +68,57 @@ GPU4DFT_HD inline void boys_vec(int m_max, R T, R* F) {
   }
 }
 
+// Overflow-safe attenuation factor theta = omega^2 / (omega^2 + rho) in (0, 1]
+// for erf(omega * r12) / r12 integrals. Returns 1 when omega <= 0.
+template <typename R>
+GPU4DFT_HD inline R omega_theta(R rho, R omega) {
+  if (omega <= R(0)) return R(1);
+  const double rho_d = static_cast<double>(rho);
+  const double omega_d = static_cast<double>(omega);
+  if (rho_d <= 0.0) return R(1);
+  if (omega_d >= rho_d) {
+    const double r = (rho_d / omega_d) / omega_d;
+    return static_cast<R>(1.0 / (1.0 + r));
+  }
+  const double x = (omega_d / rho_d) * omega_d;
+  return static_cast<R>(x / (1.0 + x));
+}
+
+// Attenuated Boys function of order 0 for erf(omega * r12) / r12:
+//   F_0^omega(T) = sqrt(theta) * F_0(theta * T)
+template <typename R>
+GPU4DFT_HD inline R boys_f0_erf(R T, R rho, R omega) {
+  if (omega <= R(0)) return boys_f0<R>(T);
+  const double theta = omega_theta<double>(static_cast<double>(rho), static_cast<double>(omega));
+  return static_cast<R>(math::sqrt(theta) * boys_f0<double>(theta * static_cast<double>(T)));
+}
+
+// Attenuated Boys moments F_m^omega(T) = theta^{m + 1/2} * F_m(theta * T) for m = 0..m_max.
+template <typename R>
+GPU4DFT_HD inline void boys_vec_erf(int m_max, R T, R rho, R omega, R* F) {
+  if (m_max < 0) return;
+  if (omega <= R(0)) {
+    boys_vec<R>(m_max, T, F);
+    return;
+  }
+  const double theta = omega_theta<double>(static_cast<double>(rho), static_cast<double>(omega));
+  const double sqrt_theta = math::sqrt(theta);
+  if (m_max <= 32) {
+    double F_d[33];
+    boys_vec<double>(m_max, theta * static_cast<double>(T), F_d);
+    double scale = sqrt_theta;
+    for (int m = 0; m <= m_max; ++m) {
+      F[m] = static_cast<R>(scale * F_d[m]);
+      scale *= theta;
+    }
+  } else {
+    boys_vec<R>(m_max, static_cast<R>(theta * static_cast<double>(T)), F);
+    double scale = sqrt_theta;
+    for (int m = 0; m <= m_max; ++m) {
+      F[m] = static_cast<R>(scale * static_cast<double>(F[m]));
+      scale *= theta;
+    }
+  }
+}
+
 }  // namespace gpu4dft

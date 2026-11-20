@@ -137,7 +137,7 @@ inline constexpr int kEri_ssss_NSph = 1;
 template <typename R>
 GPU4DFT_HD inline void eri_ssss_prim(const ShellPairView& bra, int /*ib*/, int ip,
                                      const ShellPairView& ket, int /*ik*/, int kp,
-                                     double* cart_acc) {{
+                                     double* cart_acc, double omega = 0.0) {{
   const R p = static_cast<R>(bra.exponent[ip]);
   const R q = static_cast<R>(ket.exponent[kp]);
   const R PQx = static_cast<R>(bra.Px[ip]) - static_cast<R>(ket.Px[kp]);
@@ -147,7 +147,8 @@ GPU4DFT_HD inline void eri_ssss_prim(const ShellPairView& bra, int /*ib*/, int i
   const R Ccd = static_cast<R>(ket.prefactor[kp]);
   const R rho = p * q / (p + q);
   const R T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
-  const R value = Cab * Ccd * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho) * boys_f0(T);
+  const R value = Cab * Ccd * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho) *
+                  boys_f0_erf(T, rho, static_cast<R>(omega));
   cart_acc[0] += static_cast<double>(value);
 }}
 
@@ -157,7 +158,8 @@ GPU4DFT_HD inline void eri_ssss_cart_to_sph(const double* cart, double* out) {{
 
 template <typename R>
 GPU4DFT_HD inline double eri_ssss_contracted(const ShellPairView& bra, int ib,
-                                             const ShellPairView& ket, int ik) {{
+                                             const ShellPairView& ket, int ik,
+                                             double omega = 0.0) {{
   double acc = 0.0;
   const int bra_begin = bra.prim_offset[ib];
   const int bra_end = bra.prim_offset[ib + 1];
@@ -177,7 +179,8 @@ GPU4DFT_HD inline double eri_ssss_contracted(const ShellPairView& bra, int ib,
       const R Ccd = static_cast<R>(ket.prefactor[kp]);
       const R rho = p * q / (p + q);
       const R T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
-      const R value = Cab * Ccd * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho) * boys_f0(T);
+      const R value = Cab * Ccd * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho) *
+                      boys_f0_erf(T, rho, static_cast<R>(omega));
       acc += static_cast<double>(value);
     }}
   }}
@@ -186,8 +189,9 @@ GPU4DFT_HD inline double eri_ssss_contracted(const ShellPairView& bra, int ib,
 
 template <typename R>
 GPU4DFT_HD inline void eri_ssss_eval(const ShellPairView& bra, int ib,
-                                     const ShellPairView& ket, int ik, double* out) {{
-  out[0] = eri_ssss_contracted<R>(bra, ib, ket, ik);
+                                     const ShellPairView& ket, int ik, double* out,
+                                     double omega = 0.0) {{
+  out[0] = eri_ssss_contracted<R>(bra, ib, ket, ik, omega);
 }}
 """
 
@@ -315,7 +319,7 @@ GPU4DFT_HD inline void md_coulomb_r(R rho, R scale, R PQx, R PQy, R PQz, const R
 template <typename R>
 GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int ib, int ip,
                                                 const ShellPairView& ket, int ik, int kp,
-                                                double* cart_acc) {{
+                                                double* cart_acc, double omega = 0.0) {{
 {tabs}
   const R p = static_cast<R>(bra.exponent[ip]);
   const R Px = static_cast<R>(bra.Px[ip]);
@@ -362,7 +366,9 @@ GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int i
   const R PQx = Px - Qx;
   const R PQy = Py - Qy;
   const R PQz = Pz - Qz;
-  const R rho = p * q / (p + q);
+  const R rho0 = p * q / (p + q);
+  const R theta = static_cast<R>(omega_theta<double>(static_cast<double>(rho0), omega));
+  const R rho = rho0 * theta;
   const R T = rho * (PQx * PQx + PQy * PQy + PQz * PQz);
   R F[{L + 1}];
   boys_vec<R>({L}, T, F);
@@ -423,7 +429,8 @@ GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int i
 {c2s_fn}
 template <typename R>
 GPU4DFT_HD inline void {eval_function_name(cls)}(const ShellPairView& bra, int ib,
-                                                const ShellPairView& ket, int ik, double* out) {{
+                                                const ShellPairView& ket, int ik, double* out,
+                                                double omega = 0.0) {{
   double cart[{nc_tot}] = {{0.0}};
   const int bra_begin = bra.prim_offset[ib];
   const int bra_end = bra.prim_offset[ib + 1];
@@ -431,7 +438,7 @@ GPU4DFT_HD inline void {eval_function_name(cls)}(const ShellPairView& bra, int i
   const int ket_end = ket.prim_offset[ik + 1];
   for (int ip = bra_begin; ip < bra_end; ++ip) {{
     {unroll}for (int kp = ket_begin; kp < ket_end; ++kp) {{
-      {prim_function_name(cls)}<R>(bra, ib, ip, ket, ik, kp, cart);
+      {prim_function_name(cls)}<R>(bra, ib, ip, ket, ik, kp, cart, omega);
     }}
   }}
   {cart2sph_function_name(cls)}(cart, out);
@@ -463,9 +470,10 @@ def _emit_rys_body(cls: EriClass, prim_unroll: int) -> str:
         extra_ssss = f"""
 template <typename R>
 GPU4DFT_HD inline double eri_ssss_contracted(const ShellPairView& bra, int ib,
-                                             const ShellPairView& ket, int ik) {{
+                                             const ShellPairView& ket, int ik,
+                                             double omega = 0.0) {{
   double v = 0.0;
-  {eval_function_name(cls)}<R>(bra, ib, ket, ik, &v);
+  {eval_function_name(cls)}<R>(bra, ib, ket, ik, &v, omega);
   return v;
 }}
 """
@@ -529,7 +537,7 @@ GPU4DFT_HD inline void rys_1d_vrr_hrr(R C00, R D00, R B10, R B01, R B00, R AB, R
 template <typename R>
 GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int ib, int ip,
                                                 const ShellPairView& ket, int ik, int kp,
-                                                double* cart_acc) {{
+                                                double* cart_acc, double omega = 0.0) {{
 {tabs}
   (void)AB_unused_{cls.name};
   const R p = static_cast<R>(bra.exponent[ip]);
@@ -566,7 +574,7 @@ GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int i
 
   R u_roots[{n_roots}];
   R w_weights[{n_roots}];
-  rys_roots_weights<R>({n_roots}, T, u_roots, w_weights);
+  rys_roots_weights_erf<R>({n_roots}, T, rho, static_cast<R>(omega), u_roots, w_weights);
 
   const R inv_2p = R(0.5) / p;
   const R inv_2q = R(0.5) / q;
@@ -613,7 +621,8 @@ GPU4DFT_HD inline void {prim_function_name(cls)}(const ShellPairView& bra, int i
 {c2s_fn}{extra_ssss}
 template <typename R>
 GPU4DFT_HD inline void {eval_function_name(cls)}(const ShellPairView& bra, int ib,
-                                                const ShellPairView& ket, int ik, double* out) {{
+                                                const ShellPairView& ket, int ik, double* out,
+                                                double omega = 0.0) {{
   double cart[{nc_tot}] = {{0.0}};
   const int bra_begin = bra.prim_offset[ib];
   const int bra_end = bra.prim_offset[ib + 1];
@@ -621,7 +630,7 @@ GPU4DFT_HD inline void {eval_function_name(cls)}(const ShellPairView& bra, int i
   const int ket_end = ket.prim_offset[ik + 1];
   for (int ip = bra_begin; ip < bra_end; ++ip) {{
     {unroll}for (int kp = ket_begin; kp < ket_end; ++kp) {{
-      {prim_function_name(cls)}<R>(bra, ib, ip, ket, ik, kp, cart);
+      {prim_function_name(cls)}<R>(bra, ib, ip, ket, ik, kp, cart, omega);
     }}
   }}
   {cart2sph_function_name(cls)}(cart, out);
@@ -744,7 +753,7 @@ GPU4DFT_HD inline void rys_1d_general(int la, int lb, int lc, int ld, R C00, R D
 template <typename R>
 GPU4DFT_HD inline void eri_general_eval(int la, int lb, int lc, int ld, const ShellPairView& bra,
                                         int ib, const ShellPairView& ket, int ik,
-                                        double* sph_out) {{
+                                        double* sph_out, double omega = 0.0) {{
   const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
   const int nsa = n_sph(la), nsb = n_sph(lb), nsc = n_sph(lc), nsd = n_sph(ld);
   const int nscd = nsc * nsd;
@@ -802,7 +811,7 @@ GPU4DFT_HD inline void eri_general_eval(int la, int lb, int lc, int ld, const Sh
 
       R u_roots[9];
       R w_weights[9];
-      rys_roots_weights<R>(n_roots, T, u_roots, w_weights);
+      rys_roots_weights_erf<R>(n_roots, T, rho, static_cast<R>(omega), u_roots, w_weights);
 
       const R inv_2q = R(0.5) / q;
       const R inv_2pq = R(0.5) / pq_sum;

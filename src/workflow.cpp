@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "gpu4dft/device_pool.hpp"
+#include "gpu4dft/dftd3.hpp"
 #include "gpu4dft/eri.hpp"
 #include "gpu4dft/linalg.hpp"
 #include "gpu4dft/response.hpp"
@@ -60,7 +61,25 @@ bool is_hf_functional_name(std::string_view raw) {
     if (std::isspace(static_cast<unsigned char>(ch)) != 0 || ch == '-' || ch == '_') continue;
     norm.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
   }
-  return norm.empty() || norm == "hf" || norm == "rhf";
+  return norm.empty() || norm == "hf" || norm == "rhf" || norm == "uhf";
+}
+
+bool parse_dispersion_option(std::string_view raw) {
+  std::string norm;
+  norm.reserve(raw.size());
+  for (char ch : raw) {
+    const unsigned char uch = static_cast<unsigned char>(ch);
+    if (std::isspace(uch) != 0 || ch == '-' || ch == '_' || ch == '(' || ch == ')') continue;
+    norm.push_back(static_cast<char>(std::tolower(uch)));
+  }
+  if (norm.empty() || norm == "none" || norm == "off" || norm == "false") {
+    return false;
+  }
+  if (norm == "d3bj" || norm == "dftd3bj" || norm == "dftd3") {
+    return true;
+  }
+  throw std::invalid_argument("Unsupported dispersion model '" + std::string(raw) +
+                              "'; expected ''/'none' or 'd3bj'");
 }
 
 std::vector<XcAtom> to_xc_atoms(std::span<const Atom> atoms) {
@@ -84,88 +103,6 @@ double compute_active_ao_ratio(const MolecularGrid& grid) {
   return (valid_batches > 0) ? (sum_ratio / static_cast<double>(valid_batches)) : 0.0;
 }
 
-#if defined(GPU4DFT_HAVE_CUDA)
-// Zero-copy GPU-resident state for OzakiInt8 Tensor Core RI-J and chunked RI-K contractions.
-// Borrows `RIJKEngine::device_b_ptr()` directly whenever `ri_jk.has_device_b()` is true,
-// completely avoiding any D2H `b_tensor()` download, duplicate `d_B` VRAM allocation, or
-// host-side `B_perm` permutation loop!
-struct GpuRIJKDeviceState {
-  static constexpr int kAuxChunk = 192;
-
-  int nao = 0;
-  int naux = 0;
-  GpuLinalgContext ctx;
-  const double* d_B_ptr = nullptr;   // Borrowed from RIJKEngine::device_b_ptr()
-  PooledBuffer<double> d_B_owned;    // Fallback only if RIJKEngine was built without device B
-  PooledBuffer<double> d_v_aux;      // [naux]
-  PooledBuffer<double> d_T_raw;      // [min(naux, kAuxChunk) * nao * nao]
-  PooledBuffer<double> d_Bp_chunk;   // [min(naux, kAuxChunk) * nao * nao]
-  PooledBuffer<double> d_Tp_chunk;   // [min(naux, kAuxChunk) * nao * nao]
-
-  GpuRIJKDeviceState(const RIJKEngine& ri_jk, bool prealloc_k)
-      : nao(ri_jk.nao()),
-        naux(ri_jk.naux()),
-        ctx(&default_device_pool()),
-        d_v_aux(ctx.pool(), static_cast<std::size_t>(std::max(1, ri_jk.naux()))) {
-    if (ri_jk.has_device_b()) {
-      d_B_ptr = ri_jk.device_b_ptr();
-    } else if (nao > 0 && naux > 0) {
-      const auto& h_B = ri_jk.b_tensor();
-      d_B_owned = PooledBuffer<double>(ctx.pool(), h_B.size());
-      copy_h2d_async(d_B_owned.data(), h_B.data(), h_B.size() * sizeof(double));
-      d_B_ptr = d_B_owned.data();
-    }
-    if (prealloc_k && naux > 0 && nao > 0) {
-      ensure_k_buffers(nullptr);
-    }
-    synchronize_stream(nullptr);
-  }
-
-  void ensure_k_buffers(StreamHandle stream) {
-    if (d_T_raw.size() > 0 || naux <= 0 || nao <= 0) return;
-    const std::size_t max_chunk_elems =
-        static_cast<std::size_t>(std::min(naux, kAuxChunk)) * nao * nao;
-    d_T_raw = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
-    d_Bp_chunk = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
-    d_Tp_chunk = PooledBuffer<double>(ctx.pool(), max_chunk_elems, stream);
-  }
-
-  void compute_j_device(const double* d_dm, double* d_vj, StreamHandle stream) {
-    if (d_vj == nullptr || nao == 0 || naux == 0 || d_B_ptr == nullptr) return;
-    const int nao2 = nao * nao;
-    gemm_device(ctx, naux, 1, nao2, 1.0, d_B_ptr, nao2, false, d_dm, 1, false, 0.0,
-                d_v_aux.data(), 1, GemmMode::FP64, stream);
-    gemm_device(ctx, nao2, 1, naux, 1.0, d_B_ptr, nao2, true, d_v_aux.data(), 1, false, 0.0, d_vj,
-                1, GemmMode::FP64, stream);
-  }
-
-  void compute_k_device(const double* d_dm, double* d_vk, GemmMode mode, int ozaki_slices,
-                        bool symmetrize_out, StreamHandle stream) {
-    if (d_vk == nullptr || nao == 0 || naux == 0 || d_B_ptr == nullptr) return;
-    ensure_k_buffers(stream);
-    const std::size_t nao2 = static_cast<std::size_t>(nao) * nao;
-    for (int p0 = 0; p0 < naux; p0 += kAuxChunk) {
-      const int bc = std::min(kAuxChunk, naux - p0);
-      const int k_chunk = bc * nao;
-      const double* d_Bc = d_B_ptr + static_cast<std::size_t>(p0) * nao2;
-      const double beta = (p0 == 0) ? 0.0 : 1.0;
-      // Step 1: T_raw [(bc * nao) x nao] = B_c [(bc * nao) x nao] * d_dm [nao x nao]
-      gemm_device(ctx, k_chunk, nao, nao, 1.0, d_Bc, nao, false, d_dm, nao, false, 0.0,
-                  d_T_raw.data(), nao, mode, stream, ozaki_slices);
-      // Coalesced GPU permute [bc, nao, nao] -> [nao, bc, nao] for both B_c and T_raw
-      permute_ri_chunk_pair_device(bc, nao, d_Bc, d_T_raw.data(), d_Bp_chunk.data(),
-                                   d_Tp_chunk.data(), stream);
-      // Step 2: K [nao x nao] += T_perm [nao x (bc * nao)] * B_perm^T [(bc * nao) x nao]
-      gemm_device(ctx, nao, nao, k_chunk, 1.0, d_Tp_chunk.data(), k_chunk, false,
-                  d_Bp_chunk.data(), k_chunk, true, beta, d_vk, nao, mode, stream, ozaki_slices);
-    }
-    if (symmetrize_out) {
-      symmetrize_matrix_device(nao, d_vk, stream);
-    }
-  }
-};
-#endif
-
 }  // namespace
 
 struct MolecularScf::Impl {
@@ -180,6 +117,10 @@ struct MolecularScf::Impl {
 
   bool is_dft_flag = false;
   double exx_fraction = 1.0;
+  RshCoefficients rsh_;
+  bool dispersion_enabled = false;
+  std::optional<dftd3::D3BJResult> d3_cached;
+  double dispersion_setup_time_s = 0.0;
 
   bool initialized = false;
   double e_nuc = 0.0;
@@ -191,9 +132,6 @@ struct MolecularScf::Impl {
   std::unique_ptr<DirectJKEngine> direct_jk;
   std::unique_ptr<RIJKEngine> ri_jk;
   std::unique_ptr<SemiNumericalK> snk_engine;
-#if defined(GPU4DFT_HAVE_CUDA)
-  std::unique_ptr<GpuRIJKDeviceState> gpu_rijk;
-#endif
 
   double setup_time_s = 0.0;
   double one_elec_time_s = 0.0;
@@ -215,8 +153,26 @@ struct MolecularScf::Impl {
         aux_basis(std::move(aux)),
         ext_grid_coords(gcoords.begin(), gcoords.end()),
         ext_grid_weights(gweights.begin(), gweights.end()) {
-    if (n_elec < 0 || (n_elec % 2) != 0) {
-      throw std::invalid_argument("MolecularScf: closed-shell n_elec must be non-negative and even");
+    const bool is_unrestricted = opts.unrestricted || opts.scf.unrestricted;
+    const int spin = (opts.spin != 0) ? opts.spin : opts.scf.spin;
+    if (is_unrestricted) {
+      opts.unrestricted = true;
+      opts.scf.unrestricted = true;
+      opts.spin = spin;
+      opts.scf.spin = spin;
+      if (n_elec < 0 || spin < 0 || spin > n_elec || ((n_elec - spin) % 2) != 0) {
+        throw std::invalid_argument(
+            "MolecularScf: invalid (n_elec, spin) for unrestricted SCF");
+      }
+      opts.xc_options.spin_polarized = true;
+    } else {
+      if (spin != 0) {
+        throw std::invalid_argument("MolecularScf: restricted SCF requires spin == 0");
+      }
+      if (n_elec < 0 || (n_elec % 2) != 0) {
+        throw std::invalid_argument(
+            "MolecularScf: closed-shell n_elec must be non-negative and even");
+      }
     }
     if (!ext_grid_coords.empty() || !ext_grid_weights.empty()) {
       if (ext_grid_coords.size() != ext_grid_weights.size() * 3) {
@@ -231,7 +187,18 @@ struct MolecularScf::Impl {
 
     is_dft_flag = !is_hf_functional_name(opts.xc);
     exx_fraction = is_dft_flag ? xc_exact_exchange_fraction(opts.xc) : 1.0;
-    opts.scf.exact_exchange_fraction = exx_fraction;
+    rsh_ = is_dft_flag ? xc_rsh_coefficients(opts.xc) : RshCoefficients{};
+    if (rsh_.is_rsh() && (opts.jk_mode == JKMode::SnK || opts.jk_mode == JKMode::RISnK)) {
+      throw NotImplemented(
+          "MolecularScf: semi-numerical exchange (JKMode::SnK / JKMode::RISnK) is not "
+          "implemented for range-separated hybrid functionals");
+    }
+    opts.scf.exact_exchange_fraction = rsh_.is_rsh() ? 1.0 : exx_fraction;
+
+    dispersion_enabled = parse_dispersion_option(opts.dispersion);
+    if (dispersion_enabled) {
+      (void)dftd3::get_d3bj_params(opts.xc);  // Validate functional support eagerly
+    }
 
     const Backend be = opts.scf.backend;
     opts.grid.backend = be;
@@ -266,7 +233,7 @@ struct MolecularScf::Impl {
     one_elec_time_s = elapsed_seconds(t_1e_start, t_1e_end);
 
     // 2. Molecular grid & persistent XcEngine (constructed once!)
-    const bool need_k = (exx_fraction != 0.0);
+    const bool need_k = (exx_fraction != 0.0) || rsh_.is_rsh();
     const bool need_snk =
         need_k && (opts.jk_mode == JKMode::SnK || opts.jk_mode == JKMode::RISnK);
     const bool need_grid = is_dft_flag || need_snk;
@@ -296,14 +263,7 @@ struct MolecularScf::Impl {
     if (opts.jk_mode == JKMode::Direct) {
       direct_jk = std::make_unique<DirectJKEngine>(basis, opts.prim_cutoff);
     } else if (opts.jk_mode == JKMode::RI) {
-      ri_jk = std::make_unique<RIJKEngine>(basis, *aux_basis, be);
-#if defined(GPU4DFT_HAVE_CUDA)
-      if (be == Backend::Cuda && need_k &&
-          (opts.scf.gemm_mode == GemmMode::OzakiInt8 ||
-           (opts.scf.dynamic_precision && opts.scf.early_gemm_mode == GemmMode::OzakiInt8))) {
-        gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*ri_jk, /*prealloc_k=*/true);
-      }
-#endif
+      ri_jk = std::make_unique<RIJKEngine>(basis, *aux_basis, be, rsh_.is_rsh() ? rsh_.omega : 0.0);
     } else if (opts.jk_mode == JKMode::SnK) {
       direct_jk = std::make_unique<DirectJKEngine>(basis, opts.prim_cutoff);
       if (need_k) {
@@ -318,7 +278,15 @@ struct MolecularScf::Impl {
     sync_gpu_if_cuda(be);
     const auto t_jk_end = SteadyClock::now();
     jk_setup_time_s = elapsed_seconds(t_jk_start, t_jk_end);
-    setup_time_s = elapsed_seconds(t_setup_start, t_jk_end);
+
+    if (dispersion_enabled) {
+      const auto t_d3_start = SteadyClock::now();
+      d3_cached = dftd3::compute_d3bj(atoms, opts.xc, /*compute_grad=*/true);
+      const auto t_d3_end = SteadyClock::now();
+      dispersion_setup_time_s = elapsed_seconds(t_d3_start, t_d3_end);
+    }
+
+    setup_time_s = elapsed_seconds(t_setup_start, SteadyClock::now());
 
     initialized = true;
   }
@@ -341,7 +309,15 @@ int MolecularScf::natom() const noexcept { return static_cast<int>(impl_->atoms.
 int MolecularScf::n_elec() const noexcept { return impl_->n_elec; }
 bool MolecularScf::is_dft() const noexcept { return impl_->is_dft_flag; }
 double MolecularScf::exact_exchange_fraction() const noexcept { return impl_->exx_fraction; }
+const RshCoefficients& MolecularScf::rsh_coefficients() const noexcept { return impl_->rsh_; }
 const WorkflowOptions& MolecularScf::options() const noexcept { return impl_->opts; }
+
+void MolecularScf::set_xc_grid_response(bool enabled) noexcept {
+  impl_->opts.xc_options.grid_response = enabled;
+  if (impl_->xc_engine != nullptr) {
+    impl_->xc_engine->set_grid_response(enabled);
+  }
+}
 
 void MolecularScf::setup() { impl_->ensure_setup(); }
 
@@ -350,15 +326,26 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
 
   const int n_ao = impl_->basis.nao();
   const std::size_t n2 = static_cast<std::size_t>(n_ao) * n_ao;
-  if (!initial_dm_host.empty() && initial_dm_host.size() != n2) {
-    throw std::invalid_argument("MolecularScf::run: initial_dm_host size must equal nao * nao");
+  const bool is_unrestricted = impl_->opts.unrestricted;
+  if (is_unrestricted) {
+    if (!initial_dm_host.empty() && initial_dm_host.size() != n2 &&
+        initial_dm_host.size() != 2 * n2) {
+      throw std::invalid_argument(
+          "MolecularScf::run: unrestricted initial_dm_host size must equal 2 * nao * nao or nao * nao");
+    }
+  } else {
+    if (!initial_dm_host.empty() && initial_dm_host.size() != n2) {
+      throw std::invalid_argument("MolecularScf::run: initial_dm_host size must equal nao * nao");
+    }
   }
 
   const Backend be = impl_->opts.scf.backend;
-  const bool need_k = (impl_->exx_fraction != 0.0);
 
   ScfOptions run_scf_opts = impl_->opts.scf;
-  run_scf_opts.exact_exchange_fraction = impl_->exx_fraction;
+  run_scf_opts.unrestricted = is_unrestricted;
+  run_scf_opts.spin = impl_->opts.spin;
+  run_scf_opts.exact_exchange_fraction =
+      impl_->rsh_.is_rsh() ? 1.0 : impl_->exx_fraction;
   // Dense RI-JK contractions do not rely on |Delta D| quartet screening, so evaluating
   // J(D) and K(D) directly avoids delta-density staging and saves the final full-reset step.
   if (impl_->opts.jk_mode == JKMode::RI || impl_->opts.jk_mode == JKMode::RISnK) {
@@ -367,25 +354,42 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
 
   FockCallbacks cb;
 
-  // 1. Wire XC Engine (`eval_vxc_device` on GPU, `eval_vxc` on Host)
+  // 1. Wire XC Engine (`eval_vxc(_uks)_device` on GPU, `eval_vxc(_uks)` on Host)
   if (impl_->is_dft_flag) {
     XcEngine* xc_ptr = impl_->xc_engine.get();
-    if (be == Backend::Cuda) {
-      cb.vxc_device_resident = true;
-      cb.build_vxc = [xc_ptr](const double* d_dm, Precision /*prec*/, double* d_vxc,
-                              void* raw_stream) -> double {
-        return xc_ptr->eval_vxc_device(d_dm, d_vxc, raw_stream);
-      };
+    if (is_unrestricted) {
+      if (be == Backend::Cuda) {
+        cb.vxc_device_resident = true;
+        cb.build_vxc_uks = [xc_ptr](const double* d_da, const double* d_db, Precision /*prec*/,
+                                    double* d_va, double* d_vb, void* raw_stream) -> double {
+          return xc_ptr->eval_vxc_uks_device(d_da, d_db, d_va, d_vb, raw_stream);
+        };
+      } else {
+        cb.vxc_device_resident = false;
+        cb.build_vxc_uks = [xc_ptr](const double* h_da, const double* h_db, Precision /*prec*/,
+                                    double* h_va, double* h_vb, void* /*stream*/) -> double {
+          return xc_ptr->eval_vxc_uks(h_da, h_db, h_va, h_vb, nullptr, nullptr);
+        };
+      }
     } else {
-      cb.vxc_device_resident = false;
-      cb.build_vxc = [xc_ptr](const double* h_dm, Precision /*prec*/, double* h_vxc,
-                              void* /*stream*/) -> double {
-        return xc_ptr->eval_vxc(h_dm, h_vxc, nullptr);
-      };
+      if (be == Backend::Cuda) {
+        cb.vxc_device_resident = true;
+        cb.build_vxc = [xc_ptr](const double* d_dm, Precision /*prec*/, double* d_vxc,
+                                void* raw_stream) -> double {
+          return xc_ptr->eval_vxc_device(d_dm, d_vxc, raw_stream);
+        };
+      } else {
+        cb.vxc_device_resident = false;
+        cb.build_vxc = [xc_ptr](const double* h_dm, Precision /*prec*/, double* h_vxc,
+                                void* /*stream*/) -> double {
+          return xc_ptr->eval_vxc(h_dm, h_vxc, nullptr);
+        };
+      }
     }
   }
 
   // 2. Wire Two-Electron J/K Engine (100% Zero-Copy Device-Resident on Backend::Cuda!)
+  const RshCoefficients rsh = impl_->rsh_;
   if (impl_->opts.jk_mode == JKMode::Direct) {
     DirectJKEngine* djk = impl_->direct_jk.get();
     const double s_cut = impl_->opts.schwarz_cutoff;
@@ -393,8 +397,8 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
       cb.device_resident = true;
-      cb.build_jk = [djk, s_cut, fp32_thr](const double* d_dm, bool /*is_inc*/, Precision prec,
-                                           double* d_vj, double* d_vk, void* raw_stream) {
+      cb.build_jk = [djk, s_cut, fp32_thr, rsh](const double* d_dm, bool /*is_inc*/, Precision prec,
+                                                double* d_vj, double* d_vk, void* raw_stream) {
         JKOptions jk_opts;
         jk_opts.backend = Backend::Cuda;
         jk_opts.precision = prec;
@@ -404,14 +408,42 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
         jk_opts.compute_k = (d_vk != nullptr);
         jk_opts.k_scale = 1.0;
         jk_opts.symmetrize_dm = true;
+        if (rsh.is_rsh()) {
+          jk_opts.omega = rsh.omega;
+          jk_opts.rsh_mode = true;
+          jk_opts.k_sr = rsh.c_sr();
+          jk_opts.k_lr = rsh.c_lr();
+        }
         djk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
+      };
+      cb.build_jk_uks = [djk, s_cut, fp32_thr, rsh](const double* d_da, const double* d_db,
+                                                    bool /*is_inc*/, Precision prec, double* d_vj,
+                                                    double* d_vka, double* d_vkb,
+                                                    void* raw_stream) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Cuda;
+        jk_opts.precision = prec;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (d_vj != nullptr);
+        jk_opts.compute_k = (d_vka != nullptr) || (d_vkb != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = true;
+        if (rsh.is_rsh()) {
+          jk_opts.omega = rsh.omega;
+          jk_opts.rsh_mode = true;
+          jk_opts.k_sr = rsh.c_sr();
+          jk_opts.k_lr = rsh.c_lr();
+        }
+        djk->compute_jk_uhf_device(d_da, d_db, d_vj, d_vka, d_vkb, jk_opts, raw_stream);
       };
     } else
 #endif
     {
       cb.device_resident = false;
-      cb.build_jk = [djk, be, s_cut, fp32_thr](const double* h_dm, bool /*is_inc*/, Precision prec,
-                                               double* h_vj, double* h_vk, void* /*stream*/) {
+      cb.build_jk = [djk, be, s_cut, fp32_thr, rsh](const double* h_dm, bool /*is_inc*/,
+                                                    Precision prec, double* h_vj, double* h_vk,
+                                                    void* /*stream*/) {
         JKOptions jk_opts;
         jk_opts.backend = be;
         jk_opts.precision = prec;
@@ -421,71 +453,131 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
         jk_opts.compute_k = (h_vk != nullptr);
         jk_opts.k_scale = 1.0;
         jk_opts.symmetrize_dm = true;
+        if (rsh.is_rsh()) {
+          jk_opts.omega = rsh.omega;
+          jk_opts.rsh_mode = true;
+          jk_opts.k_sr = rsh.c_sr();
+          jk_opts.k_lr = rsh.c_lr();
+        }
         djk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
+      };
+      cb.build_jk_uks = [djk, be, s_cut, fp32_thr, rsh](const double* h_da, const double* h_db,
+                                                        bool /*is_inc*/, Precision prec,
+                                                        double* h_vj, double* h_vka, double* h_vkb,
+                                                        void* /*stream*/) {
+        JKOptions jk_opts;
+        jk_opts.backend = be;
+        jk_opts.precision = prec;
+        jk_opts.schwarz_cutoff = s_cut;
+        jk_opts.fp32_threshold = fp32_thr;
+        jk_opts.compute_j = (h_vj != nullptr);
+        jk_opts.compute_k = (h_vka != nullptr) || (h_vkb != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = true;
+        if (rsh.is_rsh()) {
+          jk_opts.omega = rsh.omega;
+          jk_opts.rsh_mode = true;
+          jk_opts.k_sr = rsh.c_sr();
+          jk_opts.k_lr = rsh.c_lr();
+        }
+        djk->compute_jk_uhf(h_da, h_db, h_vj, h_vka, h_vkb, jk_opts);
       };
     }
   } else if (impl_->opts.jk_mode == JKMode::RI) {
     RIJKEngine* rijk = impl_->ri_jk.get();
+    const GemmMode target_gemm = run_scf_opts.gemm_mode;
+    const GemmMode early_gemm = run_scf_opts.early_gemm_mode;
+    const int oz_slices = run_scf_opts.ozaki_slices;
+    auto make_ri_opts = [target_gemm, early_gemm, oz_slices, rsh](
+                            Backend b, Precision prec, bool do_j, bool do_k) {
+      GemmMode k_mode = target_gemm;
+      if (prec == Precision::FP32) {
+        k_mode = GemmMode::FP32;
+      } else if (prec == Precision::Mixed) {
+        k_mode = early_gemm;
+      }
+      JKOptions jk_opts;
+      jk_opts.backend = b;
+      jk_opts.precision = (k_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
+      jk_opts.gemm_mode = k_mode;
+      jk_opts.ozaki_slices = oz_slices;
+      jk_opts.compute_j = do_j;
+      jk_opts.compute_k = do_k;
+      jk_opts.k_scale = 1.0;
+      jk_opts.symmetrize_dm = true;
+      if (rsh.is_rsh()) {
+        jk_opts.omega = rsh.omega;
+        jk_opts.rsh_mode = true;
+        jk_opts.k_sr = rsh.c_sr();
+        jk_opts.k_lr = rsh.c_lr();
+      }
+      return jk_opts;
+    };
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
-      const GemmMode target_gemm = run_scf_opts.gemm_mode;
-      const GemmMode early_gemm = run_scf_opts.early_gemm_mode;
-      const int oz_slices = run_scf_opts.ozaki_slices;
-      if (need_k &&
-          (target_gemm == GemmMode::OzakiInt8 ||
-           (run_scf_opts.dynamic_precision && early_gemm == GemmMode::OzakiInt8)) &&
-          !impl_->gpu_rijk) {
-        impl_->gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*rijk, /*prealloc_k=*/true);
-      }
-      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
       cb.device_resident = true;
-      cb.build_jk = [rijk, g_ri, target_gemm, early_gemm, oz_slices](
-                        const double* d_dm, bool /*is_inc*/, Precision prec, double* d_vj,
-                        double* d_vk, void* raw_stream) {
-        GemmMode k_mode = target_gemm;
-        if (prec == Precision::FP32) {
-          k_mode = GemmMode::FP32;
-        } else if (prec == Precision::Mixed) {
-          k_mode = early_gemm;
-        }
-
-        if (d_vk != nullptr && k_mode == GemmMode::OzakiInt8 && g_ri != nullptr) {
-          if (d_vj != nullptr) {
-            JKOptions j_opts;
-            j_opts.backend = Backend::Cuda;
-            j_opts.precision = Precision::FP64;
-            j_opts.compute_j = true;
-            j_opts.compute_k = false;
-            j_opts.symmetrize_dm = true;
-            rijk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
-          }
-          g_ri->compute_k_device(d_dm, d_vk, GemmMode::OzakiInt8, oz_slices,
-                                 /*symmetrize_out=*/true, static_cast<StreamHandle>(raw_stream));
-        } else {
-          JKOptions jk_opts;
-          jk_opts.backend = Backend::Cuda;
-          jk_opts.precision = (k_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
-          jk_opts.compute_j = (d_vj != nullptr);
-          jk_opts.compute_k = (d_vk != nullptr);
-          jk_opts.k_scale = 1.0;
-          jk_opts.symmetrize_dm = true;
-          rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
-        }
+      cb.build_jk = [rijk, make_ri_opts](const double* d_dm, bool /*is_inc*/, Precision prec,
+                                         double* d_vj, double* d_vk, void* raw_stream) {
+        const JKOptions jk_opts =
+            make_ri_opts(Backend::Cuda, prec, d_vj != nullptr, d_vk != nullptr);
+        rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
+      };
+      cb.build_jk_mo = [rijk, make_ri_opts](const double* d_dm, const double* d_c_occ, int n_occ,
+                                            bool /*is_inc*/, Precision prec, double* d_vj,
+                                            double* d_vk, void* raw_stream) {
+        const JKOptions jk_opts =
+            make_ri_opts(Backend::Cuda, prec, d_vj != nullptr, d_vk != nullptr);
+        rijk->compute_jk_mo_device(d_dm, d_c_occ, n_occ, 2.0, d_vj, d_vk, jk_opts, raw_stream);
+      };
+      cb.build_jk_uks = [rijk, make_ri_opts](const double* d_da, const double* d_db,
+                                             bool /*is_inc*/, Precision prec, double* d_vj,
+                                             double* d_vka, double* d_vkb, void* raw_stream) {
+        const JKOptions jk_opts = make_ri_opts(
+            Backend::Cuda, prec, d_vj != nullptr, (d_vka != nullptr || d_vkb != nullptr));
+        rijk->compute_jk_uks_mo_device(d_da, d_db, nullptr, -1, nullptr, -1, d_vj, d_vka, d_vkb,
+                                       jk_opts, raw_stream);
+      };
+      cb.build_jk_uks_mo = [rijk, make_ri_opts](
+                               const double* d_da, const double* d_db, const double* d_ca,
+                               int n_alpha, const double* d_cb, int n_beta, bool /*is_inc*/,
+                               Precision prec, double* d_vj, double* d_vka, double* d_vkb,
+                               void* raw_stream) {
+        const JKOptions jk_opts = make_ri_opts(
+            Backend::Cuda, prec, d_vj != nullptr, (d_vka != nullptr || d_vkb != nullptr));
+        rijk->compute_jk_uks_mo_device(d_da, d_db, d_ca, n_alpha, d_cb, n_beta, d_vj, d_vka, d_vkb,
+                                       jk_opts, raw_stream);
       };
     } else
 #endif
     {
       cb.device_resident = false;
-      cb.build_jk = [rijk, be](const double* h_dm, bool /*is_inc*/, Precision prec, double* h_vj,
-                               double* h_vk, void* /*stream*/) {
-        JKOptions jk_opts;
-        jk_opts.backend = be;
-        jk_opts.precision = (prec == Precision::FP32) ? Precision::FP32 : Precision::FP64;
-        jk_opts.compute_j = (h_vj != nullptr);
-        jk_opts.compute_k = (h_vk != nullptr);
-        jk_opts.k_scale = 1.0;
-        jk_opts.symmetrize_dm = true;
+      cb.build_jk = [rijk, be, make_ri_opts](const double* h_dm, bool /*is_inc*/, Precision prec,
+                                             double* h_vj, double* h_vk, void* /*stream*/) {
+        const JKOptions jk_opts = make_ri_opts(be, prec, h_vj != nullptr, h_vk != nullptr);
         rijk->compute_jk(h_dm, h_vj, h_vk, jk_opts);
+      };
+      cb.build_jk_mo = [rijk, be, make_ri_opts](const double* h_dm, const double* h_c_occ,
+                                                int n_occ, bool /*is_inc*/, Precision prec,
+                                                double* h_vj, double* h_vk, void* /*stream*/) {
+        const JKOptions jk_opts = make_ri_opts(be, prec, h_vj != nullptr, h_vk != nullptr);
+        rijk->compute_jk_mo(h_dm, h_c_occ, n_occ, 2.0, h_vj, h_vk, jk_opts);
+      };
+      cb.build_jk_uks = [rijk, be, make_ri_opts](const double* h_da, const double* h_db,
+                                                 bool /*is_inc*/, Precision prec, double* h_vj,
+                                                 double* h_vka, double* h_vkb, void* /*stream*/) {
+        const JKOptions jk_opts =
+            make_ri_opts(be, prec, h_vj != nullptr, (h_vka != nullptr || h_vkb != nullptr));
+        rijk->compute_jk_uks_mo(h_da, h_db, nullptr, -1, nullptr, -1, h_vj, h_vka, h_vkb, jk_opts);
+      };
+      cb.build_jk_uks_mo = [rijk, be, make_ri_opts](
+                                   const double* h_da, const double* h_db, const double* h_ca,
+                                   int n_alpha, const double* h_cb, int n_beta, bool /*is_inc*/,
+                                   Precision prec, double* h_vj, double* h_vka, double* h_vkb,
+                                   void* /*stream*/) {
+        const JKOptions jk_opts =
+            make_ri_opts(be, prec, h_vj != nullptr, (h_vka != nullptr || h_vkb != nullptr));
+        rijk->compute_jk_uks_mo(h_da, h_db, h_ca, n_alpha, h_cb, n_beta, h_vj, h_vka, h_vkb,
+                                jk_opts);
       };
     }
   } else if (impl_->opts.jk_mode == JKMode::SnK) {
@@ -513,6 +605,26 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           snk->compute_k_device(d_dm, d_vk, raw_stream);
         }
       };
+      cb.build_jk_uks = [djk, snk, s_cut, fp32_thr](const double* d_da, const double* d_db,
+                                                    bool /*is_inc*/, Precision prec, double* d_vj,
+                                                    double* d_vka, double* d_vkb,
+                                                    void* raw_stream) {
+        if (d_vj != nullptr) {
+          JKOptions j_opts;
+          j_opts.backend = Backend::Cuda;
+          j_opts.precision = prec;
+          j_opts.schwarz_cutoff = s_cut;
+          j_opts.fp32_threshold = fp32_thr;
+          j_opts.compute_j = true;
+          j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
+          djk->compute_jk_uhf_device(d_da, d_db, d_vj, nullptr, nullptr, j_opts, raw_stream);
+        }
+        if (snk != nullptr) {
+          if (d_vka != nullptr) snk->compute_k_device(d_da, d_vka, raw_stream);
+          if (d_vkb != nullptr) snk->compute_k_device(d_db, d_vkb, raw_stream);
+        }
+      };
     } else
 #endif
     {
@@ -533,6 +645,26 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
         }
         if (h_vk != nullptr && snk != nullptr) {
           snk->compute_k(h_dm, h_vk);
+        }
+      };
+      cb.build_jk_uks = [djk, snk, be, s_cut, fp32_thr](const double* h_da, const double* h_db,
+                                                        bool /*is_inc*/, Precision prec,
+                                                        double* h_vj, double* h_vka, double* h_vkb,
+                                                        void* /*stream*/) {
+        if (h_vj != nullptr) {
+          JKOptions j_opts;
+          j_opts.backend = be;
+          j_opts.precision = prec;
+          j_opts.schwarz_cutoff = s_cut;
+          j_opts.fp32_threshold = fp32_thr;
+          j_opts.compute_j = true;
+          j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
+          djk->compute_jk_uhf(h_da, h_db, h_vj, nullptr, nullptr, j_opts);
+        }
+        if (snk != nullptr) {
+          if (h_vka != nullptr) snk->compute_k(h_da, h_vka);
+          if (h_vkb != nullptr) snk->compute_k(h_db, h_vkb);
         }
       };
     }
@@ -557,6 +689,27 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           snk->compute_k_device(d_dm, d_vk, raw_stream);
         }
       };
+      cb.build_jk_uks = [rijk, snk, n2](const double* d_da, const double* d_db, bool /*is_inc*/,
+                                        Precision /*prec*/, double* d_vj, double* d_vka,
+                                        double* d_vkb, void* raw_stream) {
+        auto s = static_cast<StreamHandle>(raw_stream);
+        if (d_vj != nullptr) {
+          PooledBuffer<double> d_dtot(default_device_pool(), n2, s);
+          copy_d2d_async(d_dtot.data(), d_da, n2 * sizeof(double), s);
+          axpby_device(n2, 1.0, d_db, 1.0, d_dtot.data(), s);
+          JKOptions j_opts;
+          j_opts.backend = Backend::Cuda;
+          j_opts.precision = Precision::FP64;
+          j_opts.compute_j = true;
+          j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
+          rijk->compute_jk_device(d_dtot.data(), d_vj, nullptr, j_opts, raw_stream);
+        }
+        if (snk != nullptr) {
+          if (d_vka != nullptr) snk->compute_k_device(d_da, d_vka, raw_stream);
+          if (d_vkb != nullptr) snk->compute_k_device(d_db, d_vkb, raw_stream);
+        }
+      };
     } else
 #endif
     {
@@ -576,6 +729,25 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
           snk->compute_k(h_dm, h_vk);
         }
       };
+      cb.build_jk_uks = [rijk, snk, be, n2](const double* h_da, const double* h_db, bool /*is_inc*/,
+                                            Precision /*prec*/, double* h_vj, double* h_vka,
+                                            double* h_vkb, void* /*stream*/) {
+        if (h_vj != nullptr) {
+          std::vector<double> h_dtot(n2, 0.0);
+          for (std::size_t i = 0; i < n2; ++i) h_dtot[i] = h_da[i] + h_db[i];
+          JKOptions j_opts;
+          j_opts.backend = be;
+          j_opts.precision = Precision::FP64;
+          j_opts.compute_j = true;
+          j_opts.compute_k = false;
+          j_opts.symmetrize_dm = true;
+          rijk->compute_jk(h_dtot.data(), h_vj, nullptr, j_opts);
+        }
+        if (snk != nullptr) {
+          if (h_vka != nullptr) snk->compute_k(h_da, h_vka);
+          if (h_vkb != nullptr) snk->compute_k(h_db, h_vkb);
+        }
+      };
     }
   }
 
@@ -583,11 +755,34 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
 
   sync_gpu_if_cuda(be);
   const auto t_scf_start = SteadyClock::now();
-  ScfResult scf_res =
-      driver.run(n_ao, impl_->n_elec, impl_->e_nuc, impl_->S_mat.data(), impl_->H_core_mat.data(),
-                 cb, initial_dm_host.empty() ? nullptr : initial_dm_host.data());
+  ScfResult scf_res;
+  if (is_unrestricted) {
+    if (initial_dm_host.empty()) {
+      scf_res = driver.run(n_ao, impl_->n_elec, impl_->e_nuc, impl_->S_mat.data(),
+                           impl_->H_core_mat.data(), cb, nullptr, nullptr);
+    } else if (initial_dm_host.size() == 2 * n2) {
+      scf_res = driver.run(n_ao, impl_->n_elec, impl_->e_nuc, impl_->S_mat.data(),
+                           impl_->H_core_mat.data(), cb, initial_dm_host.data(),
+                           initial_dm_host.data() + n2);
+    } else {
+      scf_res = driver.run(n_ao, impl_->n_elec, impl_->e_nuc, impl_->S_mat.data(),
+                           impl_->H_core_mat.data(), cb, initial_dm_host.data());
+    }
+  } else {
+    scf_res = driver.run(n_ao, impl_->n_elec, impl_->e_nuc, impl_->S_mat.data(),
+                         impl_->H_core_mat.data(), cb,
+                         initial_dm_host.empty() ? nullptr : initial_dm_host.data());
+  }
   sync_gpu_if_cuda(be);
+  if (impl_->ri_jk != nullptr) {
+    impl_->ri_jk->release_workspaces();
+  }
   const auto t_scf_end = SteadyClock::now();
+
+  const double e_disp =
+      (impl_->dispersion_enabled && impl_->d3_cached.has_value()) ? impl_->d3_cached->energy : 0.0;
+  scf_res.dispersion_energy = e_disp;
+  scf_res.total_energy += e_disp;
 
   impl_->last_scf = scf_res;
 
@@ -601,6 +796,7 @@ WorkflowResult MolecularScf::run(std::span<const double> initial_dm_host) {
   out.grid_npoints = impl_->grid_npoints;
   out.grid_nbatches = impl_->grid_nbatches;
   out.active_ao_ratio = impl_->active_ao_ratio;
+  out.dispersion_energy = e_disp;
   out.overlap_matrix = impl_->S_mat;
   out.hcore_matrix = impl_->H_core_mat;
   return out;
@@ -616,6 +812,11 @@ GradientResult MolecularScf::compute_gradient(const ScfResult& scf_res) {
     throw std::invalid_argument(
         "MolecularScf::compute_gradient: density_matrix and energy_weighted_dm must have size nao^2");
   }
+  if (scf_res.unrestricted &&
+      (scf_res.density_alpha.size() != n2 || scf_res.density_beta.size() != n2)) {
+    throw std::invalid_argument(
+        "MolecularScf::compute_gradient: unrestricted density_alpha and density_beta must have size nao^2");
+  }
 
   const Backend be = impl_->opts.scf.backend;
   const double grad_schwarz = std::min(impl_->opts.schwarz_cutoff, 1e-13);
@@ -623,6 +824,7 @@ GradientResult MolecularScf::compute_gradient(const ScfResult& scf_res) {
   GradientResult gres;
   gres.natom = n_atom;
   gres.xc_grad.assign(ncomp, 0.0);
+  gres.dispersion_grad.assign(ncomp, 0.0);
 
   sync_gpu_if_cuda(be);
   const auto t_tot_start = SteadyClock::now();
@@ -638,19 +840,93 @@ GradientResult MolecularScf::compute_gradient(const ScfResult& scf_res) {
   gres.one_electron_time_s = elapsed_seconds(t_1e_start, t_1e_end);
 
   const auto t_2e_start = SteadyClock::now();
-  gres.two_electron_grad =
-      jk_nuclear_grad(impl_->basis, impl_->atoms, scf_res.density_matrix.data(),
-                      impl_->exx_fraction, be, grad_schwarz);
+  if (impl_->opts.jk_mode == JKMode::RI) {
+    if (impl_->ri_jk == nullptr) {
+      throw std::runtime_error("MolecularScf::compute_gradient: RIJKEngine is not initialized");
+    }
+    const int nao = impl_->basis.nao();
+    auto slice_occ = [&](const std::vector<double>& mo, int nmo, int n_occ) {
+      std::vector<double> out;
+      if (mo.empty() || nmo < n_occ || n_occ <= 0 || nao <= 0) return out;
+      out.resize(static_cast<std::size_t>(nao) * n_occ);
+      for (int r = 0; r < nao; ++r) {
+        const double* src = mo.data() + static_cast<std::size_t>(r) * nmo;
+        double* dst = out.data() + static_cast<std::size_t>(r) * n_occ;
+        std::copy(src, src + n_occ, dst);
+      }
+      return out;
+    };
+    const double j_frac = 1.0;
+    const double k_sr = impl_->rsh_.is_rsh() ? impl_->rsh_.c_sr() : impl_->exx_fraction;
+    const double k_lr = impl_->rsh_.is_rsh() ? impl_->rsh_.c_lr() : impl_->exx_fraction;
+    const double omega = impl_->rsh_.is_rsh() ? impl_->rsh_.omega : 0.0;
+    if (scf_res.unrestricted) {
+      const int n_a = scf_res.n_alpha;
+      const int n_b = scf_res.n_beta;
+      const std::vector<double> c_a = slice_occ(scf_res.mo_coefficients, scf_res.nmo, n_a);
+      const std::vector<double> c_b = slice_occ(scf_res.mo_coefficients_beta, scf_res.nmo, n_b);
+      const int n_a_arg =
+          !c_a.empty() ? n_a : ((n_a == 0 && (scf_res.nmo > 0 || scf_res.converged)) ? 0 : -1);
+      const int n_b_arg =
+          !c_b.empty() ? n_b : ((n_b == 0 && (scf_res.nmo > 0 || scf_res.converged)) ? 0 : -1);
+      gres.two_electron_grad = impl_->ri_jk->compute_ri_jk_grad(
+          impl_->atoms, scf_res.density_alpha.data(), c_a.empty() ? nullptr : c_a.data(), n_a_arg,
+          scf_res.density_beta.data(), c_b.empty() ? nullptr : c_b.data(), n_b_arg,
+          /*unrestricted=*/true, j_frac, k_sr, k_lr, omega, be);
+    } else {
+      const int n_occ = (scf_res.n_alpha > 0) ? scf_res.n_alpha : (impl_->n_elec / 2);
+      const std::vector<double> c_a = slice_occ(scf_res.mo_coefficients, scf_res.nmo, n_occ);
+      const int n_a_arg =
+          !c_a.empty() ? n_occ : ((n_occ == 0 && (scf_res.nmo > 0 || scf_res.converged)) ? 0 : -1);
+      gres.two_electron_grad = impl_->ri_jk->compute_ri_jk_grad(
+          impl_->atoms, scf_res.density_matrix.data(), c_a.empty() ? nullptr : c_a.data(), n_a_arg,
+          nullptr, nullptr, 0, /*unrestricted=*/false, j_frac, k_sr, k_lr, omega, be);
+    }
+  } else if (impl_->rsh_.is_rsh()) {
+    if (scf_res.unrestricted) {
+      gres.two_electron_grad = jk_nuclear_grad_uhf_rsh(
+          impl_->basis, impl_->atoms, scf_res.density_alpha.data(), scf_res.density_beta.data(),
+          impl_->rsh_.c_sr(), impl_->rsh_.c_lr(), impl_->rsh_.omega, be, grad_schwarz);
+    } else {
+      gres.two_electron_grad = jk_nuclear_grad_rsh(
+          impl_->basis, impl_->atoms, scf_res.density_matrix.data(), impl_->rsh_.c_sr(),
+          impl_->rsh_.c_lr(), impl_->rsh_.omega, be, grad_schwarz);
+    }
+  } else if (scf_res.unrestricted) {
+    gres.two_electron_grad =
+        jk_nuclear_grad_uhf(impl_->basis, impl_->atoms, scf_res.density_alpha.data(),
+                            scf_res.density_beta.data(), impl_->exx_fraction, be, grad_schwarz);
+  } else {
+    gres.two_electron_grad =
+        jk_nuclear_grad(impl_->basis, impl_->atoms, scf_res.density_matrix.data(),
+                        impl_->exx_fraction, be, grad_schwarz);
+  }
   sync_gpu_if_cuda(be);
   const auto t_2e_end = SteadyClock::now();
   gres.two_electron_time_s = elapsed_seconds(t_2e_start, t_2e_end);
 
   if (impl_->is_dft_flag && impl_->xc_engine != nullptr) {
     const auto t_xc_start = SteadyClock::now();
-    gres.xc_grad = impl_->xc_engine->nuclear_grad(impl_->xc_atoms, scf_res.density_matrix);
+    if (scf_res.unrestricted) {
+      gres.xc_grad = impl_->xc_engine->nuclear_grad_uks(impl_->xc_atoms, scf_res.density_alpha,
+                                                        scf_res.density_beta);
+    } else {
+      gres.xc_grad = impl_->xc_engine->nuclear_grad(impl_->xc_atoms, scf_res.density_matrix);
+    }
     sync_gpu_if_cuda(be);
     const auto t_xc_end = SteadyClock::now();
     gres.xc_time_s = elapsed_seconds(t_xc_start, t_xc_end);
+  }
+
+  if (impl_->dispersion_enabled) {
+    const auto t_d3_start = SteadyClock::now();
+    if (impl_->d3_cached.has_value() && impl_->d3_cached->gradient.size() == ncomp) {
+      gres.dispersion_grad = impl_->d3_cached->gradient;
+    } else {
+      gres.dispersion_grad = dftd3::compute_d3bj(impl_->atoms, impl_->opts.xc, true).gradient;
+    }
+    const auto t_d3_end = SteadyClock::now();
+    gres.dispersion_time_s = elapsed_seconds(t_d3_start, t_d3_end);
   }
 
   const auto t_tot_end = SteadyClock::now();
@@ -659,7 +935,7 @@ GradientResult MolecularScf::compute_gradient(const ScfResult& scf_res) {
   gres.total_grad.assign(ncomp, 0.0);
   for (std::size_t i = 0; i < ncomp; ++i) {
     gres.total_grad[i] = gres.nuclear_repulsion_grad[i] + gres.one_electron_grad[i] +
-                         gres.two_electron_grad[i] + gres.xc_grad[i];
+                         gres.two_electron_grad[i] + gres.xc_grad[i] + gres.dispersion_grad[i];
   }
   return gres;
 }
@@ -697,6 +973,14 @@ ResponseResult MolecularScf::run_response(const ResponseOptions& resp_opts) {
   }
 
   const ScfResult& scf_res = *impl_->last_scf;
+  if (impl_->opts.unrestricted || scf_res.unrestricted) {
+    throw NotImplemented(
+        "MolecularScf::run_response: unrestricted TDDFT/CIS is not implemented");
+  }
+  if (impl_->rsh_.is_rsh()) {
+    throw NotImplemented(
+        "MolecularScf::run_response: range-separated hybrid TDDFT is not implemented");
+  }
   const int n_ao = scf_res.nao;
   const int n_occ = impl_->n_elec / 2;
 
@@ -740,42 +1024,21 @@ ResponseResult MolecularScf::run_response(const ResponseOptions& resp_opts) {
     RIJKEngine* rijk = impl_->ri_jk.get();
 #if defined(GPU4DFT_HAVE_CUDA)
     if (be == Backend::Cuda) {
-      const bool want_ozaki_k =
-          need_k &&
-          (eff_opts.gemm_mode == GemmMode::OzakiInt8 ||
-           (eff_opts.dynamic_precision && eff_opts.early_gemm_mode == GemmMode::OzakiInt8));
-      if (want_ozaki_k && !impl_->gpu_rijk) {
-        impl_->gpu_rijk = std::make_unique<GpuRIJKDeviceState>(*rijk, /*prealloc_k=*/true);
-      }
-      GpuRIJKDeviceState* g_ri = impl_->gpu_rijk.get();
       const GemmMode final_mode = eff_opts.gemm_mode;
       const int oz_slices = eff_opts.ozaki_slices;
       cb.device_resident = true;
-      cb.build_jk = [rijk, g_ri, final_mode, oz_slices](const double* d_dm, double* d_vj,
-                                                        double* d_vk, void* raw_stream) {
-        if (d_vk != nullptr && final_mode == GemmMode::OzakiInt8 && g_ri != nullptr) {
-          if (d_vj != nullptr) {
-            JKOptions j_opts;
-            j_opts.backend = Backend::Cuda;
-            j_opts.precision = Precision::FP64;
-            j_opts.compute_j = true;
-            j_opts.compute_k = false;
-            j_opts.symmetrize_dm = false;
-            rijk->compute_jk_device(d_dm, d_vj, nullptr, j_opts, raw_stream);
-          }
-          g_ri->compute_k_device(d_dm, d_vk, GemmMode::OzakiInt8, oz_slices,
-                                 /*symmetrize_out=*/false, static_cast<StreamHandle>(raw_stream));
-        } else {
-          JKOptions jk_opts;
-          jk_opts.backend = Backend::Cuda;
-          jk_opts.precision =
-              (final_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
-          jk_opts.compute_j = (d_vj != nullptr);
-          jk_opts.compute_k = (d_vk != nullptr);
-          jk_opts.k_scale = 1.0;
-          jk_opts.symmetrize_dm = false;
-          rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
-        }
+      cb.build_jk = [rijk, final_mode, oz_slices](const double* d_dm, double* d_vj, double* d_vk,
+                                                  void* raw_stream) {
+        JKOptions jk_opts;
+        jk_opts.backend = Backend::Cuda;
+        jk_opts.precision = (final_mode == GemmMode::FP32) ? Precision::FP32 : Precision::FP64;
+        jk_opts.gemm_mode = final_mode;
+        jk_opts.ozaki_slices = oz_slices;
+        jk_opts.compute_j = (d_vj != nullptr);
+        jk_opts.compute_k = (d_vk != nullptr);
+        jk_opts.k_scale = 1.0;
+        jk_opts.symmetrize_dm = false;
+        rijk->compute_jk_device(d_dm, d_vj, d_vk, jk_opts, raw_stream);
       };
     } else
 #endif
@@ -939,6 +1202,7 @@ VibrationalResult MolecularScf::run_hessian(const HessianOptions& hess_opts,
   disp_opts.grid.backend = be;
   disp_opts.xc_options.backend = be;
   disp_opts.xc_options.precision = Precision::FP64;
+  disp_opts.xc_options.grid_response = !hess_opts.fixed_xc_grid;
 
   std::vector<double> fixed_coords;
   std::vector<double> fixed_weights;
@@ -952,7 +1216,14 @@ VibrationalResult MolecularScf::run_hessian(const HessianOptions& hess_opts,
     }
   }
 
-  const std::vector<double> eq_dm = impl_->last_scf->density_matrix;
+  std::vector<double> eq_dm = impl_->last_scf->density_matrix;
+  if (impl_->opts.unrestricted && impl_->last_scf->unrestricted) {
+    eq_dm.resize(impl_->last_scf->density_alpha.size() + impl_->last_scf->density_beta.size());
+    std::copy(impl_->last_scf->density_alpha.begin(), impl_->last_scf->density_alpha.end(),
+              eq_dm.begin());
+    std::copy(impl_->last_scf->density_beta.begin(), impl_->last_scf->density_beta.end(),
+              eq_dm.begin() + static_cast<std::ptrdiff_t>(impl_->last_scf->density_alpha.size()));
+  }
 
   auto grad_fn = [&](std::span<const Atom> disp_atoms) -> std::vector<double> {
     std::vector<Shell> disp_shells = raw_template_shells;
@@ -1001,13 +1272,35 @@ WorkflowResult run_scf(const Basis& basis, std::span<const Atom> atoms, int n_el
 
 GradientResult run_grad(const Basis& basis, std::span<const Atom> atoms, const ScfResult& scf_res,
                         const WorkflowOptions& opts, std::span<const double> external_grid_coords,
-                        std::span<const double> external_grid_weights) {
+                        std::span<const double> external_grid_weights, const Basis* aux_basis) {
   WorkflowOptions grad_opts = opts;
-  // Analytical 2e gradient uses exact 4-center Rys/MD derivative engine regardless of SCF JK mode,
-  // so no auxiliary basis is needed when constructing a standalone gradient evaluator.
-  grad_opts.jk_mode = JKMode::Direct;
-  MolecularScf runner(basis, std::vector<Atom>(atoms.begin(), atoms.end()), /*n_elec=*/0, grad_opts,
-                      std::nullopt, external_grid_coords, external_grid_weights);
+  std::optional<Basis> opt_aux;
+  if (aux_basis != nullptr) {
+    opt_aux = *aux_basis;
+  } else if (grad_opts.jk_mode == JKMode::RI) {
+    throw std::invalid_argument(
+        "run_grad: JKMode::RI requires an explicit aux_basis (or use MolecularScf::compute_gradient())");
+  }
+  int n_elec = 0;
+  if (scf_res.unrestricted) {
+    n_elec = scf_res.n_alpha + scf_res.n_beta;
+  } else if (scf_res.n_alpha > 0) {
+    n_elec = 2 * scf_res.n_alpha;
+  } else if (scf_res.density_matrix.size() ==
+             static_cast<std::size_t>(basis.nao()) * basis.nao()) {
+    const std::vector<double> S = overlap_matrix(basis, Backend::Host);
+    double tr = 0.0;
+    for (std::size_t i = 0; i < S.size(); ++i) tr += scf_res.density_matrix[i] * S[i];
+    n_elec = std::max(0, static_cast<int>(std::llround(tr)));
+  }
+  if (scf_res.unrestricted) {
+    grad_opts.unrestricted = true;
+    grad_opts.scf.unrestricted = true;
+    grad_opts.spin = scf_res.n_alpha - scf_res.n_beta;
+    grad_opts.scf.spin = grad_opts.spin;
+  }
+  MolecularScf runner(basis, std::vector<Atom>(atoms.begin(), atoms.end()), n_elec, grad_opts,
+                      std::move(opt_aux), external_grid_coords, external_grid_weights);
   return runner.compute_gradient(scf_res);
 }
 

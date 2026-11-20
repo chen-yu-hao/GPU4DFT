@@ -43,8 +43,14 @@ def aux_basis_from_pyscf(mol, auxbasis: str | dict = "def2-universal-jkfit") -> 
     return basis_from_pyscf(auxmol)
 
 
-def minao_init_guess(mol) -> np.ndarray:
+def minao_init_guess(mol, unrestricted: bool = False) -> np.ndarray:
     """Compute PySCF's atomic ``minao`` initial density guess as a contiguous float64 array."""
+    if unrestricted:
+        from pyscf.scf import uhf
+
+        dm0 = uhf.init_guess_by_minao(mol)
+        return np.ascontiguousarray(dm0, dtype=np.float64)
+
     from pyscf.scf import hf
 
     dm0 = hf.init_guess_by_minao(mol)

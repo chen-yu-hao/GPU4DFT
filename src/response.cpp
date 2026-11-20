@@ -1997,6 +1997,10 @@ ResponseResult run_linear_response(const Basis& basis, std::span<const Atom> ato
 
   ResponseOptions eff_opts = opts;
   const bool is_hf = is_hf_xc_name(xc_name);
+  if (!is_hf && xc_rsh_coefficients(xc_name).is_rsh()) {
+    throw NotImplemented(
+        "run_linear_response: range-separated hybrid TDDFT is not implemented");
+  }
   eff_opts.exact_exchange_fraction = is_hf ? 1.0 : xc_exact_exchange_fraction(xc_name);
 
   const bool need_k = (std::abs(eff_opts.exact_exchange_fraction) > 0.0);
@@ -2453,6 +2457,7 @@ VibrationalResult compute_molecular_hessian(
   wf_opts.scf.incremental_fock = false;
   wf_opts.grid.backend = hess_opts.backend;
   wf_opts.xc_options.backend = hess_opts.backend;
+  wf_opts.xc_options.grid_response = !hess_opts.fixed_xc_grid;
 
   std::vector<double> fixed_coords(external_grid_coords.begin(), external_grid_coords.end());
   std::vector<double> fixed_weights(external_grid_weights.begin(), external_grid_weights.end());

@@ -36,6 +36,7 @@ inline void check_cusolver(cusolverStatus_t status, const char* context) {
 }
 
 constexpr std::size_t kCublasWorkspaceBytes = 32ULL * 1024ULL * 1024ULL;
+constexpr int kMaxOzakiMChunk = 16384;
 constexpr int kMaxOzakiKChunk = 32768;
 
 // ---------------------------------------------------------------------------
@@ -407,6 +408,67 @@ __global__ void assemble_fock_and_traces_kernel(std::size_t count, const double*
   }
 }
 
+__global__ void assemble_fock_and_traces_uks_kernel(std::size_t count, const double* Da,
+                                                    const double* Db, const double* H,
+                                                    const double* J, const double* Ka,
+                                                    const double* Kb, double alpha_x,
+                                                    const double* Vxca, const double* Vxcb,
+                                                    double* Fa_out, double* Fb_out,
+                                                    double* traces4_out) {
+  __shared__ double s_trH[256];
+  __shared__ double s_trJ[256];
+  __shared__ double s_trKa[256];
+  __shared__ double s_trKb[256];
+
+  double trH = 0.0;
+  double trJ = 0.0;
+  double trKa = 0.0;
+  double trKb = 0.0;
+
+  for (std::size_t idx = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < count; idx += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
+    const double da = Da[idx];
+    const double db = Db[idx];
+    const double dtot = da + db;
+    const double h = H[idx];
+    const double j = (J != nullptr) ? J[idx] : 0.0;
+    const double ka = (Ka != nullptr && alpha_x != 0.0) ? Ka[idx] : 0.0;
+    const double kb = (Kb != nullptr && alpha_x != 0.0) ? Kb[idx] : 0.0;
+    const double vxca = (Vxca != nullptr) ? Vxca[idx] : 0.0;
+    const double vxcb = (Vxcb != nullptr) ? Vxcb[idx] : 0.0;
+
+    Fa_out[idx] = h + j - alpha_x * ka + vxca;
+    Fb_out[idx] = h + j - alpha_x * kb + vxcb;
+    trH += dtot * h;
+    trJ += dtot * j;
+    trKa += da * ka;
+    trKb += db * kb;
+  }
+
+  s_trH[threadIdx.x] = trH;
+  s_trJ[threadIdx.x] = trJ;
+  s_trKa[threadIdx.x] = trKa;
+  s_trKb[threadIdx.x] = trKb;
+  __syncthreads();
+
+  for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      s_trH[threadIdx.x] += s_trH[threadIdx.x + stride];
+      s_trJ[threadIdx.x] += s_trJ[threadIdx.x + stride];
+      s_trKa[threadIdx.x] += s_trKa[threadIdx.x + stride];
+      s_trKb[threadIdx.x] += s_trKb[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0 && traces4_out != nullptr) {
+    atomicAdd(&traces4_out[0], s_trH[0]);
+    atomicAdd(&traces4_out[1], s_trJ[0]);
+    atomicAdd(&traces4_out[2], s_trKa[0]);
+    atomicAdd(&traces4_out[3], s_trKb[0]);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SP2 Density Matrix Purification Kernels (100% CUDA Graph Capturable!)
 // ---------------------------------------------------------------------------
@@ -730,73 +792,82 @@ void gemm_device(GpuLinalgContext& ctx, int m, int n, int k, double alpha, const
   // GemmMode::OzakiInt8 — Error-free INT8 Tensor Core FP64-Emulated GEMM
   // -------------------------------------------------------------------------
   const int S = std::clamp(ozaki_slices, 2, 10);
-  const int mp = ((m + 15) / 16) * 16;
+  const int max_mc = std::min(m, kMaxOzakiMChunk);
+  const int max_mp = ((max_mc + 15) / 16) * 16;
   const int np = ((n + 15) / 16) * 16;
   const int max_kc = std::min(k, kMaxOzakiKChunk);
   const int max_kp = ((max_kc + 15) / 16) * 16;
 
   auto& pool = ctx.pool();
   PooledBuffer<std::int8_t> d_A_slices(
-      pool, static_cast<std::size_t>(S) * mp * max_kp, stream);
+      pool, static_cast<std::size_t>(S) * max_mp * max_kp, stream);
   PooledBuffer<std::int8_t> d_B_slices_T(
       pool, static_cast<std::size_t>(S) * np * max_kp, stream);
-  PooledBuffer<int> d_exp_A(pool, static_cast<std::size_t>(mp), stream);
+  PooledBuffer<int> d_exp_A(pool, static_cast<std::size_t>(max_mp), stream);
   PooledBuffer<int> d_exp_B(pool, static_cast<std::size_t>(np), stream);
-  PooledBuffer<std::int32_t> d_C_i32(pool, static_cast<std::size_t>(mp) * np, stream);
-  PooledBuffer<double> d_C_acc(pool, static_cast<std::size_t>(m) * n, stream);
+  PooledBuffer<std::int32_t> d_C_i32(pool, static_cast<std::size_t>(max_mp) * np, stream);
+  PooledBuffer<double> d_C_acc(pool, static_cast<std::size_t>(max_mc) * n, stream);
 
-  memset_zero_async(d_C_acc.data(), static_cast<std::size_t>(m) * n * sizeof(double), stream);
+  for (int m0 = 0; m0 < m; m0 += kMaxOzakiMChunk) {
+    const int mc = std::min(m - m0, kMaxOzakiMChunk);
+    const int mp = ((mc + 15) / 16) * 16;
+    const double* d_A_blk = d_A + (transA ? static_cast<std::size_t>(m0)
+                                          : (static_cast<std::size_t>(m0) * lda));
+    double* d_C_blk = d_C + static_cast<std::size_t>(m0) * ldc;
 
-  const std::size_t total_mn = static_cast<std::size_t>(m) * n;
-  const int blocks_mn = static_cast<int>((total_mn + 255) / 256);
+    memset_zero_async(d_C_acc.data(), static_cast<std::size_t>(mc) * n * sizeof(double), stream);
 
-  for (int k0 = 0; k0 < k; k0 += kMaxOzakiKChunk) {
-    const int kc = std::min(k - k0, kMaxOzakiKChunk);
-    const int kp = ((kc + 15) / 16) * 16;
+    const std::size_t total_mcn = static_cast<std::size_t>(mc) * n;
+    const int blocks_mcn = static_cast<int>((total_mcn + 255) / 256);
 
-    ozaki_slice_rows_kernel<<<mp, 256, 0, stream>>>(
-        m, kc, k0, mp, kp, S, d_A, lda, transA, d_exp_A.data(), d_A_slices.data());
-    ozaki_slice_cols_kernel<<<np, 256, 0, stream>>>(
-        n, kc, k0, np, kp, S, d_B, ldb, transB, d_exp_B.data(), d_B_slices_T.data());
+    for (int k0 = 0; k0 < k; k0 += kMaxOzakiKChunk) {
+      const int kc = std::min(k - k0, kMaxOzakiKChunk);
+      const int kp = ((kc + 15) / 16) * 16;
 
-    // Sum diagonals d = s + t from S + 1 down to 2 (smallest magnitude terms first!).
-    // Within each diagonal d, all pairs (s, d - s) share the exact exponent shift -7*d,
-    // so we accumulate them directly inside exact int32 Tensor Core registers/buffer!
-    for (int d = S + 1; d >= 2; --d) {
-      const int s_min = std::max(1, d - S);
-      const int s_max = std::min(S, d - 1);
-      bool first_in_diag = true;
+      ozaki_slice_rows_kernel<<<mp, 256, 0, stream>>>(
+          mc, kc, k0, mp, kp, S, d_A_blk, lda, transA, d_exp_A.data(), d_A_slices.data());
+      ozaki_slice_cols_kernel<<<np, 256, 0, stream>>>(
+          n, kc, k0, np, kp, S, d_B, ldb, transB, d_exp_B.data(), d_B_slices_T.data());
 
-      for (int s = s_min; s <= s_max; ++s) {
-        const int t = d - s;
-        const std::int8_t* ptr_A_s =
-            d_A_slices.data() + static_cast<std::size_t>(s - 1) * mp * kp;
-        const std::int8_t* ptr_B_t =
-            d_B_slices_T.data() + static_cast<std::size_t>(t - 1) * np * kp;
+      // Sum diagonals d = s + t from S + 1 down to 2 (smallest magnitude terms first!).
+      // Within each diagonal d, all pairs (s, d - s) share the exact exponent shift -7*d,
+      // so we accumulate them directly inside exact int32 Tensor Core registers/buffer!
+      for (int d = S + 1; d >= 2; --d) {
+        const int s_min = std::max(1, d - S);
+        const int s_max = std::min(S, d - 1);
+        bool first_in_diag = true;
 
-        const std::int32_t alpha_i32 = 1;
-        const std::int32_t beta_i32 = first_in_diag ? 0 : 1;
-        first_in_diag = false;
+        for (int s = s_min; s <= s_max; ++s) {
+          const int t = d - s;
+          const std::int8_t* ptr_A_s =
+              d_A_slices.data() + static_cast<std::size_t>(s - 1) * mp * kp;
+          const std::int8_t* ptr_B_t =
+              d_B_slices_T.data() + static_cast<std::size_t>(t - 1) * np * kp;
 
-        // TN layout in column-major hits native Blackwell INT8 Tensor Core MMA directly:
-        // B_slices_T is col-major [kp x np], op_T -> [np x kp];
-        // A_slices is col-major [kp x mp], op_N -> [kp x mp];
-        // Output C_i32 is col-major [np x mp] == row-major [mp x np]!
-        check_cublas(cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, np, mp, kp, &alpha_i32,
-                                  ptr_B_t, CUDA_R_8I, kp, ptr_A_s, CUDA_R_8I, kp, &beta_i32,
-                                  d_C_i32.data(), CUDA_R_32I, np, CUBLAS_COMPUTE_32I,
-                                  CUBLAS_GEMM_DEFAULT),
-                     "cublasGemmEx Ozaki INT8");
+          const std::int32_t alpha_i32 = 1;
+          const std::int32_t beta_i32 = first_in_diag ? 0 : 1;
+          first_in_diag = false;
+
+          // TN layout in column-major hits native Blackwell INT8 Tensor Core MMA directly:
+          // B_slices_T is col-major [kp x np], op_T -> [np x kp];
+          // A_slices is col-major [kp x mp], op_N -> [kp x mp];
+          // Output C_i32 is col-major [np x mp] == row-major [mp x np]!
+          check_cublas(cublasGemmEx(cublas, CUBLAS_OP_T, CUBLAS_OP_N, np, mp, kp, &alpha_i32,
+                                    ptr_B_t, CUDA_R_8I, kp, ptr_A_s, CUDA_R_8I, kp, &beta_i32,
+                                    d_C_i32.data(), CUDA_R_32I, np, CUBLAS_COMPUTE_32I,
+                                    CUBLAS_GEMM_DEFAULT),
+                       "cublasGemmEx Ozaki INT8");
+        }
+
+        ozaki_accum_diag_kernel<<<blocks_mcn, 256, 0, stream>>>(
+            mc, n, np, d_C_i32.data(), d_exp_A.data(), d_exp_B.data(), 7 * d, d_C_acc.data());
       }
-
-      ozaki_accum_diag_kernel<<<blocks_mn, 256, 0, stream>>>(
-          m, n, np, d_C_i32.data(), d_exp_A.data(), d_exp_B.data(), 7 * d, d_C_acc.data());
     }
-  }
 
-  ozaki_epilogue_kernel<<<blocks_mn, 256, 0, stream>>>(
-      m, n, alpha, d_C_acc.data(), beta, d_C, ldc);
-  check_cuda(cudaGetLastError(), "Ozaki INT8 epilogue");
+    ozaki_epilogue_kernel<<<blocks_mcn, 256, 0, stream>>>(
+        mc, n, alpha, d_C_acc.data(), beta, d_C_blk, ldc);
+    check_cuda(cudaGetLastError(), "Ozaki INT8 epilogue");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -848,7 +919,7 @@ void syevd_device(GpuLinalgContext& ctx, int n, const double* d_A, double* d_w_o
 void solve_fock_diag_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ, const double* d_F,
                             const double* d_X, double* d_eps_out, double* d_C_out, double* d_D_out,
                             double* d_W_out, GemmMode gemm_mode, StreamHandle stream,
-                            int ozaki_slices) {
+                            int ozaki_slices, double occ_weight) {
   if (nao <= 0 || nmo <= 0) return;
   auto& pool = ctx.pool();
 
@@ -884,16 +955,16 @@ void solve_fock_diag_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ, 
   slice_and_scale_cols_kernel<<<blocks_occ, 256, 0, stream>>>(
       nao, nmo, n_occ, d_C_out, nullptr, d_C_occ.data());
 
-  gemm_device(ctx, nao, nao, n_occ, 2.0, d_C_occ.data(), n_occ, false, d_C_occ.data(), n_occ, true,
-              0.0, d_D_out, nao, gemm_mode, stream, ozaki_slices);
+  gemm_device(ctx, nao, nao, n_occ, occ_weight, d_C_occ.data(), n_occ, false, d_C_occ.data(), n_occ,
+              true, 0.0, d_D_out, nao, gemm_mode, stream, ozaki_slices);
   symmetrize_matrix_device(nao, d_D_out, stream);
 
   if (d_W_out != nullptr) {
     PooledBuffer<double> d_C_scaled(pool, static_cast<std::size_t>(nao) * n_occ, stream);
     slice_and_scale_cols_kernel<<<blocks_occ, 256, 0, stream>>>(
         nao, nmo, n_occ, d_C_out, d_eps_out, d_C_scaled.data());
-    gemm_device(ctx, nao, nao, n_occ, 2.0, d_C_occ.data(), n_occ, false, d_C_scaled.data(), n_occ,
-                true, 0.0, d_W_out, nao, gemm_mode, stream, ozaki_slices);
+    gemm_device(ctx, nao, nao, n_occ, occ_weight, d_C_occ.data(), n_occ, false, d_C_scaled.data(),
+                n_occ, true, 0.0, d_W_out, nao, gemm_mode, stream, ozaki_slices);
     symmetrize_matrix_device(nao, d_W_out, stream);
   }
 }
@@ -905,10 +976,11 @@ void solve_fock_diag_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ, 
 DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ,
                                      const double* d_F, const double* d_X, double* d_P_work,
                                      double* d_D_out, double* d_W_out, const Sp2Options& opts,
-                                     StreamHandle stream) {
+                                     StreamHandle stream, double occ_weight) {
   DeviceSp2Stats stats{};
   if (nao <= 0 || nmo <= 0) return stats;
   auto& pool = ctx.pool();
+  const double w_scale = (occ_weight > 0.0) ? (1.0 / occ_weight) : 0.0;
 
   if (n_occ <= 0) {
     memset_zero_async(d_D_out, static_cast<std::size_t>(nao) * nao * sizeof(double), stream);
@@ -921,14 +993,14 @@ DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext& ctx, int nao, int nmo, in
   if (n_occ >= nmo) {
     const int blocks_nmo = static_cast<int>((static_cast<std::size_t>(nmo) * nmo + 255) / 256);
     set_identity_scaled_kernel<<<blocks_nmo, 256, 0, stream>>>(nmo, 1.0, d_P_work);
-    gemm_device(ctx, nao, nao, nmo, 2.0, d_X, nmo, false, d_X, nmo, true, 0.0, d_D_out, nao,
+    gemm_device(ctx, nao, nao, nmo, occ_weight, d_X, nmo, false, d_X, nmo, true, 0.0, d_D_out, nao,
                 opts.gemm_mode, stream, opts.ozaki_slices);
     symmetrize_matrix_device(nao, d_D_out, stream);
     if (d_W_out != nullptr) {
       PooledBuffer<double> d_DF(pool, static_cast<std::size_t>(nao) * nao, stream);
       gemm_device(ctx, nao, nao, nao, 1.0, d_D_out, nao, false, d_F, nao, false, 0.0, d_DF.data(),
                   nao, opts.gemm_mode, stream, opts.ozaki_slices);
-      gemm_device(ctx, nao, nao, nao, 0.5, d_DF.data(), nao, false, d_D_out, nao, false, 0.0,
+      gemm_device(ctx, nao, nao, nao, w_scale, d_DF.data(), nao, false, d_D_out, nao, false, 0.0,
                   d_W_out, nao, opts.gemm_mode, stream, opts.ozaki_slices);
       symmetrize_matrix_device(nao, d_W_out, stream);
     }
@@ -1028,19 +1100,19 @@ DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext& ctx, int nao, int nmo, in
   }
   symmetrize_matrix_device(nmo, d_P_work, work_stream);
 
-  // 5. Back-transform D = 2 * X * P * X^T
+  // 5. Back-transform D = occ_weight * X * P * X^T
   gemm_device(ctx, nao, nmo, nmo, 1.0, d_X, nmo, false, d_P_work, nmo, false, 0.0, d_FX.data(), nmo,
               opts.gemm_mode, work_stream, opts.ozaki_slices);
-  gemm_device(ctx, nao, nao, nmo, 2.0, d_FX.data(), nmo, false, d_X, nmo, true, 0.0, d_D_out, nao,
-              opts.gemm_mode, work_stream, opts.ozaki_slices);
+  gemm_device(ctx, nao, nao, nmo, occ_weight, d_FX.data(), nmo, false, d_X, nmo, true, 0.0, d_D_out,
+              nao, opts.gemm_mode, work_stream, opts.ozaki_slices);
   symmetrize_matrix_device(nao, d_D_out, work_stream);
 
-  // 6. Energy-weighted density matrix W = 0.5 * D * F * D (exact without MO orbitals!)
+  // 6. Energy-weighted density matrix W = (1 / occ_weight) * D * F * D (exact without MO orbitals!)
   if (d_W_out != nullptr) {
     PooledBuffer<double> d_DF(pool, static_cast<std::size_t>(nao) * nao, work_stream);
     gemm_device(ctx, nao, nao, nao, 1.0, d_D_out, nao, false, d_F, nao, false, 0.0, d_DF.data(),
                 nao, opts.gemm_mode, work_stream, opts.ozaki_slices);
-    gemm_device(ctx, nao, nao, nao, 0.5, d_DF.data(), nao, false, d_D_out, nao, false, 0.0,
+    gemm_device(ctx, nao, nao, nao, w_scale, d_DF.data(), nao, false, d_D_out, nao, false, 0.0,
                 d_W_out, nao, opts.gemm_mode, work_stream, opts.ozaki_slices);
     symmetrize_matrix_device(nao, d_W_out, work_stream);
   }
@@ -1105,23 +1177,41 @@ void assemble_fock_and_traces_device(int nao, const double* d_D, const double* d
   check_cuda(cudaGetLastError(), "assemble_fock_and_traces_kernel");
 }
 
+void assemble_fock_and_traces_uks_device(int nao, const double* d_Da, const double* d_Db,
+                                         const double* d_H, const double* d_J,
+                                         const double* d_Ka, const double* d_Kb, double alpha_x,
+                                         const double* d_Vxca, const double* d_Vxcb,
+                                         double* d_Fa_out, double* d_Fb_out,
+                                         double* d_traces4_out, StreamHandle stream) {
+  const std::size_t count = static_cast<std::size_t>(nao) * nao;
+  if (d_traces4_out != nullptr) {
+    memset_zero_async(d_traces4_out, 4 * sizeof(double), stream);
+  }
+  if (count == 0) return;
+  const int blocks = static_cast<int>(std::min<std::size_t>((count + 255) / 256, 512));
+  assemble_fock_and_traces_uks_kernel<<<blocks, 256, 0, stream>>>(
+      count, d_Da, d_Db, d_H, d_J, d_Ka, d_Kb, alpha_x, d_Vxca, d_Vxcb, d_Fa_out, d_Fb_out,
+      d_traces4_out);
+  check_cuda(cudaGetLastError(), "assemble_fock_and_traces_uks_kernel");
+}
+
 void apply_level_shift_ao_device(GpuLinalgContext& ctx, int nao, double level_shift,
                                  const double* d_S, const double* d_D, double* d_F_inout,
-                                 GemmMode gemm_mode, StreamHandle stream) {
+                                 GemmMode gemm_mode, StreamHandle stream, double dm_scale) {
   if (nao <= 0 || level_shift == 0.0) return;
   auto& pool = ctx.pool();
   const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
   PooledBuffer<double> d_SD(pool, n2, stream);
   PooledBuffer<double> d_SDS(pool, n2, stream);
 
-  // Exact AO virtual-space shift: F <- F + level_shift * (S - 0.5 * S * D * S)
+  // Exact AO virtual-space shift: F <- F + level_shift * (S - dm_scale * S * D * S)
   gemm_device(ctx, nao, nao, nao, 1.0, d_S, nao, false, d_D, nao, false, 0.0, d_SD.data(), nao,
               gemm_mode, stream);
   gemm_device(ctx, nao, nao, nao, 1.0, d_SD.data(), nao, false, d_S, nao, false, 0.0,
               d_SDS.data(), nao, gemm_mode, stream);
 
   axpby_device(n2, level_shift, d_S, 1.0, d_F_inout, stream);
-  axpby_device(n2, -0.5 * level_shift, d_SDS.data(), 1.0, d_F_inout, stream);
+  axpby_device(n2, -dm_scale * level_shift, d_SDS.data(), 1.0, d_F_inout, stream);
   symmetrize_matrix_device(nao, d_F_inout, stream);
 }
 
@@ -1158,6 +1248,16 @@ void permute_ri_chunk_pair_device(int bc, int nao, const double* d_src_a, const 
   permute_ri_chunk_pair_kernel<<<blocks, 256, 0, stream>>>(bc, nao, d_src_a, d_src_b, d_dst_a,
                                                            d_dst_b);
   check_cuda(cudaGetLastError(), "permute_ri_chunk_pair_kernel");
+}
+
+void slice_cols_device(int rows, int total_cols, int occ_cols, const double* d_C_full,
+                       double* d_C_occ_out, StreamHandle stream) {
+  if (rows <= 0 || occ_cols <= 0) return;
+  const std::size_t total = static_cast<std::size_t>(rows) * occ_cols;
+  const int blocks = static_cast<int>((total + 255) / 256);
+  slice_and_scale_cols_kernel<<<blocks, 256, 0, stream>>>(rows, total_cols, occ_cols, d_C_full,
+                                                          nullptr, d_C_occ_out);
+  check_cuda(cudaGetLastError(), "slice_and_scale_cols_kernel (slice_cols_device)");
 }
 
 }  // namespace gpu4dft

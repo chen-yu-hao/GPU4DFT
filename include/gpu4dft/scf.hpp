@@ -43,18 +43,27 @@ struct ScfOptions {
   double exact_exchange_fraction = 1.0; // RHF = 1.0, LDA/GGA/MGGA = 0.0, B3LYP = 0.20, PBE0 = 0.25
   int ozaki_slices = 8;
   Sp2Options sp2_options{};
+
+  bool unrestricted = false;            // false = RHF/RKS, true = UHF/UKS
+  int spin = 0;                         // 2*S = n_alpha - n_beta (matching PySCF mol.spin)
 };
 
 // Decoupled Fock callbacks supporting BOTH GPU device-pointer hot paths
 // (`device_resident = true`) and Host staging paths (`device_resident = false`),
 // and supporting either separate `(J, K)` callbacks (`build_jk`) or combined
-// `V_hf = J - 0.5 * alpha_x * K` (`build_vhf`).
+// `V_hf = J - 0.5 * alpha_x * K` (`build_vhf`), plus spin-resolved UKS/UHF callbacks.
 struct FockCallbacks {
   // Option 1: Separate Coulomb J(D) and Exact Exchange K(D) [nao x nao].
   // Note: When `compute_k` is not needed (`exact_exchange_fraction == 0.0`), `vk_out_ptr` may be nullptr.
   std::function<void(const double* dm_ptr, bool is_incremental, Precision prec, double* vj_out_ptr,
                      double* vk_out_ptr, void* stream)>
       build_jk;
+
+  // Optional occupied-MO-accelerated J(D) and K(C_occ) [nao x nao] where `c_occ_ptr` is
+  // contiguous row-major [nao x n_occ] (or nullptr when unavailable, e.g. iter 0 minao or SP2).
+  std::function<void(const double* dm_ptr, const double* c_occ_ptr, int n_occ, bool is_incremental,
+                     Precision prec, double* vj_out_ptr, double* vk_out_ptr, void* stream)>
+      build_jk_mo;
 
   // Option 2: Combined two-electron HF potential V_hf(D) = J(D) - 0.5 * alpha_x * K(D) [nao x nao].
   std::function<void(const double* dm_ptr, bool is_incremental, Precision prec,
@@ -64,6 +73,25 @@ struct FockCallbacks {
   // Optional XC potential V_xc(D) [nao x nao] returning scalar E_xc (leave empty for RHF).
   std::function<double(const double* dm_ptr, Precision prec, double* vxc_out_ptr, void* stream)>
       build_vxc;
+
+  // Unrestricted J(D_alpha + D_beta), K(D_alpha), K(D_beta) [nao x nao].
+  // Note: `vk_alpha_out_ptr` and `vk_beta_out_ptr` may be nullptr when `exact_exchange_fraction == 0.0`.
+  std::function<void(const double* dm_alpha_ptr, const double* dm_beta_ptr, bool is_incremental,
+                     Precision prec, double* vj_tot_out_ptr, double* vk_alpha_out_ptr,
+                     double* vk_beta_out_ptr, void* stream)>
+      build_jk_uks;
+
+  // Optional occupied-MO-accelerated unrestricted J(D_a + D_b), K(C_a), K(C_b) [nao x nao].
+  std::function<void(const double* dm_alpha_ptr, const double* dm_beta_ptr,
+                     const double* c_occ_alpha_ptr, int n_alpha, const double* c_occ_beta_ptr,
+                     int n_beta, bool is_incremental, Precision prec, double* vj_tot_out_ptr,
+                     double* vk_alpha_out_ptr, double* vk_beta_out_ptr, void* stream)>
+      build_jk_uks_mo;
+
+  // Optional unrestricted XC potentials V_xc_alpha, V_xc_beta [nao x nao] returning scalar E_xc.
+  std::function<double(const double* dm_alpha_ptr, const double* dm_beta_ptr, Precision prec,
+                       double* vxc_alpha_out_ptr, double* vxc_beta_out_ptr, void* stream)>
+      build_vxc_uks;
 
   // When true, `dm_ptr`, `vj_out_ptr`, `vk_out_ptr`, `vhf_out_ptr` passed to `build_jk`/`build_vhf`
   // are GPU device pointers on `Backend::Cuda` (zero host matrix copies!).
@@ -81,6 +109,11 @@ struct GradCallbacks {
   std::function<std::vector<double>(const double* dm_host, double exact_exchange_fraction)>
       two_electron_grad_fn;
   std::function<std::vector<double>(const double* dm_host)> xc_grad_fn;
+  std::function<std::vector<double>(const double* dm_alpha_host, const double* dm_beta_host,
+                                    double exact_exchange_fraction)>
+      two_electron_grad_uks_fn;
+  std::function<std::vector<double>(const double* dm_alpha_host, const double* dm_beta_host)>
+      xc_grad_uks_fn;
 };
 
 struct ScfIterationLog {
@@ -103,6 +136,7 @@ struct ScfResult {
   double one_electron_energy = 0.0;
   double two_electron_energy = 0.0;
   double xc_energy = 0.0;
+  double dispersion_energy = 0.0;
   double nuclear_repulsion = 0.0;
   double final_diis_rms = 0.0;
 
@@ -111,12 +145,29 @@ struct ScfResult {
   std::size_t pool_cache_hits = 0;
   std::size_t steady_state_allocations = 0;  // New GPU allocations after warmup iterations (0!)
 
-  std::vector<double> density_matrix;      // [nao * nao] closed-shell D (Tr(D*S) = n_elec)
-  std::vector<double> energy_weighted_dm;  // [nao * nao] W = 2 C_occ eps_occ C_occ^T
-  std::vector<double> fock_matrix;         // [nao * nao] converged AO Fock matrix
-  std::vector<double> mo_energies;         // [nmo] orbital energies (populated in Diag mode)
-  std::vector<double> mo_coefficients;     // [nao * nmo] row-major MO coefficients (Diag mode)
+  std::vector<double> density_matrix;      // [nao * nao] total D (Tr(D*S) = n_elec)
+  std::vector<double> energy_weighted_dm;  // [nao * nao] total W
+  std::vector<double> fock_matrix;         // [nao * nao] converged AO Fock matrix (alpha if UHF/UKS)
+  std::vector<double> mo_energies;         // [nmo] orbital energies (alpha if UHF/UKS, Diag mode)
+  std::vector<double> mo_coefficients;     // [nao * nmo] row-major MO coefficients (alpha if UHF/UKS)
   std::vector<ScfIterationLog> history;
+
+  // Open-shell UHF/UKS fields
+  bool unrestricted = false;
+  int n_alpha = 0;
+  int n_beta = 0;
+  double s2 = 0.0;
+  double multiplicity = 1.0;
+  std::vector<double> density_alpha;             // [nao * nao]
+  std::vector<double> density_beta;              // [nao * nao]
+  std::vector<double> energy_weighted_dm_alpha;  // [nao * nao]
+  std::vector<double> energy_weighted_dm_beta;   // [nao * nao]
+  std::vector<double> fock_alpha;                // [nao * nao]
+  std::vector<double> fock_beta;                 // [nao * nao]
+  std::vector<double> mo_energies_beta;          // [nmo]
+  std::vector<double> mo_coefficients_beta;      // [nao * nmo]
+  std::vector<double> mo_occ_alpha;              // [nmo]
+  std::vector<double> mo_occ_beta;               // [nmo]
 };
 
 class ScfDriver {
@@ -132,10 +183,15 @@ class ScfDriver {
   const ScfOptions& options() const noexcept;
   void set_options(ScfOptions opts);
 
-  // Execute closed-shell RHF / RKS / Hybrid DFT self-consistent field loop.
+  // Execute closed-shell RHF / RKS (or unrestricted with optional total/split guess).
   // If `initial_dm_host` is nullptr, constructs initial density from H_core.
   ScfResult run(int nao, int n_elec, double e_nuc, const double* S_host, const double* H_core_host,
                 const FockCallbacks& callbacks, const double* initial_dm_host = nullptr);
+
+  // Execute SCF with explicit spin-resolved initial density guesses [nao * nao] each.
+  ScfResult run(int nao, int n_elec, double e_nuc, const double* S_host, const double* H_core_host,
+                const FockCallbacks& callbacks, const double* initial_dm_alpha_host,
+                const double* initial_dm_beta_host);
 
   // Assemble total analytical nuclear gradient [natom * 3] (Hartree / Bohr) from converged ScfResult.
   std::vector<double> compute_nuclear_gradient(int natom, const ScfResult& scf_res,

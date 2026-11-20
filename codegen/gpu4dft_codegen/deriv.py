@@ -94,6 +94,62 @@ GPU4DFT_HD inline void rys_1d_deriv1(int la, int lb, int lc, int ld, R C00, R D0
   }}
 }}
 
+// Builds 2-center 1D Rys VRR table G[0..lP+1][0..lQ] (no HRR needed; d/dQ = -d/dP).
+template <typename R>
+GPU4DFT_HD inline void rys_2c_deriv1(int lP, int lQ, R C00, R D00, R B10, R B01, R B00,
+                                     R G[6][5]) {{
+  const int lP_hi = lP + 1;
+  G[0][0] = R(1);
+  for (int n = 0; n < lP_hi; ++n) {{
+    G[n + 1][0] = C00 * G[n][0] + (n > 0 ? R(n) * B10 * G[n - 1][0] : R(0));
+  }}
+  for (int m = 0; m < lQ; ++m) {{
+    for (int n = 0; n <= lP_hi; ++n) {{
+      R val = D00 * G[n][m];
+      if (m > 0) val += R(m) * B01 * G[n][m - 1];
+      if (n > 0) val += R(n) * B00 * G[n - 1][m];
+      G[n][m + 1] = val;
+    }}
+  }}
+}}
+
+// Builds 3-center 1D Rys VRR + bra-HRR table H[0..la+1][0..lb+1][0..lP] (zero ket HRR;
+// d/dP = -(d/dA + d/dB)). MaxOrbL=2 (spd) uses H[4][4][5] (1.9 KB); MaxOrbL=4 uses H[6][6][5].
+template <int MaxOrbL, typename R>
+GPU4DFT_HD inline void rys_3c_deriv1(int la, int lb, int lP, R C00, R D00, R B10, R B01, R B00,
+                                     R AB, R H[MaxOrbL + 2][MaxOrbL + 2][5]) {{
+  constexpr int kLab = 2 * MaxOrbL + 2;
+  const int la_hi = la + 1;
+  const int lb_hi = lb + 1;
+  const int lab = la + lb + 1;
+
+  R G[kLab][5];
+  G[0][0] = R(1);
+  for (int n = 0; n < lab; ++n) {{
+    G[n + 1][0] = C00 * G[n][0] + (n > 0 ? R(n) * B10 * G[n - 1][0] : R(0));
+  }}
+  for (int m = 0; m < lP; ++m) {{
+    for (int n = 0; n <= lab; ++n) {{
+      R val = D00 * G[n][m];
+      if (m > 0) val += R(m) * B01 * G[n][m - 1];
+      if (n > 0) val += R(n) * B00 * G[n - 1][m];
+      G[n][m + 1] = val;
+    }}
+  }}
+
+  for (int j = 0; j <= lb_hi; ++j) {{
+    const int i_max = (la_hi < lab - j) ? la_hi : (lab - j);
+    for (int i = 0; i <= i_max; ++i) {{
+      for (int m = 0; m <= lP; ++m) H[i][j][m] = G[i][m];
+    }}
+    if (j < lb_hi) {{
+      for (int i = 0; i <= lab - j - 1; ++i) {{
+        for (int m = 0; m <= lP; ++m) G[i][m] = G[i + 1][m] + AB * G[i][m];
+      }}
+    }}
+  }}
+}}
+
 }}  // namespace detail_deriv1
 
 // Generic functor-driven 1st nuclear derivative contraction of quartet (la,lb|lc,ld)
@@ -101,7 +157,7 @@ GPU4DFT_HD inline void rys_1d_deriv1(int la, int lb, int lc, int ld, R C00, R D0
 template <typename R, typename GammaFn>
 GPU4DFT_HD inline void eri_quartet_grad_contract_fn(
     int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
-    int ik, GammaFn gamma_fn, double grad12[12]) {{
+    int ik, GammaFn gamma_fn, double grad12[12], double omega = 0.0) {{
   for (int i = 0; i < 12; ++i) grad12[i] = 0.0;
 
   const int nca = n_cart(la), ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
@@ -157,7 +213,7 @@ GPU4DFT_HD inline void eri_quartet_grad_contract_fn(
 
       R u_roots[10];
       R w_weights[10];
-      rys_roots_weights<R>(n_roots, T, u_roots, w_weights);
+      rys_roots_weights_erf<R>(n_roots, T, rho, static_cast<R>(omega), u_roots, w_weights);
 
       const R inv_2q = R(0.5) / q;
       const R inv_2pq = R(0.5) / pq_sum;
@@ -259,7 +315,8 @@ template <typename R>
 GPU4DFT_HD inline void eri_quartet_grad_direct_dm(
     int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
     int ik, const double* D_cart, int ncart_tot, int off_a, int off_b, int off_c, int off_d,
-    double w_sym, double k_fraction, double grad12[12]) {{
+    double w_sym, double k_fraction, double grad12[12], double omega = 0.0,
+    double j_fraction = 1.0) {{
   const int ncb = n_cart(lb), ncc = n_cart(lc), ncd = n_cart(ld);
   (void)ncb;
   (void)ncc;
@@ -277,9 +334,349 @@ GPU4DFT_HD inline void eri_quartet_grad_direct_dm(
     const double dbd = D_cart[b * ncart_tot + d];
     const double dad = D_cart[a * ncart_tot + d];
     const double dbc = D_cart[b * ncart_tot + c];
-    return half_w * (dab * dcd - q_kfrac * (dac * dbd + dad * dbc));
+    return half_w * (j_fraction * dab * dcd - q_kfrac * (dac * dbd + dad * dbc));
   }};
-  eri_quartet_grad_contract_fn<R>(la, lb, lc, ld, bra, ib, ket, ik, gamma_fn, grad12);
+  eri_quartet_grad_contract_fn<R>(la, lb, lc, ld, bra, ib, ket, ik, gamma_fn, grad12, omega);
+}}
+
+// Open-shell UHF/UKS on-the-fly contraction with Cartesian density matrices
+// D_tot_cart, D_alpha_cart, D_beta_cart [ncart_tot x ncart_tot]:
+//   Gamma_abcd = 0.5 * w_sym * (j_fraction * D_tot_ab * D_tot_cd -
+//     0.5 * k_fraction * (Da_ac*Da_bd + Da_ad*Da_bc + Db_ac*Db_bd + Db_ad*Db_bc))
+template <typename R>
+GPU4DFT_HD inline void eri_quartet_grad_direct_dm_uhf(
+    int la, int lb, int lc, int ld, const ShellPairView& bra, int ib, const ShellPairView& ket,
+    int ik, const double* D_tot_cart, const double* D_alpha_cart, const double* D_beta_cart,
+    int ncart_tot, int off_a, int off_b, int off_c, int off_d, double w_sym, double k_fraction,
+    double grad12[12], double omega = 0.0, double j_fraction = 1.0) {{
+  const double half_w = 0.5 * w_sym;
+  const double h_kfrac = 0.5 * k_fraction;
+  auto gamma_fn = [=](int ia, int ib_c, int ic, int id) -> double {{
+    const int a = off_a + ia;
+    const int b = off_b + ib_c;
+    const int c = off_c + ic;
+    const int d = off_d + id;
+    const double dtab = D_tot_cart[a * ncart_tot + b];
+    const double dtcd = D_tot_cart[c * ncart_tot + d];
+    const double daac = D_alpha_cart[a * ncart_tot + c];
+    const double dabd = D_alpha_cart[b * ncart_tot + d];
+    const double daad = D_alpha_cart[a * ncart_tot + d];
+    const double dabc = D_alpha_cart[b * ncart_tot + c];
+    const double dbac = D_beta_cart[a * ncart_tot + c];
+    const double dbbd = D_beta_cart[b * ncart_tot + d];
+    const double dbad = D_beta_cart[a * ncart_tot + d];
+    const double dbbc = D_beta_cart[b * ncart_tot + c];
+    return half_w * (j_fraction * dtab * dtcd -
+                     h_kfrac * (daac * dabd + daad * dabc + dbac * dbbd + dbad * dbbc));
+  }};
+  eri_quartet_grad_contract_fn<R>(la, lb, lc, ld, bra, ib, ket, ik, gamma_fn, grad12, omega);
+}}
+
+// Dedicated 2-center 1st nuclear derivative contraction of (lP | lQ) into
+// `grad_P[0..2]` = d/dR_P (with d/dR_Q = -grad_P by translational invariance).
+template <typename R, typename GammaFn>
+GPU4DFT_HD inline void eri_2c_grad_contract_fn(
+    int lP, int lQ, const ShellPairView& bra_aux, int iP, const ShellPairView& ket_aux, int iQ,
+    GammaFn gamma_fn, double grad_P[3], double omega = 0.0) {{
+  grad_P[0] = 0.0;
+  grad_P[1] = 0.0;
+  grad_P[2] = 0.0;
+
+  const int bra_begin = bra_aux.prim_offset[iP];
+  const int bra_end = bra_aux.prim_offset[iP + 1];
+  const int ket_begin = ket_aux.prim_offset[iQ];
+  const int ket_end = ket_aux.prim_offset[iQ + 1];
+
+  const double Ax = bra_aux.Ax[iP], Ay = bra_aux.Ay[iP], Az = bra_aux.Az[iP];
+  const double Cx = ket_aux.Ax[iQ], Cy = ket_aux.Ay[iQ], Cz = ket_aux.Az[iQ];
+  const R PQx = static_cast<R>(Ax - Cx);
+  const R PQy = static_cast<R>(Ay - Cy);
+  const R PQz = static_cast<R>(Az - Cz);
+  const R PQ2 = PQx * PQx + PQy * PQy + PQz * PQz;
+
+  double gPx = 0.0, gPy = 0.0, gPz = 0.0;
+
+  if (lP == 0 && lQ == 0) {{
+    for (int ip = bra_begin; ip < bra_end; ++ip) {{
+      const R p = static_cast<R>(bra_aux.exponent[ip]);
+      const R two_p = R(2) * static_cast<R>(bra_aux.alpha_a[ip]);
+      const R cP = static_cast<R>(bra_aux.prefactor[ip]);
+      for (int kp = ket_begin; kp < ket_end; ++kp) {{
+        const R q = static_cast<R>(ket_aux.exponent[kp]);
+        const R cQ = static_cast<R>(ket_aux.prefactor[kp]);
+        const R rho = p * q / (p + q);
+        const R T = rho * PQ2;
+        const R scale = cP * cQ * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho);
+        R u = R(0), w = R(0);
+        rys_roots_weights_erf<R>(1, T, rho, static_cast<R>(omega), &u, &w);
+        const double w_gam = static_cast<double>(scale * w) * gamma_fn(0, 0);
+        if (w_gam == 0.0) continue;
+        const R fac = -two_p * (rho / p) * u;
+        gPx += w_gam * static_cast<double>(fac * PQx);
+        gPy += w_gam * static_cast<double>(fac * PQy);
+        gPz += w_gam * static_cast<double>(fac * PQz);
+      }}
+    }}
+    grad_P[0] = gPx;
+    grad_P[1] = gPy;
+    grad_P[2] = gPz;
+    return;
+  }}
+
+  const int ncP = n_cart(lP), ncQ = n_cart(lQ);
+  const int n_roots = (lP + lQ + 1) / 2 + 1;
+  CartTriple tP[15], tQ[15];
+  for (int i = 0; i < ncP; ++i) tP[i] = cart_triple(lP, i);
+  for (int j = 0; j < ncQ; ++j) tQ[j] = cart_triple(lQ, j);
+
+  for (int ip = bra_begin; ip < bra_end; ++ip) {{
+    const R p = static_cast<R>(bra_aux.exponent[ip]);
+    const R two_p = R(2) * static_cast<R>(bra_aux.alpha_a[ip]);
+    const R cP = static_cast<R>(bra_aux.prefactor[ip]);
+    const R inv_2p = R(0.5) / p;
+
+    for (int kp = ket_begin; kp < ket_end; ++kp) {{
+      const R q = static_cast<R>(ket_aux.exponent[kp]);
+      const R cQ = static_cast<R>(ket_aux.prefactor[kp]);
+      const R pq_sum = p + q;
+      const R rho = p * q / pq_sum;
+      const R T = rho * PQ2;
+      const R scale = cP * cQ * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho);
+
+      R u_roots[5], w_weights[5];
+      rys_roots_weights_erf<R>(n_roots, T, rho, static_cast<R>(omega), u_roots, w_weights);
+
+      const R inv_2q = R(0.5) / q;
+      const R inv_2pq = R(0.5) / pq_sum;
+      const R rho_over_p = rho / p;
+      const R rho_over_q = rho / q;
+
+      for (int r = 0; r < n_roots; ++r) {{
+        const R u = u_roots[r];
+        const double Wr = static_cast<double>(scale * w_weights[r]);
+        const R B00 = inv_2pq * u;
+        const R B10 = inv_2p * (R(1) - rho_over_p * u);
+        const R B01 = inv_2q * (R(1) - rho_over_q * u);
+
+        R Gx[6][5], Gy[6][5], Gz[6][5];
+        detail_deriv1::rys_2c_deriv1<R>(lP, lQ, -rho_over_p * u * PQx, rho_over_q * u * PQx, B10,
+                                        B01, B00, Gx);
+        detail_deriv1::rys_2c_deriv1<R>(lP, lQ, -rho_over_p * u * PQy, rho_over_q * u * PQy, B10,
+                                        B01, B00, Gy);
+        detail_deriv1::rys_2c_deriv1<R>(lP, lQ, -rho_over_p * u * PQz, rho_over_q * u * PQz, B10,
+                                        B01, B00, Gz);
+
+        for (int ip_c = 0; ip_c < ncP; ++ip_c) {{
+          const int px = tP[ip_c].lx, py = tP[ip_c].ly, pz = tP[ip_c].lz;
+          for (int iq_c = 0; iq_c < ncQ; ++iq_c) {{
+            const double w_gam = Wr * gamma_fn(ip_c, iq_c);
+            if (w_gam == 0.0) continue;
+            const int qx = tQ[iq_c].lx, qy = tQ[iq_c].ly, qz = tQ[iq_c].lz;
+            const R gx0 = Gx[px][qx], gy0 = Gy[py][qy], gz0 = Gz[pz][qz];
+            const R dPx =
+                two_p * Gx[px + 1][qx] - (px > 0 ? R(px) * Gx[px - 1][qx] : R(0));
+            const R dPy =
+                two_p * Gy[py + 1][qy] - (py > 0 ? R(py) * Gy[py - 1][qy] : R(0));
+            const R dPz =
+                two_p * Gz[pz + 1][qz] - (pz > 0 ? R(pz) * Gz[pz - 1][qz] : R(0));
+            gPx += w_gam * static_cast<double>(dPx * gy0 * gz0);
+            gPy += w_gam * static_cast<double>(gx0 * dPy * gz0);
+            gPz += w_gam * static_cast<double>(gx0 * gy0 * dPz);
+          }}
+        }}
+      }}
+    }}
+  }}
+
+  grad_P[0] = gPx;
+  grad_P[1] = gPy;
+  grad_P[2] = gPz;
+}}
+
+// Dedicated 3-center 1st nuclear derivative contraction of (la, lb | lP) into
+// `grad9[0..8]` = (d/dA_xyz, d/dB_xyz, d/dP_xyz) with d/dP = -(d/dA + d/dB).
+template <int MaxOrbL, typename R, typename GammaFn>
+GPU4DFT_HD inline void eri_3c_grad_contract_fn(
+    int la, int lb, int lP, const ShellPairView& orb, int ab, const ShellPairView& aux, int P,
+    GammaFn gamma_fn, double grad9[9], double omega = 0.0) {{
+  for (int i = 0; i < 9; ++i) grad9[i] = 0.0;
+  if (la < 0 || la > MaxOrbL || lb < 0 || lb > MaxOrbL || lP < 0 || lP > 4) return;
+
+  const int bra_begin = orb.prim_offset[ab];
+  const int bra_end = orb.prim_offset[ab + 1];
+  const int ket_begin = aux.prim_offset[P];
+  const int ket_end = aux.prim_offset[P + 1];
+
+  const double Ax = orb.Ax[ab], Ay = orb.Ay[ab], Az = orb.Az[ab];
+  const double Bx = orb.Bx[ab], By = orb.By[ab], Bz = orb.Bz[ab];
+  const double Cx = aux.Ax[P], Cy = aux.Ay[P], Cz = aux.Az[P];
+  const R ABx = static_cast<R>(Ax - Bx);
+  const R ABy = static_cast<R>(Ay - By);
+  const R ABz = static_cast<R>(Az - Bz);
+
+  double gAx = 0.0, gAy = 0.0, gAz = 0.0;
+  double gBx = 0.0, gBy = 0.0, gBz = 0.0;
+
+  if (la == 0 && lb == 0 && lP == 0) {{
+    for (int ip = bra_begin; ip < bra_end; ++ip) {{
+      const R p = static_cast<R>(orb.exponent[ip]);
+      const R two_a = R(2) * static_cast<R>(orb.alpha_a[ip]);
+      const R two_b = R(2) * static_cast<R>(orb.alpha_b[ip]);
+      const R Px = static_cast<R>(orb.Px[ip]);
+      const R Py = static_cast<R>(orb.Py[ip]);
+      const R Pz = static_cast<R>(orb.Pz[ip]);
+      const R Cab = static_cast<R>(orb.prefactor[ip]);
+      const R PAx = Px - static_cast<R>(Ax);
+      const R PAy = Py - static_cast<R>(Ay);
+      const R PAz = Pz - static_cast<R>(Az);
+      const R PQx = Px - static_cast<R>(Cx);
+      const R PQy = Py - static_cast<R>(Cy);
+      const R PQz = Pz - static_cast<R>(Cz);
+      const R PQ2 = PQx * PQx + PQy * PQy + PQz * PQz;
+
+      for (int kp = ket_begin; kp < ket_end; ++kp) {{
+        const R q = static_cast<R>(aux.exponent[kp]);
+        const R cP = static_cast<R>(aux.prefactor[kp]);
+        const R rho = p * q / (p + q);
+        const R T = rho * PQ2;
+        const R scale = Cab * cP * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho);
+        R u = R(0), w = R(0);
+        rys_roots_weights_erf<R>(1, T, rho, static_cast<R>(omega), &u, &w);
+        const double w_gam = static_cast<double>(scale * w) * gamma_fn(0, 0, 0);
+        if (w_gam == 0.0) continue;
+        const R rho_over_p = rho / p;
+        const R c00x = PAx - rho_over_p * u * PQx;
+        const R c00y = PAy - rho_over_p * u * PQy;
+        const R c00z = PAz - rho_over_p * u * PQz;
+        gAx += w_gam * static_cast<double>(two_a * c00x);
+        gAy += w_gam * static_cast<double>(two_a * c00y);
+        gAz += w_gam * static_cast<double>(two_a * c00z);
+        gBx += w_gam * static_cast<double>(two_b * (c00x + ABx));
+        gBy += w_gam * static_cast<double>(two_b * (c00y + ABy));
+        gBz += w_gam * static_cast<double>(two_b * (c00z + ABz));
+      }}
+    }}
+    grad9[0] = gAx;
+    grad9[1] = gAy;
+    grad9[2] = gAz;
+    grad9[3] = gBx;
+    grad9[4] = gBy;
+    grad9[5] = gBz;
+    grad9[6] = -(gAx + gBx);
+    grad9[7] = -(gAy + gBy);
+    grad9[8] = -(gAz + gBz);
+    return;
+  }}
+
+  constexpr int kMaxOrbCart = (MaxOrbL + 1) * (MaxOrbL + 2) / 2;
+  const int nca = n_cart(la), ncb = n_cart(lb), ncP = n_cart(lP);
+  const int n_roots = (la + lb + lP + 1) / 2 + 1;
+
+  CartTriple ta[kMaxOrbCart], tb[kMaxOrbCart], tP[15];
+  for (int ia = 0; ia < nca; ++ia) ta[ia] = cart_triple(la, ia);
+  for (int ib_c = 0; ib_c < ncb; ++ib_c) tb[ib_c] = cart_triple(lb, ib_c);
+  for (int iP_c = 0; iP_c < ncP; ++iP_c) tP[iP_c] = cart_triple(lP, iP_c);
+
+  for (int ip = bra_begin; ip < bra_end; ++ip) {{
+    const R p = static_cast<R>(orb.exponent[ip]);
+    const R two_a = R(2) * static_cast<R>(orb.alpha_a[ip]);
+    const R two_b = R(2) * static_cast<R>(orb.alpha_b[ip]);
+    const R Px = static_cast<R>(orb.Px[ip]);
+    const R Py = static_cast<R>(orb.Py[ip]);
+    const R Pz = static_cast<R>(orb.Pz[ip]);
+    const R Cab = static_cast<R>(orb.prefactor[ip]);
+    const R PAx = Px - static_cast<R>(Ax);
+    const R PAy = Py - static_cast<R>(Ay);
+    const R PAz = Pz - static_cast<R>(Az);
+    const R PQx = Px - static_cast<R>(Cx);
+    const R PQy = Py - static_cast<R>(Cy);
+    const R PQz = Pz - static_cast<R>(Cz);
+    const R PQ2 = PQx * PQx + PQy * PQy + PQz * PQz;
+    const R inv_2p = R(0.5) / p;
+
+    for (int kp = ket_begin; kp < ket_end; ++kp) {{
+      const R q = static_cast<R>(aux.exponent[kp]);
+      const R cP = static_cast<R>(aux.prefactor[kp]);
+      const R pq_sum = p + q;
+      const R rho = p * q / pq_sum;
+      const R T = rho * PQ2;
+      const R scale = Cab * cP * R({TWO_OVER_SQRT_PI}) * math::sqrt(rho);
+
+      R u_roots[7], w_weights[7];
+      rys_roots_weights_erf<R>(n_roots, T, rho, static_cast<R>(omega), u_roots, w_weights);
+
+      const R inv_2q = R(0.5) / q;
+      const R inv_2pq = R(0.5) / pq_sum;
+      const R rho_over_p = rho / p;
+      const R rho_over_q = rho / q;
+
+      for (int r = 0; r < n_roots; ++r) {{
+        const R u = u_roots[r];
+        const double Wr = static_cast<double>(scale * w_weights[r]);
+        const R B00 = inv_2pq * u;
+        const R B10 = inv_2p * (R(1) - rho_over_p * u);
+        const R B01 = inv_2q * (R(1) - rho_over_q * u);
+
+        R Hx[MaxOrbL + 2][MaxOrbL + 2][5];
+        R Hy[MaxOrbL + 2][MaxOrbL + 2][5];
+        R Hz[MaxOrbL + 2][MaxOrbL + 2][5];
+        detail_deriv1::rys_3c_deriv1<MaxOrbL, R>(la, lb, lP, PAx - rho_over_p * u * PQx,
+                                                 rho_over_q * u * PQx, B10, B01, B00, ABx, Hx);
+        detail_deriv1::rys_3c_deriv1<MaxOrbL, R>(la, lb, lP, PAy - rho_over_p * u * PQy,
+                                                 rho_over_q * u * PQy, B10, B01, B00, ABy, Hy);
+        detail_deriv1::rys_3c_deriv1<MaxOrbL, R>(la, lb, lP, PAz - rho_over_p * u * PQz,
+                                                 rho_over_q * u * PQz, B10, B01, B00, ABz, Hz);
+
+        for (int ia = 0; ia < nca; ++ia) {{
+          const int ax = ta[ia].lx, ay = ta[ia].ly, az = ta[ia].lz;
+          for (int ib_c = 0; ib_c < ncb; ++ib_c) {{
+            const int bx = tb[ib_c].lx, by = tb[ib_c].ly, bz = tb[ib_c].lz;
+            for (int iP_c = 0; iP_c < ncP; ++iP_c) {{
+              const double w_gam = Wr * gamma_fn(ia, ib_c, iP_c);
+              if (w_gam == 0.0) continue;
+              const int px = tP[iP_c].lx, py = tP[iP_c].ly, pz = tP[iP_c].lz;
+
+              const R hx0 = Hx[ax][bx][px];
+              const R hy0 = Hy[ay][by][py];
+              const R hz0 = Hz[az][bz][pz];
+
+              const R dAx = two_a * Hx[ax + 1][bx][px] -
+                            (ax > 0 ? R(ax) * Hx[ax - 1][bx][px] : R(0));
+              const R dAy = two_a * Hy[ay + 1][by][py] -
+                            (ay > 0 ? R(ay) * Hy[ay - 1][by][py] : R(0));
+              const R dAz = two_a * Hz[az + 1][bz][pz] -
+                            (az > 0 ? R(az) * Hz[az - 1][bz][pz] : R(0));
+
+              const R dBx = two_b * Hx[ax][bx + 1][px] -
+                            (bx > 0 ? R(bx) * Hx[ax][bx - 1][px] : R(0));
+              const R dBy = two_b * Hy[ay][by + 1][py] -
+                            (by > 0 ? R(by) * Hy[ay][by - 1][py] : R(0));
+              const R dBz = two_b * Hz[az][bz + 1][pz] -
+                            (bz > 0 ? R(bz) * Hz[az][bz - 1][pz] : R(0));
+
+              gAx += w_gam * static_cast<double>(dAx * hy0 * hz0);
+              gAy += w_gam * static_cast<double>(hx0 * dAy * hz0);
+              gAz += w_gam * static_cast<double>(hx0 * hy0 * dAz);
+
+              gBx += w_gam * static_cast<double>(dBx * hy0 * hz0);
+              gBy += w_gam * static_cast<double>(hx0 * dBy * hz0);
+              gBz += w_gam * static_cast<double>(hx0 * hy0 * dBz);
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+
+  grad9[0] = gAx;
+  grad9[1] = gAy;
+  grad9[2] = gAz;
+  grad9[3] = gBx;
+  grad9[4] = gBy;
+  grad9[5] = gBz;
+  grad9[6] = -(gAx + gBx);
+  grad9[7] = -(gAy + gBy);
+  grad9[8] = -(gAz + gBz);
 }}
 
 }}  // namespace gpu4dft::generated

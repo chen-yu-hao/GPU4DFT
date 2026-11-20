@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -51,7 +52,7 @@ struct DeviceMemoryPool::Impl {
   bool async_supported = false;
 
   mutable std::mutex mtx;
-  std::unordered_map<std::size_t, std::vector<void*>> free_lists;
+  std::map<std::size_t, std::vector<void*>> free_lists;
   std::unordered_map<void*, std::size_t> active_blocks;
 
   std::uint8_t* arena_base = nullptr;
@@ -174,6 +175,9 @@ void* DeviceMemoryPool::acquire(std::size_t bytes, StreamHandle stream) {
   if (it != impl_->free_lists.end() && !it->second.empty()) {
     void* ptr = it->second.back();
     it->second.pop_back();
+    if (it->second.empty()) {
+      impl_->free_lists.erase(it);
+    }
     impl_->active_blocks.emplace(ptr, aligned);
     impl_->cached_free_bytes -= aligned;
     impl_->in_use_bytes += aligned;
@@ -184,8 +188,10 @@ void* DeviceMemoryPool::acquire(std::size_t bytes, StreamHandle stream) {
 
   ScopedDeviceGuard guard(impl_->device_id);
   cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
-  if (stream != nullptr && cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess &&
-      cap_status != cudaStreamCaptureStatusNone) {
+  const bool capturing =
+      (stream != nullptr && cudaStreamIsCapturing(stream, &cap_status) == cudaSuccess &&
+       cap_status != cudaStreamCaptureStatusNone);
+  if (capturing) {
     if (impl_->arena_base != nullptr && impl_->arena_offset + aligned <= impl_->arena_capacity) {
       void* ptr = impl_->arena_base + impl_->arena_offset;
       impl_->arena_offset += aligned;
@@ -196,9 +202,58 @@ void* DeviceMemoryPool::acquire(std::size_t bytes, StreamHandle stream) {
         "arena capacity");
   }
 
+  // Size-tolerant reuse outside graph capture: reuse the smallest cached block >= aligned within
+  // bounded slack so varying chunk dimensions (e.g. RI aux chunks in OzakiInt8) do not fragment.
+  auto lb = impl_->free_lists.lower_bound(aligned);
+  if (lb != impl_->free_lists.end() && !lb->second.empty() &&
+      lb->first <= aligned * 2 && (lb->first - aligned) <= (256ULL << 20)) {
+    const std::size_t block_bytes = lb->first;
+    void* ptr = lb->second.back();
+    lb->second.pop_back();
+    if (lb->second.empty()) {
+      impl_->free_lists.erase(lb);
+    }
+    impl_->active_blocks.emplace(ptr, block_bytes);
+    if (impl_->cached_free_bytes >= block_bytes) {
+      impl_->cached_free_bytes -= block_bytes;
+    } else {
+      impl_->cached_free_bytes = 0;
+    }
+    impl_->in_use_bytes += block_bytes;
+    impl_->peak_in_use_bytes = std::max(impl_->peak_in_use_bytes, impl_->in_use_bytes);
+    impl_->cache_hits += 1;
+    return ptr;
+  }
+
   void* ptr = nullptr;
   if (impl_->async_supported) {
-    check_cuda(cudaMallocAsync(&ptr, aligned, stream), "DeviceMemoryPool cudaMallocAsync");
+    cudaError_t st = cudaMallocAsync(&ptr, aligned, stream);
+    if (st == cudaErrorMemoryAllocation) {
+      (void)cudaGetLastError();
+      for (auto& kv : impl_->free_lists) {
+        const std::size_t block_bytes = kv.first;
+        for (void* fptr : kv.second) {
+          impl_->free_raw_unlocked(fptr, stream);
+          if (impl_->allocated_bytes >= block_bytes) {
+            impl_->allocated_bytes -= block_bytes;
+          }
+        }
+      }
+      impl_->free_lists.clear();
+      impl_->cached_free_bytes = 0;
+      if (stream != nullptr) {
+        (void)cudaStreamSynchronize(stream);
+      }
+      (void)cudaDeviceSynchronize();
+      cudaMemPool_t mempool{};
+      if (cudaDeviceGetDefaultMemPool(&mempool, impl_->device_id) == cudaSuccess) {
+        (void)cudaMemPoolTrimTo(mempool, 0);
+      } else {
+        (void)cudaGetLastError();
+      }
+      st = cudaMallocAsync(&ptr, aligned, stream);
+    }
+    check_cuda(st, "DeviceMemoryPool cudaMallocAsync");
   } else {
     check_cuda(cudaMalloc(&ptr, aligned), "DeviceMemoryPool cudaMalloc");
   }
@@ -274,6 +329,7 @@ void DeviceMemoryPool::reset_arena() noexcept {
 
 void DeviceMemoryPool::trim(StreamHandle stream) {
   std::lock_guard<std::mutex> lock(impl_->mtx);
+  ScopedDeviceGuard guard(impl_->device_id);
   for (auto& kv : impl_->free_lists) {
     const std::size_t block_bytes = kv.first;
     for (void* ptr : kv.second) {
@@ -285,6 +341,18 @@ void DeviceMemoryPool::trim(StreamHandle stream) {
   }
   impl_->free_lists.clear();
   impl_->cached_free_bytes = 0;
+  if (impl_->async_supported) {
+    if (stream != nullptr) {
+      (void)cudaStreamSynchronize(stream);
+    }
+    (void)cudaDeviceSynchronize();
+    cudaMemPool_t mempool{};
+    if (cudaDeviceGetDefaultMemPool(&mempool, impl_->device_id) == cudaSuccess) {
+      (void)cudaMemPoolTrimTo(mempool, 0);
+    } else {
+      (void)cudaGetLastError();
+    }
+  }
 }
 
 int DeviceMemoryPool::device_id() const noexcept { return impl_ ? impl_->device_id : 0; }

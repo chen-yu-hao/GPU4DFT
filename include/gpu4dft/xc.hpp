@@ -66,7 +66,10 @@ class MolecularGrid {
                                    std::span<const double> weights,
                                    const Basis& basis,
                                    int max_batch_points = 2048,
-                                   double ao_cutoff = 1e-12);
+                                   double ao_cutoff = 1e-12,
+                                   std::span<const int> parent_atom = {},
+                                   PartitionScheme partition = PartitionScheme::Stratmann,
+                                   bool becke_radii_adjust = true);
 
   // Returns unit-sphere Lebedev quadrature (coords_xyz [n_ang * 3], weights [n_ang]
   // summing to 4*pi) for supported sizes {14, 26, 50, 110, 194, 302}.
@@ -82,22 +85,51 @@ class MolecularGrid {
   std::size_t nbatches() const { return batches_.size(); }
   int nao() const { return nao_; }
 
+  bool has_partition_info() const noexcept {
+    return !parent_atom_.empty() && parent_atom_.size() == weights_.size();
+  }
+  bool has_grid_response_data() const noexcept { return has_partition_info(); }
+  const std::vector<int>& parent_atoms() const noexcept { return parent_atom_; }
+  PartitionScheme partition_scheme() const noexcept { return partition_scheme_; }
+  bool becke_radii_adjust() const noexcept { return becke_radii_adjust_; }
+
  private:
   void finalize_spatial_batches(std::vector<double> raw_coords,
                                 std::vector<double> raw_weights,
                                 const Basis& basis,
                                 int max_batch_points,
-                                double ao_cutoff);
+                                double ao_cutoff,
+                                std::vector<int> raw_parent_atom = {});
 
   std::vector<double> coords_;
   std::vector<double> weights_;
+  std::vector<int> parent_atom_;
+  PartitionScheme partition_scheme_ = PartitionScheme::Stratmann;
+  bool becke_radii_adjust_ = true;
   std::vector<SpatialBatch> batches_;
   int nao_ = 0;
 };
 
+// Range-separated hybrid (RSH) Hartree-Fock exchange parameters following PySCF convention:
+//   E_x^{HF,RSH} = alpha * K(1/r) + beta * K(erfc(omega*r)/r)
+//                = c_sr() * K(1/r) + (c_lr() - c_sr()) * K(erf(omega*r)/r)
+struct RshCoefficients {
+  double omega = 0.0;
+  double alpha = 0.0;
+  double beta = 0.0;
+
+  constexpr double c_lr() const noexcept { return alpha; }
+  constexpr double c_sr() const noexcept { return alpha + beta; }
+  constexpr bool is_rsh() const noexcept { return omega > 0.0 && beta != 0.0; }
+};
+
 // Returns exact Hartree-Fock exchange fraction alpha_x (e.g. 0.20 for B3LYP,
 // 0.25 for PBE0, 0.0 for pure LDA/GGA/TPSS, 1.0 for HF).
+// For range-separated hybrids, returns short-range exact exchange fraction c_sr = alpha + beta.
 double xc_exact_exchange_fraction(std::string_view xc_name);
+
+// Returns RSH Hartree-Fock exchange parameters (omega, alpha, beta) via Libxc.
+RshCoefficients xc_rsh_coefficients(std::string_view xc_name);
 
 // Point-wise evaluation result for generated symbolic XC functionals (deriv = 1 or 2).
 struct XcPointwiseResult {
@@ -136,6 +168,9 @@ struct XcOptions {
   double rho_cutoff = 1e-15;
   bool cache_ao_on_device = true;         // Cache compacted active-AO Phi across batches on GPU when within VRAM cap
   std::size_t max_ao_cache_mb = 2048;     // Maximum GPU memory budget (MiB) for persistent active-AO Phi cache
+  bool spin_polarized = false;            // Pre-configure for spin-polarized UKS evaluation
+  bool use_libxc = true;                  // Evaluate XC via Libxc 5.2.3 (required for UKS, RSH, general functionals)
+  bool grid_response = true;              // Include quadrature weight + moving-grid derivatives when grid has partition info
 };
 
 struct XcResult {
@@ -143,6 +178,18 @@ struct XcResult {
   double nelec = 0.0;
   std::vector<double> vxc;  // [nao * nao] row-major symmetric matrix
 };
+
+struct XcUksResult {
+  double exc = 0.0;
+  double nelec_alpha = 0.0;
+  double nelec_beta = 0.0;
+  std::vector<double> vxc_alpha;  // [nao * nao] row-major symmetric matrix
+  std::vector<double> vxc_beta;   // [nao * nao] row-major symmetric matrix
+};
+
+namespace detail {
+struct LibxcState;
+}  // namespace detail
 
 class XcEngine {
  public:
@@ -158,6 +205,10 @@ class XcEngine {
   int nao() const { return basis_.nao(); }
   const std::string& xc_name() const { return xc_name_; }
   double exact_exchange_fraction() const { return exx_fraction_; }
+  RshCoefficients rsh_coefficients() const noexcept { return rsh_; }
+  bool is_range_separated() const noexcept { return rsh_.is_rsh(); }
+  bool grid_response() const noexcept { return opts_.grid_response; }
+  void set_grid_response(bool enabled) noexcept;
   const MolecularGrid& grid() const { return grid_; }
   Backend active_backend() const { return active_backend_; }
 
@@ -165,9 +216,26 @@ class XcEngine {
   XcResult eval_vxc(std::span<const double> dm) const;
   double eval_vxc(const double* dm, double* vxc_out, double* nelec_out = nullptr) const;
 
+  // Spin-polarized UKS Host API: evaluates E_xc, alpha/beta electron counts, and [nao x nao] V_xc^{alpha,beta}.
+  XcUksResult eval_vxc_uks(std::span<const double> dm_alpha,
+                           std::span<const double> dm_beta) const;
+  double eval_vxc_uks(const double* dm_alpha,
+                      const double* dm_beta,
+                      double* vxc_alpha_out,
+                      double* vxc_beta_out,
+                      double* nelec_alpha_out = nullptr,
+                      double* nelec_beta_out = nullptr) const;
+
   // GPU Device-Pointer API: takes device pointers `d_dm` [nao * nao] and `d_vxc` [nao * nao]
   // (writes symmetric V_xc on GPU without host matrix transfers) and returns E_xc.
   double eval_vxc_device(const double* d_dm, double* d_vxc, void* cuda_stream = nullptr) const;
+
+  // Spin-polarized UKS GPU Device-Pointer API.
+  double eval_vxc_uks_device(const double* d_dm_alpha,
+                             const double* d_dm_beta,
+                             double* d_vxc_alpha,
+                             double* d_vxc_beta,
+                             void* cuda_stream = nullptr) const;
 
   // Second-Derivative XC Linear Response (TDDFT / CPHF Hessian contraction f_xc[rho_0]):
   // Precomputes and caches ground-state (rho_0, grad_rho_0, tau_0) and 1st+2nd XC functional
@@ -186,9 +254,14 @@ class XcEngine {
   void eval_fxc_device(const double* d_delta_dm, double* d_fxc_out,
                        void* cuda_stream = nullptr) const;
 
-  // Analytical XC nuclear gradient AO-derivative term [natom * 3] matching PySCF rks.Gradients().
+  // Analytical XC nuclear gradient [natom * 3] (includes grid_response when enabled and grid has partition info).
   std::vector<double> nuclear_grad(std::span<const XcAtom> atoms,
                                    std::span<const double> dm) const;
+
+  // Spin-polarized UKS analytical XC nuclear gradient [natom * 3].
+  std::vector<double> nuclear_grad_uks(std::span<const XcAtom> atoms,
+                                       std::span<const double> dm_alpha,
+                                       std::span<const double> dm_beta) const;
 
  private:
   Basis basis_;
@@ -199,6 +272,10 @@ class XcEngine {
   int xc_func_id_ = 0;
   int xc_family_ = 0;  // 0=LDA, 1=GGA, 2=MGGA
   double exx_fraction_ = 0.0;
+  RshCoefficients rsh_{};
+  bool xc_codegen_supported_ = false;
+
+  std::unique_ptr<detail::LibxcState> libxc_;
 
   struct HostFxcState;
   std::unique_ptr<HostFxcState> host_fxc_;
@@ -213,9 +290,40 @@ std::vector<double> xc_nuclear_grad(const Basis& basis,
                                     std::span<const XcAtom> atoms,
                                     std::string_view xc_name,
                                     const double* dm,
-                                    Backend backend = Backend::Cuda);
+                                    Backend backend = Backend::Cuda,
+                                    bool grid_response = true);
 
 namespace detail {
+
+void compute_partition_weight_grad_host(const MolecularGrid& grid,
+                                        std::span<const XcAtom> atoms,
+                                        std::span<const double> e_xc_point,
+                                        std::vector<double>& grad_io);
+
+void eval_libxc_rks_grid(const void* libxc_state,
+                         int family,
+                         double rho_cutoff,
+                         std::size_t npts,
+                         const double* weights,
+                         const double* dens_in,
+                         bool for_grad,
+                         double* wv_out,
+                         double* e_xc_point_out,
+                         double* exc_out,
+                         double* nelec_out);
+
+void eval_libxc_uks_grid(const void* libxc_state,
+                         int family,
+                         double rho_cutoff,
+                         std::size_t npts,
+                         const double* weights,
+                         const double* dens_in,
+                         bool for_grad,
+                         double* wv_out,
+                         double* e_xc_point_out,
+                         double* exc_out,
+                         double* nelec_a_out,
+                         double* nelec_b_out);
 
 struct FlatBasisView {
   int nshell = 0;

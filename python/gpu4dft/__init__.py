@@ -8,11 +8,14 @@ from __future__ import annotations
 import numpy as np
 
 from . import _core
+from . import dftd3
 from . import pw
 from ._core import (
     Atom,
     Backend,
     Basis,
+    D3BJParams,
+    D3BJResult,
     DavidsonIterationLog,
     DensitySolver,
     DirectJKEngine,
@@ -32,6 +35,7 @@ from ._core import (
     ResponseMethod,
     ResponseOptions,
     ResponseResult,
+    RshCoefficients,
     ScfIterationLog,
     ScfOptions,
     ScfResult,
@@ -45,6 +49,7 @@ from ._core import (
     XcEngine,
     XcOptions,
     XcResult,
+    XcUksResult,
     analyze_hessian,
     compute_molecular_hessian,
     kernel_names,
@@ -54,9 +59,17 @@ from ._core import (
     run_linear_response,
     run_scf,
     standard_atomic_mass_amu,
+    trim_device_pool,
     xc_exact_exchange_fraction,
+    xc_rsh_coefficients,
 )
 from .ase_calculator import GPU4DFTCalculator, SimpleAtoms
+from .dftd3 import (
+    dftd3_energy,
+    dftd3_energy_grad,
+    dftd3_params,
+    supported_dftd3_functionals,
+)
 from .pyscf_interface import (
     atoms_from_pyscf,
     aux_basis_from_pyscf,
@@ -64,6 +77,7 @@ from .pyscf_interface import (
     minao_init_guess,
 )
 from .scf import (
+    GradScanner,
     GridsConfig,
     LinearResponseSCF,
     MoleculeSpec,
@@ -71,12 +85,17 @@ from .scf import (
     NuclearHessian,
     RHF,
     RKS,
+    SCFScanner,
+    UHF,
+    UKS,
 )
 
 __all__ = [
     "Atom",
     "Backend",
     "Basis",
+    "D3BJParams",
+    "D3BJResult",
     "DavidsonIterationLog",
     "DensitySolver",
     "DirectJKEngine",
@@ -84,6 +103,7 @@ __all__ = [
     "GPU4DFTCalculator",
     "GemmBenchmarkResult",
     "GemmMode",
+    "GradScanner",
     "GradientResult",
     "GridOptions",
     "GridsConfig",
@@ -101,9 +121,13 @@ __all__ = [
     "RHF",
     "RIJKEngine",
     "RKS",
+    "UHF",
+    "UKS",
     "ResponseMethod",
     "ResponseOptions",
     "ResponseResult",
+    "RshCoefficients",
+    "SCFScanner",
     "ScfIterationLog",
     "ScfOptions",
     "ScfResult",
@@ -118,6 +142,7 @@ __all__ = [
     "XcEngine",
     "XcOptions",
     "XcResult",
+    "XcUksResult",
     "analyze_hessian",
     "atoms_from_pyscf",
     "aux_basis_from_pyscf",
@@ -125,11 +150,18 @@ __all__ = [
     "basis_from_pyscf",
     "benchmark_gemm",
     "compute_molecular_hessian",
+    "dftd3",
+    "dftd3_energy",
+    "dftd3_energy_grad",
+    "dftd3_params",
     "dipole_matrices",
     "eri_tensor",
     "eval_ao_grid",
     "gemm",
     "jk_nuclear_grad",
+    "jk_nuclear_grad_rsh",
+    "jk_nuclear_grad_uhf",
+    "jk_nuclear_grad_uhf_rsh",
     "kernel_names",
     "kinetic_matrix",
     "minao_init_guess",
@@ -144,7 +176,10 @@ __all__ = [
     "run_linear_response",
     "run_scf",
     "standard_atomic_mass_amu",
+    "supported_dftd3_functionals",
+    "trim_device_pool",
     "xc_exact_exchange_fraction",
+    "xc_rsh_coefficients",
 ]
 
 
@@ -170,14 +205,19 @@ def backend_available(backend: Backend | str) -> bool:
 
 
 def eri_tensor(
-    basis: Basis, backend: Backend | str = "host", precision: Precision | str = "fp64"
+    basis: Basis,
+    backend: Backend | str = "host",
+    precision: Precision | str = "fp64",
+    omega: float = 0.0,
 ) -> np.ndarray:
     """Full (ij|kl) ERI tensor as a (nao, nao, nao, nao) NumPy array.
 
     Intended for validation on small systems; production code paths contract
     integrals on the fly instead of storing them.
     """
-    return _core.eri_tensor(basis, _as_enum(Backend, backend), _as_enum(Precision, precision))
+    return _core.eri_tensor(
+        basis, _as_enum(Backend, backend), _as_enum(Precision, precision), float(omega)
+    )
 
 
 def overlap_matrix(basis: Basis, backend: Backend | str = "host") -> np.ndarray:
@@ -245,6 +285,75 @@ def jk_nuclear_grad(
     dm_c = np.ascontiguousarray(dm, dtype=np.float64)
     return _core.jk_nuclear_grad(
         basis, dm_c, float(k_fraction), _as_enum(Backend, backend), float(schwarz_cutoff), atoms
+    )
+
+
+def jk_nuclear_grad_uhf(
+    basis: Basis,
+    dm_alpha: np.ndarray,
+    dm_beta: np.ndarray,
+    k_fraction: float = 1.0,
+    backend: Backend | str = "cuda",
+    schwarz_cutoff: float = 1e-13,
+    atoms: list[Atom] | None = None,
+) -> np.ndarray:
+    """Analytical open-shell 2e nuclear gradient, shape (natom, 3) in Hartree/Bohr."""
+    da_c = np.ascontiguousarray(dm_alpha, dtype=np.float64)
+    db_c = np.ascontiguousarray(dm_beta, dtype=np.float64)
+    return _core.jk_nuclear_grad_uhf(
+        basis, da_c, db_c, float(k_fraction), _as_enum(Backend, backend), float(schwarz_cutoff),
+        atoms
+    )
+
+
+def jk_nuclear_grad_rsh(
+    basis: Basis,
+    dm: np.ndarray,
+    k_sr: float,
+    k_lr: float,
+    omega: float,
+    backend: Backend | str = "cuda",
+    schwarz_cutoff: float = 1e-13,
+    atoms: list[Atom] | None = None,
+) -> np.ndarray:
+    """Analytical RSH 2e Coulomb/Exchange nuclear gradient, shape (natom, 3) in Hartree/Bohr."""
+    dm_c = np.ascontiguousarray(dm, dtype=np.float64)
+    return _core.jk_nuclear_grad_rsh(
+        basis,
+        dm_c,
+        float(k_sr),
+        float(k_lr),
+        float(omega),
+        _as_enum(Backend, backend),
+        float(schwarz_cutoff),
+        atoms,
+    )
+
+
+def jk_nuclear_grad_uhf_rsh(
+    basis: Basis,
+    dm_alpha: np.ndarray,
+    dm_beta: np.ndarray,
+    k_sr: float,
+    k_lr: float,
+    omega: float,
+    backend: Backend | str = "cuda",
+    schwarz_cutoff: float = 1e-13,
+    atoms: list[Atom] | None = None,
+) -> np.ndarray:
+    """Analytical open-shell RSH 2e nuclear gradient, shape (natom, 3) in Hartree/Bohr."""
+    da_c = np.ascontiguousarray(dm_alpha, dtype=np.float64)
+    db_c = np.ascontiguousarray(dm_beta, dtype=np.float64)
+    return _core.jk_nuclear_grad_uhf_rsh(
+        basis,
+        da_c,
+        db_c,
+        float(k_sr),
+        float(k_lr),
+        float(omega),
+        _as_enum(Backend, backend),
+        float(schwarz_cutoff),
+        atoms,
     )
 
 

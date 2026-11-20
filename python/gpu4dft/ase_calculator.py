@@ -10,11 +10,13 @@ from typing import Any
 
 import numpy as np
 
+from . import _core
 from ._core import Atom, Basis, Shell
-from .scf import MoleculeSpec, RHF, RKS
+from .scf import MoleculeSpec, RHF, RKS, UHF, UKS
 
 try:
     from ase.calculators.calculator import Calculator as _ASECalculatorBase
+    from ase.calculators.calculator import PropertyNotImplementedError
     from ase.calculators.calculator import all_changes as _ALL_CHANGES
     from ase.units import Bohr as _BOHR_IN_ANGSTROM
     from ase.units import Hartree as _HARTREE_IN_EV
@@ -22,6 +24,7 @@ try:
     HAVE_ASE = True
 except ImportError:  # pragma: no cover - clean standalone fallback when ASE is absent
     HAVE_ASE = False
+    PropertyNotImplementedError = NotImplementedError  # type: ignore[misc,assignment]
     _ALL_CHANGES = [
         "positions",
         "numbers",
@@ -36,11 +39,31 @@ except ImportError:  # pragma: no cover - clean standalone fallback when ASE is 
 
     class _ASECalculatorBase:  # type: ignore[no-redef]
         implemented_properties: list[str] = ["energy", "forces"]
+        default_parameters: dict[str, Any] = {}
 
         def __init__(self, **kwargs: Any) -> None:
-            self.parameters: dict[str, Any] = dict(kwargs)
+            self.parameters: dict[str, Any] = self.get_default_parameters()
             self.results: dict[str, Any] = {}
             self.atoms: Any = None
+            if kwargs:
+                self.set(**kwargs)
+
+        def get_default_parameters(self) -> dict[str, Any]:
+            return dict(self.default_parameters)
+
+        def reset(self) -> None:
+            self.atoms = None
+            self.results = {}
+
+        def set(self, **kwargs: Any) -> dict[str, Any]:
+            changed: dict[str, Any] = {}
+            for key, val in kwargs.items():
+                if key not in self.parameters or self.parameters[key] != val:
+                    changed[key] = val
+                self.parameters[key] = val
+            if changed:
+                self.reset()
+            return changed
 
         def check_state(self, atoms: Any, tol: float = 1e-15) -> list[str]:
             if self.atoms is None:
@@ -116,13 +139,17 @@ class SimpleAtoms:
         self,
         numbers: list[int] | np.ndarray,
         positions: list[list[float]] | np.ndarray,
-        charge: int = 0,
+        charge: int | None = 0,
+        spin: int | None = None,
     ) -> None:
         self._numbers = np.asarray(numbers, dtype=int)
         self._positions = np.asarray(positions, dtype=np.float64)
         if self._positions.ndim != 2 or self._positions.shape != (len(self._numbers), 3):
             raise ValueError("positions must have shape (natom, 3) in Angstrom")
-        self.info: dict[str, Any] = {"charge": int(charge)}
+        q = 0 if charge is None else int(charge)
+        self.info: dict[str, Any] = {"charge": q}
+        if spin is not None:
+            self.info["spin"] = int(spin)
         self.calc: Any = None
 
     def get_atomic_numbers(self) -> np.ndarray:
@@ -138,7 +165,9 @@ class SimpleAtoms:
         self._positions = arr.copy()
 
     def copy(self) -> SimpleAtoms:
-        out = SimpleAtoms(self._numbers.copy(), self._positions.copy(), int(self.info.get("charge", 0)))
+        raw_q = self.info.get("charge", 0)
+        q = 0 if raw_q is None else int(raw_q)
+        out = SimpleAtoms(self._numbers.copy(), self._positions.copy(), q)
         out.info = dict(self.info)
         return out
 
@@ -153,7 +182,33 @@ class SimpleAtoms:
         return np.asarray(self.calc.get_forces(self), dtype=np.float64)
 
 
-def _build_molecule_for_atoms(atoms_obj: Any, basis_name: str, charge: int) -> Any:
+def _freeze_value(val: Any) -> Any:
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, Basis):
+        return ("Basis", id(val))
+    if isinstance(val, dict):
+        return ("dict", tuple(sorted((str(k), _freeze_value(v)) for k, v in val.items())))
+    if isinstance(val, (list, tuple)):
+        return tuple(_freeze_value(x) for x in val)
+    return ("repr", repr(val))
+
+
+def _hashable_basis_key(val: Any) -> Any:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return ("str", val)
+    if isinstance(val, Basis):
+        return ("Basis", id(val))
+    if isinstance(val, dict):
+        return ("dict", tuple(sorted((str(k), _freeze_value(v)) for k, v in val.items())))
+    return _freeze_value(val)
+
+
+def _build_molecule_for_atoms(
+    atoms_obj: Any, basis_name: Any, charge: int, spin: int = 0
+) -> Any:
     numbers = [int(z) for z in atoms_obj.get_atomic_numbers()]
     pos_ang = np.asarray(atoms_obj.get_positions(), dtype=np.float64)
 
@@ -164,9 +219,17 @@ def _build_molecule_for_atoms(atoms_obj: Any, basis_name: str, charge: int) -> A
             (z, (float(pos_ang[i, 0]), float(pos_ang[i, 1]), float(pos_ang[i, 2])))
             for i, z in enumerate(numbers)
         ]
-        return gto.M(atom=atom_spec, basis=basis_name, charge=charge, unit="Angstrom", cart=False, verbose=0)
+        return gto.M(
+            atom=atom_spec,
+            basis=basis_name,
+            charge=charge,
+            spin=int(spin),
+            unit="Angstrom",
+            cart=False,
+            verbose=0,
+        )
     except ImportError:
-        if basis_name.strip().lower() != "sto-3g":
+        if not isinstance(basis_name, str) or basis_name.strip().lower() != "sto-3g":
             raise ImportError(
                 f"pyscf is required to parse basis {basis_name!r}; only 'sto-3g' is embedded standalone"
             ) from None
@@ -181,25 +244,49 @@ def _build_molecule_for_atoms(atoms_obj: Any, basis_name: str, charge: int) -> A
             for l_ang, exps, coeffs in _EMBEDDED_STO3G[z]:
                 shells.append(Shell(l_ang, c_bohr, list(exps), list(coeffs)))
         nelec = int(sum(numbers) - charge)
-        return MoleculeSpec(basis=Basis(shells), atoms=atom_list, nelectron=nelec)
+        return MoleculeSpec(
+            basis=Basis(shells), atoms=atom_list, nelectron=nelec, spin=int(spin)
+        )
 
 
 class GPU4DFTCalculator(_ASECalculatorBase):
-    """ASE-compatible calculator driving GPU4DFT's C++20/CUDA RHF & RKS engines.
+    """ASE-compatible calculator driving GPU4DFT's C++20/CUDA RHF/RKS/UHF/UKS engines.
 
     Energies are returned in **eV** and forces in **eV / Angstrom**, matching ASE conventions.
     """
 
     implemented_properties = ["energy", "forces"]
+    default_parameters: dict[str, Any] = {
+        "method": None,
+        "xc": "b3lyp",
+        "basis": "def2-svp",
+        "charge": 0,
+        "spin": None,
+        "dispersion": None,
+        "density_fit": False,
+        "auxbasis": "def2-universal-jkfit",
+        "snk": False,
+        "backend": None,
+        "precision": "fp64",
+        "dynamic_precision": None,
+        "gemm_mode": "fp64",
+        "solver": "diag",
+        "grids_level": 3,
+        "conv_tol": 1e-9,
+        "max_cycle": 100,
+    }
 
     def __init__(
         self,
         *,
+        method: str | None = None,
         xc: str = "b3lyp",
-        basis: str = "def2-svp",
-        charge: int = 0,
+        basis: str | dict = "def2-svp",
+        charge: int | None = 0,
+        spin: int | None = None,
+        dispersion: str | None = None,
         density_fit: bool = False,
-        auxbasis: str = "def2-universal-jkfit",
+        auxbasis: str | dict | Basis | None = "def2-universal-jkfit",
         snk: bool = False,
         backend: str | None = None,
         precision: str = "fp64",
@@ -208,12 +295,20 @@ class GPU4DFTCalculator(_ASECalculatorBase):
         solver: str = "diag",
         grids_level: int = 3,
         conv_tol: float = 1e-9,
+        max_cycle: int = 100,
         **kwargs: Any,
     ) -> None:
+        self.last_mf: RHF | RKS | UHF | UKS | None = None
+        self._last_dm_key: tuple | None = None
+        self._last_coords_ang: np.ndarray | None = None
+        self._last_full_sig: tuple | None = None
         super().__init__(
+            method=method,
             xc=xc,
             basis=basis,
             charge=charge,
+            spin=spin,
+            dispersion=dispersion,
             density_fit=density_fit,
             auxbasis=auxbasis,
             snk=snk,
@@ -224,9 +319,35 @@ class GPU4DFTCalculator(_ASECalculatorBase):
             solver=solver,
             grids_level=grids_level,
             conv_tol=conv_tol,
+            max_cycle=max_cycle,
             **kwargs,
         )
-        self.last_mf: RHF | RKS | None = None
+
+    def reset(self) -> None:
+        super().reset()
+        mf = getattr(self, "last_mf", None)
+        if mf is not None:
+            if hasattr(mf, "release"):
+                mf.release()
+            else:
+                mf._engine = None
+        self._last_coords_ang = None
+        self._last_full_sig = None
+        _core.trim_device_pool()
+
+    def close(self) -> None:
+        mf = getattr(self, "last_mf", None)
+        if mf is not None:
+            if hasattr(mf, "release"):
+                mf.release()
+            else:
+                mf._engine = None
+        self.last_mf = None
+        self._last_dm_key = None
+        self._last_coords_ang = None
+        self._last_full_sig = None
+        super().reset()
+        _core.trim_device_pool()
 
     def check_state(self, atoms: Any, tol: float = 1e-15) -> list[str]:
         if self.atoms is None:
@@ -248,12 +369,22 @@ class GPU4DFTCalculator(_ASECalculatorBase):
                 old_pos, new_pos, rtol=0.0, atol=tol
             ):
                 changes.append("positions")
-            old_q = int((getattr(self.atoms, "info", {}) or {}).get("charge", 0))
-            new_q = int((getattr(atoms, "info", {}) or {}).get("charge", 0))
-            if old_q != new_q:
+        else:
+            changes = list(super().check_state(atoms, tol=tol))
+
+        old_info = getattr(self.atoms, "info", {}) or {}
+        new_info = getattr(atoms, "info", {}) or {}
+        old_q = old_info.get("charge", 0)
+        new_q = new_info.get("charge", 0)
+        if (0 if old_q is None else int(old_q)) != (0 if new_q is None else int(new_q)):
+            if "initial_charges" not in changes:
                 changes.append("initial_charges")
-            return changes
-        return list(super().check_state(atoms, tol=tol))
+        old_s = old_info.get("spin", None)
+        new_s = new_info.get("spin", None)
+        if (None if old_s is None else int(old_s)) != (None if new_s is None else int(new_s)):
+            if "initial_magmoms" not in changes:
+                changes.append("initial_magmoms")
+        return changes
 
     def calculate(
         self,
@@ -261,7 +392,15 @@ class GPU4DFTCalculator(_ASECalculatorBase):
         properties: list[str] | tuple[str, ...] = ("energy",),
         system_changes: list[str] = _ALL_CHANGES,
     ) -> None:
+        for prop in properties:
+            if prop not in ("energy", "free_energy", "forces"):
+                raise PropertyNotImplementedError(
+                    f"Property {prop!r} is not implemented by GPU4DFTCalculator"
+                )
+        prev_results = dict(self.results)
         if isinstance(atoms, SimpleAtoms):
+            if system_changes:
+                self.results = {}
             self.atoms = atoms.copy()
         else:
             super().calculate(atoms, properties, system_changes)
@@ -271,12 +410,36 @@ class GPU4DFTCalculator(_ASECalculatorBase):
 
         p = self.parameters
         info_dict = getattr(target, "info", {}) or {}
-        charge = int(info_dict.get("charge", p.get("charge", 0)))
-        mol = _build_molecule_for_atoms(target, str(p["basis"]), charge)
+        if "charge" in info_dict and info_dict["charge"] is not None:
+            charge = int(info_dict["charge"])
+        elif p.get("charge") is not None:
+            charge = int(p["charge"])
+        else:
+            charge = 0
+        if "spin" in info_dict and info_dict["spin"] is not None:
+            spin = int(info_dict["spin"])
+        elif p.get("spin") is not None:
+            spin = int(p["spin"])
+        elif hasattr(target, "get_initial_magnetic_moments"):
+            spin = int(round(float(np.sum(target.get_initial_magnetic_moments()))))
+        else:
+            spin = 0
+        if spin < 0:
+            raise ValueError(
+                f"GPU4DFTCalculator requires non-negative spin (N_alpha - N_beta >= 0); got spin={spin}"
+            )
 
         xc_name = str(p["xc"]).strip()
-        is_hf = xc_name.lower() in ("", "hf", "rhf")
-        scf_kwargs = dict(
+        is_hf = xc_name.lower() in ("", "hf", "rhf", "uhf")
+        raw_method = p.get("method")
+        if raw_method is not None:
+            method = str(raw_method).strip().lower()
+        else:
+            method = ("uhf" if is_hf else "uks") if spin != 0 else ("rhf" if is_hf else "rks")
+        if method not in ("rhf", "rks", "uhf", "uks"):
+            raise ValueError(f"Unsupported method {method!r}; choose 'rhf', 'rks', 'uhf', or 'uks'")
+
+        scf_kwargs: dict[str, Any] = dict(
             backend=p["backend"],
             precision=p["precision"],
             dynamic_precision=p["dynamic_precision"],
@@ -284,21 +447,148 @@ class GPU4DFTCalculator(_ASECalculatorBase):
             solver=p["solver"],
             grids_level=int(p["grids_level"]),
             conv_tol=float(p["conv_tol"]),
+            max_cycle=int(p.get("max_cycle", 100)),
+            dispersion=p.get("dispersion"),
         )
-        mf: RHF | RKS = RHF(mol, **scf_kwargs) if is_hf else RKS(mol, xc=xc_name, **scf_kwargs)
+        for key in (
+            "diis_tol",
+            "diis_space",
+            "damping",
+            "level_shift",
+            "lindep_tol",
+            "schwarz_cutoff",
+            "fp32_threshold",
+            "ozaki_slices",
+            "early_gemm_mode",
+            "incremental",
+            "use_cuda_graph",
+            "init_guess",
+        ):
+            if key in p and p[key] is not None:
+                scf_kwargs[key] = p[key]
+        grids_partition = p.get("grids_partition")
+        grids_prune = p.get("grids_prune")
+
+        basis_val = p.get("basis", "def2-svp")
+        aux_val = p.get("auxbasis", "def2-universal-jkfit")
+        numbers = tuple(int(z) for z in target.get_atomic_numbers())
+        dm_key = (
+            numbers,
+            charge,
+            spin,
+            method,
+            xc_name.lower(),
+            _hashable_basis_key(basis_val),
+            bool(p["density_fit"]),
+            _hashable_basis_key(aux_val),
+            bool(p["snk"]),
+        )
+        full_sig = (
+            dm_key,
+            tuple(sorted((k, _freeze_value(v)) for k, v in scf_kwargs.items())),
+            _freeze_value(grids_partition),
+            None if grids_prune is None else bool(grids_prune),
+            tuple(
+                sorted(
+                    (k, _freeze_value(p.get(k)))
+                    for k in ("snk_overlap_fitting", "snk_pair_cutoff", "snk_lindep_tol", "snk_precision")
+                )
+            ),
+        )
+
+        pos_ang = np.asarray(target.get_positions(), dtype=np.float64)
+        if (
+            not system_changes
+            and self.last_mf is not None
+            and self.last_mf.converged
+            and self.last_mf.result is not None
+            and self._last_dm_key == dm_key
+            and self._last_full_sig == full_sig
+            and self._last_coords_ang is not None
+            and self._last_coords_ang.shape == pos_ang.shape
+            and np.allclose(self._last_coords_ang, pos_ang, rtol=0.0, atol=1e-15)
+        ):
+            e_hartree = float(self.last_mf.e_tot)
+            energy_ev = e_hartree * _HARTREE_IN_EV
+            self.results["energy"] = energy_ev
+            self.results["free_energy"] = energy_ev
+            self.results["energy_hartree"] = e_hartree
+            if "forces" in properties:
+                if "forces" in prev_results and "gradient_eh_bohr" in prev_results:
+                    self.results["forces"] = prev_results["forces"]
+                    self.results["gradient_eh_bohr"] = prev_results["gradient_eh_bohr"]
+                else:
+                    if self.last_mf._engine is None:
+                        self.last_mf.kernel(dm0=self.last_mf.make_rdm1())
+                    grad_eh_bohr = self.last_mf.nuc_grad_method().kernel()
+                    forces_ev_ang = -np.asarray(grad_eh_bohr, dtype=np.float64) * (
+                        _HARTREE_IN_EV / _BOHR_IN_ANGSTROM
+                    )
+                    self.results["forces"] = forces_ev_ang
+                    self.results["gradient_eh_bohr"] = grad_eh_bohr
+            return
+
+        dm0 = None
+        if self.last_mf is not None:
+            if (
+                self.last_mf.converged
+                and self._last_dm_key == dm_key
+                and self.last_mf.result is not None
+            ):
+                dm0 = self.last_mf.make_rdm1()
+            if hasattr(self.last_mf, "release"):
+                self.last_mf.release()
+            else:
+                self.last_mf._engine = None
+        if self._last_dm_key is not None and self._last_dm_key != dm_key:
+            _core.trim_device_pool()
+
+        mol = _build_molecule_for_atoms(target, basis_val, charge, spin=spin)
+
+        mf: RHF | RKS | UHF | UKS
+        if method == "rhf":
+            mf = RHF(mol, **scf_kwargs)
+        elif method == "rks":
+            mf = RKS(mol, xc=xc_name, **scf_kwargs)
+        elif method == "uhf":
+            mf = UHF(mol, spin=spin, **scf_kwargs)
+        else:
+            mf = UKS(mol, xc=xc_name, spin=spin, **scf_kwargs)
 
         if p["density_fit"]:
-            mf.density_fit(auxbasis=str(p["auxbasis"]))
+            mf.density_fit(auxbasis=aux_val)
         if p["snk"]:
-            mf.snk()
+            snk_kwargs: dict[str, Any] = {}
+            for sk_src, sk_dst in (
+                ("snk_overlap_fitting", "overlap_fitting"),
+                ("snk_pair_cutoff", "pair_cutoff"),
+                ("snk_lindep_tol", "lindep_tol"),
+                ("snk_precision", "precision"),
+            ):
+                if sk_src in p and p[sk_src] is not None:
+                    snk_kwargs[sk_dst] = p[sk_src]
+            mf.snk(**snk_kwargs)
+        if grids_partition is not None:
+            mf.grids.partition = grids_partition
+        if grids_prune is not None:
+            mf.grids.prune = bool(grids_prune)
 
-        e_hartree = mf.kernel()
+        e_hartree = mf.kernel(dm0=dm0)
+        if not mf.converged and dm0 is not None:
+            e_hartree = mf.kernel(dm0=None)
         if not mf.converged:
+            if hasattr(mf, "release"):
+                mf.release()
+            else:
+                mf._engine = None
             raise RuntimeError(
                 f"GPU4DFT SCF did not converge in {mf.iterations} iterations "
                 f"(final DIIS RMS = {mf.result.scf.final_diis_rms:.3e})"
             )
         self.last_mf = mf
+        self._last_dm_key = dm_key
+        self._last_coords_ang = pos_ang.copy()
+        self._last_full_sig = full_sig
 
         energy_ev = float(e_hartree) * _HARTREE_IN_EV
         self.results["energy"] = energy_ev

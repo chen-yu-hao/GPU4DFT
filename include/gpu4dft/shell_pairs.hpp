@@ -42,7 +42,8 @@ struct ShellPairData {
 // only i >= j is kept. Primitive pairs with |prefactor| < prim_cutoff are
 // dropped. Computes exact shell-pair Schwarz bounds and sorts pairs in
 // descending `schwarz_bound` order.
-ShellPairData build_shell_pairs(const Basis& basis, int la, int lb, double prim_cutoff = 0.0);
+ShellPairData build_shell_pairs(const Basis& basis, int la, int lb, double prim_cutoff = 0.0,
+                                double omega = 0.0);
 
 // Builds 1-center auxiliary shell pairs (P, unit) for RI 3-center (ab|P) and
 // 2-center (P|Q) Coulomb integrals for shells in `aux_basis` with l == la.

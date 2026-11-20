@@ -11,6 +11,9 @@ namespace gpu4dft::detail {
 
 using GeneralEriLaunchFn = void (*)(int la, int lb, int lc, int ld, const ShellPairView& bra,
                                     const ShellPairView& ket, double* out, void* stream);
+using GeneralEriOmegaLaunchFn = void (*)(int la, int lb, int lc, int ld, const ShellPairView& bra,
+                                         const ShellPairView& ket, double omega, double* out,
+                                         void* stream);
 
 // Number of visible CUDA devices; 0 if there is no driver or no device.
 int cuda_device_count();
@@ -24,5 +27,9 @@ void run_eri_kernel_cuda(EriLaunchFn launch, const ShellPairData& bra, const She
 void run_eri_general_cuda(GeneralEriLaunchFn launch, int la, int lb, int lc, int ld,
                           const ShellPairData& bra, const ShellPairData& ket,
                           std::vector<double>& out);
+
+void run_eri_general_omega_cuda(GeneralEriOmegaLaunchFn launch, int la, int lb, int lc, int ld,
+                                const ShellPairData& bra, const ShellPairData& ket, double omega,
+                                std::vector<double>& out);
 
 }  // namespace gpu4dft::detail

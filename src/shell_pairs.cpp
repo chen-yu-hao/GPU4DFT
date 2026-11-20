@@ -63,7 +63,7 @@ void append_raw_pair(ShellPairData& pairs, const Basis& basis, int i, int j, dou
   pairs.prim_offset.push_back(static_cast<int>(pairs.exponent.size()));
 }
 
-void compute_schwarz_and_sort(ShellPairData& raw, bool sort_descending) {
+void compute_schwarz_and_sort(ShellPairData& raw, bool sort_descending, double omega = 0.0) {
   const int np = raw.npair();
   raw.schwarz_bound.assign(np, 0.0);
   if (np == 0) return;
@@ -84,7 +84,7 @@ void compute_schwarz_and_sort(ShellPairData& raw, bool sort_descending) {
     #pragma omp for schedule(dynamic, 16)
     #endif
     for (int P = 0; P < np; ++P) {
-      generated::eri_general_eval<double>(la, lb, la, lb, v, P, v, P, diag_block.data());
+      generated::eri_general_eval<double>(la, lb, la, lb, v, P, v, P, diag_block.data(), omega);
       double max_diag = 0.0;
       for (int uv = 0; uv < nsab; ++uv) {
         const double val = std::abs(diag_block[uv * nsab + uv]);
@@ -183,7 +183,7 @@ ShellPairView ShellPairData::view() const {
   };
 }
 
-ShellPairData build_shell_pairs(const Basis& basis, int la, int lb, double prim_cutoff) {
+ShellPairData build_shell_pairs(const Basis& basis, int la, int lb, double prim_cutoff, double omega) {
   if (la < 0 || lb < 0) throw std::invalid_argument("angular momenta must be non-negative");
   if (la > kMaxSupportedL || lb > kMaxSupportedL) {
     throw NotImplemented("shell pairs (l=" + std::to_string(la) + ", l=" + std::to_string(lb) +
@@ -204,7 +204,7 @@ ShellPairData build_shell_pairs(const Basis& basis, int la, int lb, double prim_
     }
   }
 
-  compute_schwarz_and_sort(pairs, /*sort_descending=*/true);
+  compute_schwarz_and_sort(pairs, /*sort_descending=*/true, omega);
   return pairs;
 }
 

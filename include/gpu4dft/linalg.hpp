@@ -126,17 +126,19 @@ CanonicalOrthoResult canonical_orthogonalization(int nao, const double* S,
                                                  Backend backend = Backend::Cuda);
 
 // Solve Roothaan-Hall equations F C = S C eps via canonical orthogonalizer X [nao x nmo],
-// building D = 2 C_occ C_occ^T and W = 2 C_occ diag(eps_occ) C_occ^T.
+// building D = occ_weight * C_occ C_occ^T and W = occ_weight * C_occ diag(eps_occ) C_occ^T.
 FockDiagResult solve_fock_diag(int nao, int nmo, int n_occ, const double* F, const double* X,
                                Backend backend = Backend::Cuda,
-                               GemmMode gemm_mode = GemmMode::FP64, int ozaki_slices = 8);
+                               GemmMode gemm_mode = GemmMode::FP64, int ozaki_slices = 8,
+                               double occ_weight = 2.0);
 
 // Niklasson's Second-Order Trace-Resetting Density Matrix Purification (SP2).
 // Maps F' = X^T F X via Gershgorin bounds into [0, 1], iterates P_{k+1} = P_k^2 or 2 P_k - P_k^2
 // using pure GEMMs (FP64, FP32, or OzakiInt8, with CUDA Graph capture on GPU), and forms
-// D = 2 X P X^T and W = 0.5 D F D.
+// D = occ_weight * X P X^T and W = (1 / occ_weight) * D F D.
 Sp2Result solve_fock_sp2(int nao, int nmo, int n_occ, const double* F, const double* X,
-                         Backend backend = Backend::Cuda, const Sp2Options& opts = {});
+                         Backend backend = Backend::Cuda, const Sp2Options& opts = {},
+                         double occ_weight = 2.0);
 
 // ---------------------------------------------------------------------------
 // GPU Device-Pointer API (zero host transfers inside GPU-resident SCF)
@@ -151,11 +153,12 @@ void syevd_device(GpuLinalgContext& ctx, int n, const double* d_A, double* d_w_o
                   double* d_U_out, StreamHandle stream = nullptr);
 
 // Transforms F' = X^T F X, diagonalizes via cusolverDnDsyevd, back-transforms C = X C',
-// and constructs D = 2 C_occ C_occ^T and (if d_W_out != nullptr) W = 2 C_occ diag(eps_occ) C_occ^T.
+// and constructs D = occ_weight * C_occ C_occ^T and (if d_W_out != nullptr) W = occ_weight * C_occ diag(eps_occ) C_occ^T.
 void solve_fock_diag_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ, const double* d_F,
                             const double* d_X, double* d_eps_out, double* d_C_out, double* d_D_out,
                             double* d_W_out = nullptr, GemmMode gemm_mode = GemmMode::FP64,
-                            StreamHandle stream = nullptr, int ozaki_slices = 8);
+                            StreamHandle stream = nullptr, int ozaki_slices = 8,
+                            double occ_weight = 2.0);
 
 // GPU-resident SP2 purification with CUDA Graph capture of fixed SP2 polynomial step blocks.
 struct DeviceSp2Stats {
@@ -167,7 +170,8 @@ struct DeviceSp2Stats {
 DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext& ctx, int nao, int nmo, int n_occ,
                                      const double* d_F, const double* d_X, double* d_P_work,
                                      double* d_D_out, double* d_W_out = nullptr,
-                                     const Sp2Options& opts = {}, StreamHandle stream = nullptr);
+                                     const Sp2Options& opts = {}, StreamHandle stream = nullptr,
+                                     double occ_weight = 2.0);
 
 // Device matrix utility primitives used by GPU-resident SCF and CDIIS.
 void symmetrize_matrix_device(int n, double* d_A, StreamHandle stream = nullptr);
@@ -180,14 +184,24 @@ void assemble_fock_and_traces_device(int nao, const double* d_D, const double* d
                                      const double* d_J, const double* d_K, double alpha_x,
                                      const double* d_Vxc, double* d_F_out,
                                      double* d_traces3_out, StreamHandle stream = nullptr);
+void assemble_fock_and_traces_uks_device(int nao, const double* d_Da, const double* d_Db,
+                                         const double* d_H, const double* d_J,
+                                         const double* d_Ka, const double* d_Kb, double alpha_x,
+                                         const double* d_Vxca, const double* d_Vxcb,
+                                         double* d_Fa_out, double* d_Fb_out,
+                                         double* d_traces4_out, StreamHandle stream = nullptr);
 void apply_level_shift_ao_device(GpuLinalgContext& ctx, int nao, double level_shift,
                                  const double* d_S, const double* d_D, double* d_F_inout,
                                  GemmMode gemm_mode = GemmMode::FP64,
-                                 StreamHandle stream = nullptr);
+                                 StreamHandle stream = nullptr, double dm_scale = 0.5);
 
 // Coalesced [bc, nao, nao] -> [nao, bc, nao] outer-axis permutation for chunked GPU RI-K.
 void permute_ri_chunk_pair_device(int bc, int nao, const double* d_src_a, const double* d_src_b,
                                   double* d_dst_a, double* d_dst_b,
                                   StreamHandle stream = nullptr);
+
+// Slice first `occ_cols` columns from row-major [rows x total_cols] into [rows x occ_cols].
+void slice_cols_device(int rows, int total_cols, int occ_cols, const double* d_C_full,
+                       double* d_C_occ_out, StreamHandle stream = nullptr);
 
 }  // namespace gpu4dft

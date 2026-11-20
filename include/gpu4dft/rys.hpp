@@ -361,4 +361,27 @@ GPU4DFT_HD inline void rys_roots_weights_from_boys(int n_roots, R T, const R* F,
   }
 }
 
+// Omega-attenuated Rys quadrature roots u_r and weights w_r for erf(omega * r12) / r12:
+//   \sum_{r=0}^{n_roots-1} w_r u_r^k == theta^{k + 1/2} F_k(theta * T)
+// where theta = omega^2 / (omega^2 + rho). Delegates to standard rys_roots_weights when omega <= 0.
+template <typename R>
+GPU4DFT_HD inline void rys_roots_weights_erf(int n_roots, R T, R rho, R omega, R* roots,
+                                             R* weights) {
+  if (omega <= R(0)) {
+    rys_roots_weights<R>(n_roots, T, roots, weights);
+    return;
+  }
+  constexpr int kMaxRoots = 12;
+  if (n_roots <= 0 || n_roots > kMaxRoots) return;
+  const double theta = omega_theta<double>(static_cast<double>(rho), static_cast<double>(omega));
+  const double sqrt_theta = math::sqrt(theta);
+  double u_d[kMaxRoots];
+  double w_d[kMaxRoots];
+  detail::rys_solve_double<kMaxRoots>(n_roots, theta * static_cast<double>(T), nullptr, u_d, w_d);
+  for (int r = 0; r < n_roots; ++r) {
+    roots[r] = static_cast<R>(theta * u_d[r]);
+    weights[r] = static_cast<R>(sqrt_theta * w_d[r]);
+  }
+}
+
 }  // namespace gpu4dft

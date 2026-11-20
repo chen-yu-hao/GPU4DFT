@@ -35,6 +35,11 @@ GENERAL_LAUNCHER_PARAMS = (
     "const ShellPairView& ket, double* out, void* stream"
 )
 
+GENERAL_OMEGA_LAUNCHER_PARAMS = (
+    "int la, int lb, int lc, int ld, const ShellPairView& bra, "
+    "const ShellPairView& ket, double omega, double* out, void* stream"
+)
+
 
 def launcher_name(cls: EriClass, backend: str, precision: Precision) -> str:
     return f"eri_{cls.name}_{backend}_{precision.name}"
@@ -42,6 +47,10 @@ def launcher_name(cls: EriClass, backend: str, precision: Precision) -> str:
 
 def general_launcher_name(backend: str, precision: Precision) -> str:
     return f"eri_general_{backend}_{precision.name}"
+
+
+def general_omega_launcher_name(backend: str, precision: Precision) -> str:
+    return f"eri_general_{backend}_{precision.name}_omega"
 
 
 class Backend:
@@ -71,12 +80,17 @@ class Backend:
             )
         return "\n".join(out)
 
-    def _general_wrappers(self, driver: str) -> str:
+    def _general_wrappers(self, driver: str, omega_driver: str) -> str:
         out = []
         for prec in PRECISIONS:
             out.append(
                 f"void {general_launcher_name(self.name, prec)}({GENERAL_LAUNCHER_PARAMS}) {{\n"
                 f"  {driver}<{prec.ctype}>(la, lb, lc, ld, bra, ket, out, stream);\n"
+                f"}}\n"
+            )
+            out.append(
+                f"void {general_omega_launcher_name(self.name, prec)}({GENERAL_OMEGA_LAUNCHER_PARAMS}) {{\n"
+                f"  {omega_driver}<{prec.ctype}>(la, lb, lc, ld, bra, ket, omega, out, stream);\n"
                 f"}}\n"
             )
         return "\n".join(out)
@@ -125,6 +139,7 @@ void {driver}(const ShellPairView& bra, const ShellPairView& ket, double* out,
 
     def emit_general_source(self) -> str:
         driver = "eri_general_host_driver"
+        omega_driver = "eri_general_host_omega_driver"
         return f"""\
 {GENERATED_BANNER}
 #include "gpu4dft/generated/eri_launchers.hpp"
@@ -149,9 +164,25 @@ void {driver}(int la, int lb, int lc, int ld, const ShellPairView& bra,
   }}
 }}
 
+template <typename R>
+void {omega_driver}(int la, int lb, int lc, int ld, const ShellPairView& bra,
+                    const ShellPairView& ket, double omega, double* out, void* /*stream*/) {{
+  const long long nket = ket.npair;
+  const long long n = static_cast<long long>(bra.npair) * nket;
+  const long long nsph = static_cast<long long>(n_sph(la)) * n_sph(lb) * n_sph(lc) * n_sph(ld);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(dynamic, 16)
+#endif
+  for (long long idx = 0; idx < n; ++idx) {{
+    const int ib = static_cast<int>(idx / nket);
+    const int ik = static_cast<int>(idx - ib * nket);
+    eri_general_eval<R>(la, lb, lc, ld, bra, ib, ket, ik, out + idx * nsph, omega);
+  }}
+}}
+
 }}  // namespace
 
-{self._general_wrappers(driver)}
+{self._general_wrappers(driver, omega_driver)}
 }}  // namespace gpu4dft::generated
 """
 
@@ -281,6 +312,7 @@ def _emit_gpu_general_source(
     stream_type: str,
 ) -> str:
     driver = f"eri_general_{backend.name}_driver"
+    omega_driver = f"eri_general_{backend.name}_omega_driver"
     return f"""\
 {GENERATED_BANNER}
 #include <{runtime_header}>
@@ -313,6 +345,22 @@ __global__ void __launch_bounds__(kBlockSize)
 }}
 
 template <typename R>
+__global__ void __launch_bounds__(kBlockSize)
+    eri_general_omega_kernel(int la, int lb, int lc, int ld, ShellPairView bra, ShellPairView ket,
+                             double omega, double* __restrict__ out) {{
+  const long long nket = ket.npair;
+  const long long n = static_cast<long long>(bra.npair) * nket;
+  const long long nsph = static_cast<long long>(n_sph(la)) * n_sph(lb) * n_sph(lc) * n_sph(ld);
+  const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+  for (long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+       idx < n; idx += stride) {{
+    const int ib = static_cast<int>(idx / nket);
+    const int ik = static_cast<int>(idx - ib * nket);
+    eri_general_eval<R>(la, lb, lc, ld, bra, ib, ket, ik, out + idx * nsph, omega);
+  }}
+}}
+
+template <typename R>
 void {driver}(int la, int lb, int lc, int ld, const ShellPairView& bra,
               const ShellPairView& ket, double* out, void* stream) {{
   const long long n = static_cast<long long>(bra.npair) * ket.npair;
@@ -322,9 +370,20 @@ void {driver}(int la, int lb, int lc, int ld, const ShellPairView& bra,
                           static_cast<{stream_type}>(stream)>>>(la, lb, lc, ld, bra, ket, out);
 }}
 
+template <typename R>
+void {omega_driver}(int la, int lb, int lc, int ld, const ShellPairView& bra,
+                    const ShellPairView& ket, double omega, double* out, void* stream) {{
+  const long long n = static_cast<long long>(bra.npair) * ket.npair;
+  if (n == 0) return;
+  const long long blocks = std::min((n + kBlockSize - 1) / kBlockSize, kMaxBlocks);
+  eri_general_omega_kernel<R><<<static_cast<unsigned>(blocks), kBlockSize, 0,
+                                static_cast<{stream_type}>(stream)>>>(la, lb, lc, ld, bra, ket,
+                                                                      omega, out);
+}}
+
 }}  // namespace
 
-{backend._general_wrappers(driver)}
+{backend._general_wrappers(driver, omega_driver)}
 }}  // namespace gpu4dft::generated
 """
 
@@ -390,6 +449,9 @@ def emit_launchers_header(classes: list[EriClass], backends: list[Backend]) -> s
             decls.append(
                 f"void {general_launcher_name(backend.name, prec)}({GENERAL_LAUNCHER_PARAMS});"
             )
+            decls.append(
+                f"void {general_omega_launcher_name(backend.name, prec)}({GENERAL_OMEGA_LAUNCHER_PARAMS});"
+            )
     body = "\n".join(decls)
     return f"""\
 {GENERATED_BANNER}#pragma once
@@ -410,6 +472,10 @@ bool eri_general_dispatch(int la, int lb, int lc, int ld, Backend backend, Preci
                           const ShellPairView& bra, const ShellPairView& ket, double* out,
                           void* stream);
 
+bool eri_general_omega_dispatch(int la, int lb, int lc, int ld, Backend backend,
+                                Precision precision, const ShellPairView& bra,
+                                const ShellPairView& ket, double omega, double* out, void* stream);
+
 }}  // namespace gpu4dft::generated
 """
 
@@ -428,6 +494,7 @@ def emit_registry(classes: list[EriClass], backends: list[Backend]) -> str:
     table = "\n".join(rows)
 
     dispatch_cases = []
+    omega_dispatch_cases = []
     for backend in backends:
         for prec in PRECISIONS:
             fn = general_launcher_name(backend.name, prec)
@@ -437,7 +504,15 @@ def emit_registry(classes: list[EriClass], backends: list[Backend]) -> str:
                 f"    return true;\n"
                 f"  }}"
             )
+            omega_fn = general_omega_launcher_name(backend.name, prec)
+            omega_dispatch_cases.append(
+                f"  if (backend == Backend::{backend.enum} && precision == Precision::{prec.enum}) {{\n"
+                f"    {omega_fn}(la, lb, lc, ld, bra, ket, omega, out, stream);\n"
+                f"    return true;\n"
+                f"  }}"
+            )
     dispatch_body = "\n".join(dispatch_cases)
+    omega_dispatch_body = "\n".join(omega_dispatch_cases)
 
     return f"""\
 {GENERATED_BANNER}
@@ -462,6 +537,14 @@ bool eri_general_dispatch(int la, int lb, int lc, int ld, Backend backend, Preci
                           void* stream) {{
 {dispatch_body}
   (void)la; (void)lb; (void)lc; (void)ld; (void)bra; (void)ket; (void)out; (void)stream;
+  return false;
+}}
+
+bool eri_general_omega_dispatch(int la, int lb, int lc, int ld, Backend backend,
+                                Precision precision, const ShellPairView& bra,
+                                const ShellPairView& ket, double omega, double* out, void* stream) {{
+{omega_dispatch_body}
+  (void)la; (void)lb; (void)lc; (void)ld; (void)bra; (void)ket; (void)omega; (void)out; (void)stream;
   return false;
 }}
 

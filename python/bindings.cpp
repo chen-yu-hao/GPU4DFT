@@ -5,6 +5,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/string_view.h>
+#include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
 #include <array>
@@ -17,6 +18,10 @@
 #include <vector>
 
 #include "gpu4dft/basis.hpp"
+#if defined(GPU4DFT_HAVE_CUDA)
+#include "gpu4dft/device_pool.hpp"
+#endif
+#include "gpu4dft/dftd3.hpp"
 #include "gpu4dft/eri.hpp"
 #include "gpu4dft/jk_engine.hpp"
 #include "gpu4dft/kernel_registry.hpp"
@@ -37,6 +42,7 @@ namespace {
 
 using ConstVec = nb::ndarray<const double, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using ConstMat = nb::ndarray<const double, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+using ConstAnyArray = nb::ndarray<const double, nb::c_contig, nb::device::cpu>;
 using ConstComplex4D =
     nb::ndarray<const std::complex<double>, nb::ndim<4>, nb::c_contig, nb::device::cpu>;
 using OutVec = nb::ndarray<nb::numpy, double, nb::ndim<1>>;
@@ -131,6 +137,24 @@ void check_square(const ConstMat& m, int nao, const char* name) {
   }
 }
 
+std::span<const double> extract_dm0_span(const std::optional<ConstAnyArray>& dm0, int nao,
+                                         bool unrestricted) {
+  if (!dm0.has_value()) return {};
+  const auto n = static_cast<std::size_t>(nao);
+  if (unrestricted) {
+    if (dm0->ndim() != 3 || dm0->shape(0) != 2 || dm0->shape(1) != n || dm0->shape(2) != n) {
+      throw std::invalid_argument("dm0 for unrestricted SCF must have shape (2, " +
+                                  std::to_string(nao) + ", " + std::to_string(nao) + ")");
+    }
+    return std::span<const double>(dm0->data(), 2 * n * n);
+  }
+  if (dm0->ndim() != 2 || dm0->shape(0) != n || dm0->shape(1) != n) {
+    throw std::invalid_argument("dm0 for restricted SCF must have shape (" + std::to_string(nao) +
+                                ", " + std::to_string(nao) + ")");
+  }
+  return std::span<const double>(dm0->data(), n * n);
+}
+
 std::vector<gpu4dft::XcAtom> atoms_to_xc(const std::vector<gpu4dft::Atom>& atoms) {
   std::vector<gpu4dft::XcAtom> out;
   out.reserve(atoms.size());
@@ -219,17 +243,35 @@ NB_MODULE(_core, m) {
 
   m.def("backend_available", &gpu4dft::backend_available, "backend"_a);
 
+#if defined(GPU4DFT_HAVE_CUDA)
+  m.def(
+      "trim_device_pool",
+      [](int device_id) {
+        nb::gil_scoped_release release;
+        gpu4dft::default_device_pool(device_id).trim();
+      },
+      "device_id"_a = -1,
+      "Release cached free blocks from the default CUDA device memory pool.");
+#else
+  m.def(
+      "trim_device_pool",
+      [](int /*device_id*/) {},
+      "device_id"_a = -1,
+      "No-op when built without CUDA.");
+#endif
+
   m.def(
       "eri_tensor",
-      [](const gpu4dft::Basis& basis, gpu4dft::Backend backend, gpu4dft::Precision precision) {
+      [](const gpu4dft::Basis& basis, gpu4dft::Backend backend, gpu4dft::Precision precision,
+         double omega) {
         std::vector<double> eri;
         {
           nb::gil_scoped_release release;
-          eri = gpu4dft::eri_tensor(basis, backend, precision);
+          eri = gpu4dft::eri_tensor(basis, backend, precision, omega);
         }
         return to_numpy_4d(std::move(eri), static_cast<std::size_t>(basis.nao()));
       },
-      "basis"_a, "backend"_a, "precision"_a,
+      "basis"_a, "backend"_a, "precision"_a, "omega"_a = 0.0,
       "Full (ij|kl) ERI tensor, shape (nao, nao, nao, nao). Validation only.");
 
   m.def(
@@ -323,12 +365,18 @@ NB_MODULE(_core, m) {
       .def(nb::init<>())
       .def_rw("backend", &gpu4dft::JKOptions::backend)
       .def_rw("precision", &gpu4dft::JKOptions::precision)
+      .def_rw("gemm_mode", &gpu4dft::JKOptions::gemm_mode)
+      .def_rw("ozaki_slices", &gpu4dft::JKOptions::ozaki_slices)
       .def_rw("schwarz_cutoff", &gpu4dft::JKOptions::schwarz_cutoff)
       .def_rw("fp32_threshold", &gpu4dft::JKOptions::fp32_threshold)
       .def_rw("compute_j", &gpu4dft::JKOptions::compute_j)
       .def_rw("compute_k", &gpu4dft::JKOptions::compute_k)
       .def_rw("k_scale", &gpu4dft::JKOptions::k_scale)
-      .def_rw("symmetrize_dm", &gpu4dft::JKOptions::symmetrize_dm);
+      .def_rw("symmetrize_dm", &gpu4dft::JKOptions::symmetrize_dm)
+      .def_rw("omega", &gpu4dft::JKOptions::omega)
+      .def_rw("rsh_mode", &gpu4dft::JKOptions::rsh_mode)
+      .def_rw("k_sr", &gpu4dft::JKOptions::k_sr)
+      .def_rw("k_lr", &gpu4dft::JKOptions::k_lr);
 
   nb::class_<gpu4dft::DirectJKEngine>(m, "DirectJKEngine")
       .def(
@@ -379,19 +427,44 @@ NB_MODULE(_core, m) {
             return std::make_pair(to_numpy_2d(std::move(vj), nu, nu),
                                   to_numpy_2d(std::move(vk), nu, nu));
           },
-          "dm_new"_a, "dm_old"_a, "vj_prev"_a, "vk_prev"_a, "opts"_a = gpu4dft::JKOptions{});
+          "dm_new"_a, "dm_old"_a, "vj_prev"_a, "vk_prev"_a, "opts"_a = gpu4dft::JKOptions{})
+      .def(
+          "compute_jk_uhf",
+          [](const gpu4dft::DirectJKEngine& self, ConstMat dm_alpha, ConstMat dm_beta,
+             const gpu4dft::JKOptions& opts) {
+            const int n = self.nao();
+            check_square(dm_alpha, n, "dm_alpha");
+            check_square(dm_beta, n, "dm_beta");
+            const double* da_ptr = dm_alpha.data();
+            const double* db_ptr = dm_beta.data();
+            const auto nu = static_cast<std::size_t>(n);
+            std::vector<double> vj(nu * nu, 0.0);
+            std::vector<double> vka(nu * nu, 0.0);
+            std::vector<double> vkb(nu * nu, 0.0);
+            {
+              nb::gil_scoped_release release;
+              self.compute_jk_uhf(da_ptr, db_ptr, opts.compute_j ? vj.data() : nullptr,
+                                  opts.compute_k ? vka.data() : nullptr,
+                                  opts.compute_k ? vkb.data() : nullptr, opts);
+            }
+            return std::make_tuple(to_numpy_2d(std::move(vj), nu, nu),
+                                   to_numpy_2d(std::move(vka), nu, nu),
+                                   to_numpy_2d(std::move(vkb), nu, nu));
+          },
+          "dm_alpha"_a, "dm_beta"_a, "opts"_a = gpu4dft::JKOptions{});
 
   nb::class_<gpu4dft::RIJKEngine>(m, "RIJKEngine")
       .def(
           "__init__",
           [](gpu4dft::RIJKEngine* self, const gpu4dft::Basis& basis,
-             const gpu4dft::Basis& aux_basis, gpu4dft::Backend backend) {
+             const gpu4dft::Basis& aux_basis, gpu4dft::Backend backend, double rsh_omega) {
             nb::gil_scoped_release release;
-            new (self) gpu4dft::RIJKEngine(basis, aux_basis, backend);
+            new (self) gpu4dft::RIJKEngine(basis, aux_basis, backend, rsh_omega);
           },
-          "basis"_a, "aux_basis"_a, "backend"_a = gpu4dft::Backend::Cuda)
+          "basis"_a, "aux_basis"_a, "backend"_a = gpu4dft::Backend::Cuda, "rsh_omega"_a = 0.0)
       .def_prop_ro("nao", &gpu4dft::RIJKEngine::nao)
       .def_prop_ro("naux", &gpu4dft::RIJKEngine::naux)
+      .def_prop_ro("rsh_omega", &gpu4dft::RIJKEngine::rsh_omega)
       .def(
           "compute_jk",
           [](const gpu4dft::RIJKEngine& self, ConstMat dm, const gpu4dft::JKOptions& opts) {
@@ -409,7 +482,127 @@ NB_MODULE(_core, m) {
             return std::make_pair(to_numpy_2d(std::move(vj), nu, nu),
                                   to_numpy_2d(std::move(vk), nu, nu));
           },
-          "dm"_a, "opts"_a = gpu4dft::JKOptions{});
+          "dm"_a, "opts"_a = gpu4dft::JKOptions{})
+      .def(
+          "compute_jk_mo",
+          [](const gpu4dft::RIJKEngine& self, ConstMat dm, const std::optional<ConstMat>& c_occ,
+             double occ_scale, const gpu4dft::JKOptions& opts) {
+            const int n = self.nao();
+            check_square(dm, n, "dm");
+            const double* c_ptr = nullptr;
+            int n_occ = -1;
+            if (c_occ.has_value()) {
+              if (c_occ->shape(0) != static_cast<std::size_t>(n)) {
+                throw std::invalid_argument("c_occ must have shape (nao, n_occ)");
+              }
+              n_occ = static_cast<int>(c_occ->shape(1));
+              c_ptr = (n_occ > 0) ? c_occ->data() : nullptr;
+            }
+            const double* dm_ptr = dm.data();
+            const auto nu = static_cast<std::size_t>(n);
+            std::vector<double> vj(nu * nu, 0.0);
+            std::vector<double> vk(nu * nu, 0.0);
+            {
+              nb::gil_scoped_release release;
+              self.compute_jk_mo(dm_ptr, c_ptr, n_occ, occ_scale,
+                                 opts.compute_j ? vj.data() : nullptr,
+                                 opts.compute_k ? vk.data() : nullptr, opts);
+            }
+            return std::make_pair(to_numpy_2d(std::move(vj), nu, nu),
+                                  to_numpy_2d(std::move(vk), nu, nu));
+          },
+          "dm"_a, "c_occ"_a = nb::none(), "occ_scale"_a = 2.0, "opts"_a = gpu4dft::JKOptions{})
+      .def(
+          "compute_jk_uks_mo",
+          [](const gpu4dft::RIJKEngine& self, ConstMat dm_alpha, ConstMat dm_beta,
+             const std::optional<ConstMat>& c_occ_alpha,
+             const std::optional<ConstMat>& c_occ_beta, const gpu4dft::JKOptions& opts) {
+            const int n = self.nao();
+            check_square(dm_alpha, n, "dm_alpha");
+            check_square(dm_beta, n, "dm_beta");
+            const double* ca_ptr = nullptr;
+            const double* cb_ptr = nullptr;
+            int na = -1, nb_occ = -1;
+            if (c_occ_alpha.has_value()) {
+              if (c_occ_alpha->shape(0) != static_cast<std::size_t>(n)) {
+                throw std::invalid_argument("c_occ_alpha must have shape (nao, n_alpha)");
+              }
+              na = static_cast<int>(c_occ_alpha->shape(1));
+              ca_ptr = (na > 0) ? c_occ_alpha->data() : nullptr;
+            }
+            if (c_occ_beta.has_value()) {
+              if (c_occ_beta->shape(0) != static_cast<std::size_t>(n)) {
+                throw std::invalid_argument("c_occ_beta must have shape (nao, n_beta)");
+              }
+              nb_occ = static_cast<int>(c_occ_beta->shape(1));
+              cb_ptr = (nb_occ > 0) ? c_occ_beta->data() : nullptr;
+            }
+            const double* da_ptr = dm_alpha.data();
+            const double* db_ptr = dm_beta.data();
+            const auto nu = static_cast<std::size_t>(n);
+            std::vector<double> vj(nu * nu, 0.0);
+            std::vector<double> vka(nu * nu, 0.0);
+            std::vector<double> vkb(nu * nu, 0.0);
+            {
+              nb::gil_scoped_release release;
+              self.compute_jk_uks_mo(da_ptr, db_ptr, ca_ptr, na, cb_ptr, nb_occ,
+                                     opts.compute_j ? vj.data() : nullptr,
+                                     opts.compute_k ? vka.data() : nullptr,
+                                     opts.compute_k ? vkb.data() : nullptr, opts);
+            }
+            return std::make_tuple(to_numpy_2d(std::move(vj), nu, nu),
+                                   to_numpy_2d(std::move(vka), nu, nu),
+                                   to_numpy_2d(std::move(vkb), nu, nu));
+          },
+          "dm_alpha"_a, "dm_beta"_a, "c_occ_alpha"_a = nb::none(), "c_occ_beta"_a = nb::none(),
+          "opts"_a = gpu4dft::JKOptions{})
+      .def(
+          "compute_ri_jk_grad",
+          [](const gpu4dft::RIJKEngine& self, const std::vector<gpu4dft::Atom>& atoms,
+             ConstMat dm_alpha, const std::optional<ConstMat>& c_occ_alpha,
+             const std::optional<ConstMat>& dm_beta, const std::optional<ConstMat>& c_occ_beta,
+             bool unrestricted, double j_fraction, double k_sr, double k_lr, double omega,
+             gpu4dft::Backend backend) {
+            const int n = self.nao();
+            check_square(dm_alpha, n, "dm_alpha");
+            if (unrestricted) {
+              if (!dm_beta.has_value()) {
+                throw std::invalid_argument("dm_beta is required when unrestricted=True");
+              }
+              check_square(*dm_beta, n, "dm_beta");
+            }
+            const double* ca_ptr = nullptr;
+            const double* cb_ptr = nullptr;
+            int na = -1, nb_occ = -1;
+            if (c_occ_alpha.has_value()) {
+              if (c_occ_alpha->shape(0) != static_cast<std::size_t>(n)) {
+                throw std::invalid_argument("c_occ_alpha must have shape (nao, n_alpha)");
+              }
+              na = static_cast<int>(c_occ_alpha->shape(1));
+              ca_ptr = (na > 0) ? c_occ_alpha->data() : nullptr;
+            }
+            if (c_occ_beta.has_value()) {
+              if (c_occ_beta->shape(0) != static_cast<std::size_t>(n)) {
+                throw std::invalid_argument("c_occ_beta must have shape (nao, n_beta)");
+              }
+              nb_occ = static_cast<int>(c_occ_beta->shape(1));
+              cb_ptr = (nb_occ > 0) ? c_occ_beta->data() : nullptr;
+            }
+            const double* da_ptr = dm_alpha.data();
+            const double* db_ptr = dm_beta.has_value() ? dm_beta->data() : nullptr;
+            std::vector<double> g;
+            {
+              nb::gil_scoped_release release;
+              g = self.compute_ri_jk_grad(atoms, da_ptr, ca_ptr, na, db_ptr, cb_ptr, nb_occ,
+                                          unrestricted, j_fraction, k_sr, k_lr, omega, backend);
+            }
+            return to_numpy_2d(std::move(g), atoms.size(), 3);
+          },
+          "atoms"_a, "dm_alpha"_a, "c_occ_alpha"_a = nb::none(), "dm_beta"_a = nb::none(),
+          "c_occ_beta"_a = nb::none(), "unrestricted"_a = false, "j_fraction"_a = 1.0,
+          "k_sr"_a = 1.0, "k_lr"_a = 1.0, "omega"_a = 0.0,
+          "backend"_a = gpu4dft::Backend::Cuda)
+      .def("release_workspaces", &gpu4dft::RIJKEngine::release_workspaces);
 
   m.def(
       "jk_nuclear_grad",
@@ -432,6 +625,82 @@ NB_MODULE(_core, m) {
       },
       "basis"_a, "dm"_a, "k_fraction"_a, "backend"_a = gpu4dft::Backend::Cuda,
       "schwarz_cutoff"_a = 1e-13, "atoms"_a = nb::none());
+
+  m.def(
+      "jk_nuclear_grad_uhf",
+      [](const gpu4dft::Basis& basis, ConstMat dm_alpha, ConstMat dm_beta, double k_fraction,
+         gpu4dft::Backend backend, double schwarz_cutoff,
+         const std::optional<std::vector<gpu4dft::Atom>>& atoms) {
+        check_square(dm_alpha, basis.nao(), "dm_alpha");
+        check_square(dm_beta, basis.nao(), "dm_beta");
+        const double* da_ptr = dm_alpha.data();
+        const double* db_ptr = dm_beta.data();
+        std::vector<double> g;
+        {
+          nb::gil_scoped_release release;
+          if (atoms.has_value()) {
+            g = gpu4dft::jk_nuclear_grad_uhf(basis, *atoms, da_ptr, db_ptr, k_fraction, backend,
+                                             schwarz_cutoff);
+          } else {
+            g = gpu4dft::jk_nuclear_grad_uhf(basis, da_ptr, db_ptr, k_fraction, backend,
+                                             schwarz_cutoff);
+          }
+        }
+        const std::size_t natom = g.size() / 3;
+        return to_numpy_2d(std::move(g), natom, 3);
+      },
+      "basis"_a, "dm_alpha"_a, "dm_beta"_a, "k_fraction"_a, "backend"_a = gpu4dft::Backend::Cuda,
+      "schwarz_cutoff"_a = 1e-13, "atoms"_a = nb::none());
+
+  m.def(
+      "jk_nuclear_grad_rsh",
+      [](const gpu4dft::Basis& basis, ConstMat dm, double k_sr, double k_lr, double omega,
+         gpu4dft::Backend backend, double schwarz_cutoff,
+         const std::optional<std::vector<gpu4dft::Atom>>& atoms) {
+        check_square(dm, basis.nao(), "dm");
+        const double* dm_ptr = dm.data();
+        std::vector<double> g;
+        {
+          nb::gil_scoped_release release;
+          if (atoms.has_value()) {
+            g = gpu4dft::jk_nuclear_grad_rsh(basis, *atoms, dm_ptr, k_sr, k_lr, omega, backend,
+                                             schwarz_cutoff);
+          } else {
+            g = gpu4dft::jk_nuclear_grad_rsh(basis, dm_ptr, k_sr, k_lr, omega, backend,
+                                             schwarz_cutoff);
+          }
+        }
+        const std::size_t natom = g.size() / 3;
+        return to_numpy_2d(std::move(g), natom, 3);
+      },
+      "basis"_a, "dm"_a, "k_sr"_a, "k_lr"_a, "omega"_a, "backend"_a = gpu4dft::Backend::Cuda,
+      "schwarz_cutoff"_a = 1e-13, "atoms"_a = nb::none());
+
+  m.def(
+      "jk_nuclear_grad_uhf_rsh",
+      [](const gpu4dft::Basis& basis, ConstMat dm_alpha, ConstMat dm_beta, double k_sr, double k_lr,
+         double omega, gpu4dft::Backend backend, double schwarz_cutoff,
+         const std::optional<std::vector<gpu4dft::Atom>>& atoms) {
+        check_square(dm_alpha, basis.nao(), "dm_alpha");
+        check_square(dm_beta, basis.nao(), "dm_beta");
+        const double* da_ptr = dm_alpha.data();
+        const double* db_ptr = dm_beta.data();
+        std::vector<double> g;
+        {
+          nb::gil_scoped_release release;
+          if (atoms.has_value()) {
+            g = gpu4dft::jk_nuclear_grad_uhf_rsh(basis, *atoms, da_ptr, db_ptr, k_sr, k_lr, omega,
+                                                 backend, schwarz_cutoff);
+          } else {
+            g = gpu4dft::jk_nuclear_grad_uhf_rsh(basis, da_ptr, db_ptr, k_sr, k_lr, omega,
+                                                 backend, schwarz_cutoff);
+          }
+        }
+        const std::size_t natom = g.size() / 3;
+        return to_numpy_2d(std::move(g), natom, 3);
+      },
+      "basis"_a, "dm_alpha"_a, "dm_beta"_a, "k_sr"_a, "k_lr"_a, "omega"_a,
+      "backend"_a = gpu4dft::Backend::Cuda, "schwarz_cutoff"_a = 1e-13, "atoms"_a = nb::none());
 
   // -------------------------------------------------------------------------
   // MolecularGrid, XcEngine & SemiNumericalK (`sn-K` / COSX)
@@ -488,6 +757,10 @@ NB_MODULE(_core, m) {
       .def_prop_ro("npoints", &gpu4dft::MolecularGrid::npoints)
       .def_prop_ro("nbatches", &gpu4dft::MolecularGrid::nbatches)
       .def_prop_ro("nao", &gpu4dft::MolecularGrid::nao)
+      .def_prop_ro("has_partition_info", &gpu4dft::MolecularGrid::has_partition_info)
+      .def_prop_ro("has_grid_response_data", &gpu4dft::MolecularGrid::has_grid_response_data)
+      .def_prop_ro("partition_scheme", &gpu4dft::MolecularGrid::partition_scheme)
+      .def_prop_ro("becke_radii_adjust", &gpu4dft::MolecularGrid::becke_radii_adjust)
       .def_prop_ro(
           "coords",
           [](const gpu4dft::MolecularGrid& self) {
@@ -501,7 +774,17 @@ NB_MODULE(_core, m) {
           },
           nb::rv_policy::move);
 
+  nb::class_<gpu4dft::RshCoefficients>(m, "RshCoefficients")
+      .def(nb::init<>())
+      .def_ro("omega", &gpu4dft::RshCoefficients::omega)
+      .def_ro("alpha", &gpu4dft::RshCoefficients::alpha)
+      .def_ro("beta", &gpu4dft::RshCoefficients::beta)
+      .def_prop_ro("c_lr", &gpu4dft::RshCoefficients::c_lr)
+      .def_prop_ro("c_sr", &gpu4dft::RshCoefficients::c_sr)
+      .def_prop_ro("is_rsh", &gpu4dft::RshCoefficients::is_rsh);
+
   m.def("xc_exact_exchange_fraction", &gpu4dft::xc_exact_exchange_fraction, "xc_name"_a);
+  m.def("xc_rsh_coefficients", &gpu4dft::xc_rsh_coefficients, "xc_name"_a);
 
   m.def(
       "eval_ao_grid",
@@ -532,7 +815,10 @@ NB_MODULE(_core, m) {
       .def_rw("precision", &gpu4dft::XcOptions::precision)
       .def_rw("rho_cutoff", &gpu4dft::XcOptions::rho_cutoff)
       .def_rw("cache_ao_on_device", &gpu4dft::XcOptions::cache_ao_on_device)
-      .def_rw("max_ao_cache_mb", &gpu4dft::XcOptions::max_ao_cache_mb);
+      .def_rw("max_ao_cache_mb", &gpu4dft::XcOptions::max_ao_cache_mb)
+      .def_rw("spin_polarized", &gpu4dft::XcOptions::spin_polarized)
+      .def_rw("use_libxc", &gpu4dft::XcOptions::use_libxc)
+      .def_rw("grid_response", &gpu4dft::XcOptions::grid_response);
 
   nb::class_<gpu4dft::XcResult>(m, "XcResult")
       .def_ro("exc", &gpu4dft::XcResult::exc)
@@ -542,6 +828,27 @@ NB_MODULE(_core, m) {
           [](const gpu4dft::XcResult& self) {
             const auto n = static_cast<std::size_t>(std::sqrt(static_cast<double>(self.vxc.size())));
             return to_numpy_2d(self.vxc, n, n);
+          },
+          nb::rv_policy::move);
+
+  nb::class_<gpu4dft::XcUksResult>(m, "XcUksResult")
+      .def_ro("exc", &gpu4dft::XcUksResult::exc)
+      .def_ro("nelec_alpha", &gpu4dft::XcUksResult::nelec_alpha)
+      .def_ro("nelec_beta", &gpu4dft::XcUksResult::nelec_beta)
+      .def_prop_ro(
+          "vxc_alpha",
+          [](const gpu4dft::XcUksResult& self) {
+            const auto n =
+                static_cast<std::size_t>(std::sqrt(static_cast<double>(self.vxc_alpha.size())));
+            return to_numpy_2d(self.vxc_alpha, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "vxc_beta",
+          [](const gpu4dft::XcUksResult& self) {
+            const auto n =
+                static_cast<std::size_t>(std::sqrt(static_cast<double>(self.vxc_beta.size())));
+            return to_numpy_2d(self.vxc_beta, n, n);
           },
           nb::rv_policy::move);
 
@@ -558,6 +865,10 @@ NB_MODULE(_core, m) {
       .def_prop_ro("nao", &gpu4dft::XcEngine::nao)
       .def_prop_ro("xc_name", &gpu4dft::XcEngine::xc_name)
       .def_prop_ro("exact_exchange_fraction", &gpu4dft::XcEngine::exact_exchange_fraction)
+      .def_prop_ro("rsh_coefficients", &gpu4dft::XcEngine::rsh_coefficients)
+      .def_prop_ro("is_range_separated", &gpu4dft::XcEngine::is_range_separated)
+      .def_prop_ro("grid_response", &gpu4dft::XcEngine::grid_response)
+      .def("set_grid_response", &gpu4dft::XcEngine::set_grid_response, "enabled"_a)
       .def_prop_ro("active_backend", &gpu4dft::XcEngine::active_backend)
       .def(
           "eval_vxc",
@@ -570,6 +881,20 @@ NB_MODULE(_core, m) {
             return self.eval_vxc(std::span<const double>(dm_ptr, n2));
           },
           "dm"_a)
+      .def(
+          "eval_vxc_uks",
+          [](const gpu4dft::XcEngine& self, ConstMat dm_alpha, ConstMat dm_beta) {
+            const int n = self.nao();
+            check_square(dm_alpha, n, "dm_alpha");
+            check_square(dm_beta, n, "dm_beta");
+            const double* da_ptr = dm_alpha.data();
+            const double* db_ptr = dm_beta.data();
+            const std::size_t n2 = static_cast<std::size_t>(n) * n;
+            nb::gil_scoped_release release;
+            return self.eval_vxc_uks(std::span<const double>(da_ptr, n2),
+                                     std::span<const double>(db_ptr, n2));
+          },
+          "dm_alpha"_a, "dm_beta"_a)
       .def_prop_ro("has_reference_density", &gpu4dft::XcEngine::has_reference_density)
       .def(
           "set_reference_density",
@@ -613,7 +938,77 @@ NB_MODULE(_core, m) {
             }
             return to_numpy_2d(std::move(g), atoms.size(), 3);
           },
-          "atoms"_a, "dm"_a);
+          "atoms"_a, "dm"_a)
+      .def(
+          "nuclear_grad_uks",
+          [](const gpu4dft::XcEngine& self, const std::vector<gpu4dft::Atom>& atoms,
+             ConstMat dm_alpha, ConstMat dm_beta) {
+            const int n = self.nao();
+            check_square(dm_alpha, n, "dm_alpha");
+            check_square(dm_beta, n, "dm_beta");
+            const auto xc_at = atoms_to_xc(atoms);
+            const double* da_ptr = dm_alpha.data();
+            const double* db_ptr = dm_beta.data();
+            const std::size_t n2 = static_cast<std::size_t>(n) * n;
+            std::vector<double> g;
+            {
+              nb::gil_scoped_release release;
+              g = self.nuclear_grad_uks(xc_at, std::span<const double>(da_ptr, n2),
+                                        std::span<const double>(db_ptr, n2));
+            }
+            return to_numpy_2d(std::move(g), atoms.size(), 3);
+          },
+          "atoms"_a, "dm_alpha"_a, "dm_beta"_a);
+
+  // -------------------------------------------------------------------------
+  // DFT-D3(BJ) Dispersion
+  // -------------------------------------------------------------------------
+  nb::class_<gpu4dft::dftd3::D3BJParams>(m, "D3BJParams")
+      .def(nb::init<>())
+      .def_rw("s6", &gpu4dft::dftd3::D3BJParams::s6)
+      .def_rw("a1", &gpu4dft::dftd3::D3BJParams::a1)
+      .def_rw("s8", &gpu4dft::dftd3::D3BJParams::s8)
+      .def_rw("a2", &gpu4dft::dftd3::D3BJParams::a2);
+
+  nb::class_<gpu4dft::dftd3::D3BJResult>(m, "D3BJResult")
+      .def_ro("energy", &gpu4dft::dftd3::D3BJResult::energy)
+      .def_prop_ro(
+          "gradient",
+          [](const gpu4dft::dftd3::D3BJResult& self) {
+            const std::size_t natom = self.gradient.size() / 3;
+            return to_numpy_2d(self.gradient, natom, 3);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "cn",
+          [](const gpu4dft::dftd3::D3BJResult& self) {
+            return to_numpy_1d(self.cn, self.cn.size());
+          },
+          nb::rv_policy::move);
+
+  m.def(
+      "dftd3_params",
+      [](const std::string& functional) { return gpu4dft::dftd3::get_d3bj_params(functional); },
+      "functional"_a);
+  m.def(
+      "has_d3bj_params",
+      [](const std::string& functional) { return gpu4dft::dftd3::has_d3bj_params(functional); },
+      "functional"_a);
+  m.def("supported_dftd3_functionals", &gpu4dft::dftd3::supported_d3bj_functionals);
+  m.def(
+      "compute_d3bj",
+      [](const std::vector<int>& atomic_numbers, ConstMat coords_bohr,
+         const std::string& functional, bool compute_grad) {
+        if (coords_bohr.shape(1) != 3 || coords_bohr.shape(0) != atomic_numbers.size()) {
+          throw std::invalid_argument(
+              "compute_d3bj: coords_bohr must have shape (len(atomic_numbers), 3)");
+        }
+        std::vector<double> coords(coords_bohr.data(),
+                                   coords_bohr.data() + atomic_numbers.size() * 3);
+        nb::gil_scoped_release release;
+        return gpu4dft::dftd3::compute_d3bj(atomic_numbers, coords, functional, compute_grad);
+      },
+      "atomic_numbers"_a, "coords_bohr"_a, "functional"_a, "compute_grad"_a = true);
 
   nb::class_<gpu4dft::SnkOptions>(m, "SnkOptions")
       .def(nb::init<>())
@@ -746,7 +1141,9 @@ NB_MODULE(_core, m) {
       .def_rw("use_cuda_graphs", &gpu4dft::ScfOptions::use_cuda_graphs)
       .def_rw("exact_exchange_fraction", &gpu4dft::ScfOptions::exact_exchange_fraction)
       .def_rw("ozaki_slices", &gpu4dft::ScfOptions::ozaki_slices)
-      .def_rw("sp2_options", &gpu4dft::ScfOptions::sp2_options);
+      .def_rw("sp2_options", &gpu4dft::ScfOptions::sp2_options)
+      .def_rw("unrestricted", &gpu4dft::ScfOptions::unrestricted)
+      .def_rw("spin", &gpu4dft::ScfOptions::spin);
 
   nb::class_<gpu4dft::ScfIterationLog>(m, "ScfIterationLog")
       .def_ro("iteration", &gpu4dft::ScfIterationLog::iteration)
@@ -767,18 +1164,40 @@ NB_MODULE(_core, m) {
       .def_ro("one_electron_energy", &gpu4dft::ScfResult::one_electron_energy)
       .def_ro("two_electron_energy", &gpu4dft::ScfResult::two_electron_energy)
       .def_ro("xc_energy", &gpu4dft::ScfResult::xc_energy)
+      .def_ro("dispersion_energy", &gpu4dft::ScfResult::dispersion_energy)
       .def_ro("nuclear_repulsion", &gpu4dft::ScfResult::nuclear_repulsion)
       .def_ro("final_diis_rms", &gpu4dft::ScfResult::final_diis_rms)
       .def_ro("cuda_graph_captures", &gpu4dft::ScfResult::cuda_graph_captures)
       .def_ro("cuda_graph_replays", &gpu4dft::ScfResult::cuda_graph_replays)
       .def_ro("pool_cache_hits", &gpu4dft::ScfResult::pool_cache_hits)
       .def_ro("steady_state_allocations", &gpu4dft::ScfResult::steady_state_allocations)
+      .def_ro("unrestricted", &gpu4dft::ScfResult::unrestricted)
+      .def_ro("n_alpha", &gpu4dft::ScfResult::n_alpha)
+      .def_ro("n_beta", &gpu4dft::ScfResult::n_beta)
+      .def_ro("s2", &gpu4dft::ScfResult::s2)
+      .def_ro("multiplicity", &gpu4dft::ScfResult::multiplicity)
       .def_ro("history", &gpu4dft::ScfResult::history)
       .def_prop_ro(
           "density_matrix",
           [](const gpu4dft::ScfResult& self) {
             const auto n = static_cast<std::size_t>(self.nao);
             return to_numpy_2d(self.density_matrix, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "density_matrix_alpha",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.density_alpha.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.density_alpha, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "density_matrix_beta",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.density_beta.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.density_beta, n, n);
           },
           nb::rv_policy::move)
       .def_prop_ro(
@@ -789,6 +1208,22 @@ NB_MODULE(_core, m) {
           },
           nb::rv_policy::move)
       .def_prop_ro(
+          "energy_weighted_dm_alpha",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.energy_weighted_dm_alpha.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.energy_weighted_dm_alpha, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "energy_weighted_dm_beta",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.energy_weighted_dm_beta.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.energy_weighted_dm_beta, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
           "fock_matrix",
           [](const gpu4dft::ScfResult& self) {
             const auto n = static_cast<std::size_t>(self.nao);
@@ -796,9 +1231,31 @@ NB_MODULE(_core, m) {
           },
           nb::rv_policy::move)
       .def_prop_ro(
+          "fock_matrix_alpha",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.fock_alpha.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.fock_alpha, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "fock_matrix_beta",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.fock_beta.empty()) return to_numpy_2d({}, 0, 0);
+            const auto n = static_cast<std::size_t>(self.nao);
+            return to_numpy_2d(self.fock_beta, n, n);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
           "mo_energies",
           [](const gpu4dft::ScfResult& self) {
             return to_numpy_1d(self.mo_energies, self.mo_energies.size());
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "mo_energies_beta",
+          [](const gpu4dft::ScfResult& self) {
+            return to_numpy_1d(self.mo_energies_beta, self.mo_energies_beta.size());
           },
           nb::rv_policy::move)
       .def_prop_ro(
@@ -810,13 +1267,38 @@ NB_MODULE(_core, m) {
             return to_numpy_2d(self.mo_coefficients, static_cast<std::size_t>(self.nao),
                                static_cast<std::size_t>(self.nmo));
           },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "mo_coefficients_beta",
+          [](const gpu4dft::ScfResult& self) {
+            if (self.mo_coefficients_beta.empty()) {
+              return to_numpy_2d({}, 0, 0);
+            }
+            return to_numpy_2d(self.mo_coefficients_beta, static_cast<std::size_t>(self.nao),
+                               static_cast<std::size_t>(self.nmo));
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "mo_occ_alpha",
+          [](const gpu4dft::ScfResult& self) {
+            return to_numpy_1d(self.mo_occ_alpha, self.mo_occ_alpha.size());
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "mo_occ_beta",
+          [](const gpu4dft::ScfResult& self) {
+            return to_numpy_1d(self.mo_occ_beta, self.mo_occ_beta.size());
+          },
           nb::rv_policy::move);
 
   nb::class_<gpu4dft::WorkflowOptions>(m, "WorkflowOptions")
       .def(nb::init<>())
       .def_rw("xc", &gpu4dft::WorkflowOptions::xc)
+      .def_rw("dispersion", &gpu4dft::WorkflowOptions::dispersion)
       .def_rw("jk_mode", &gpu4dft::WorkflowOptions::jk_mode)
       .def_rw("scf", &gpu4dft::WorkflowOptions::scf)
+      .def_rw("unrestricted", &gpu4dft::WorkflowOptions::unrestricted)
+      .def_rw("spin", &gpu4dft::WorkflowOptions::spin)
       .def_rw("schwarz_cutoff", &gpu4dft::WorkflowOptions::schwarz_cutoff)
       .def_rw("fp32_threshold", &gpu4dft::WorkflowOptions::fp32_threshold)
       .def_rw("prim_cutoff", &gpu4dft::WorkflowOptions::prim_cutoff)
@@ -834,6 +1316,7 @@ NB_MODULE(_core, m) {
       .def_ro("grid_npoints", &gpu4dft::WorkflowResult::grid_npoints)
       .def_ro("grid_nbatches", &gpu4dft::WorkflowResult::grid_nbatches)
       .def_ro("active_ao_ratio", &gpu4dft::WorkflowResult::active_ao_ratio)
+      .def_ro("dispersion_energy", &gpu4dft::WorkflowResult::dispersion_energy)
       .def_prop_ro(
           "overlap_matrix",
           [](const gpu4dft::WorkflowResult& self) {
@@ -855,6 +1338,7 @@ NB_MODULE(_core, m) {
       .def_ro("one_electron_time_s", &gpu4dft::GradientResult::one_electron_time_s)
       .def_ro("two_electron_time_s", &gpu4dft::GradientResult::two_electron_time_s)
       .def_ro("xc_time_s", &gpu4dft::GradientResult::xc_time_s)
+      .def_ro("dispersion_time_s", &gpu4dft::GradientResult::dispersion_time_s)
       .def_prop_ro(
           "total_grad",
           [](const gpu4dft::GradientResult& self) {
@@ -884,6 +1368,12 @@ NB_MODULE(_core, m) {
           "xc_grad",
           [](const gpu4dft::GradientResult& self) {
             return to_numpy_2d(self.xc_grad, static_cast<std::size_t>(self.natom), 3);
+          },
+          nb::rv_policy::move)
+      .def_prop_ro(
+          "dispersion_grad",
+          [](const gpu4dft::GradientResult& self) {
+            return to_numpy_2d(self.dispersion_grad, static_cast<std::size_t>(self.natom), 3);
           },
           nb::rv_policy::move);
 
@@ -1194,6 +1684,8 @@ NB_MODULE(_core, m) {
       .def_prop_ro("n_elec", &gpu4dft::MolecularScf::n_elec)
       .def_prop_ro("is_dft", &gpu4dft::MolecularScf::is_dft)
       .def_prop_ro("exact_exchange_fraction", &gpu4dft::MolecularScf::exact_exchange_fraction)
+      .def_prop_ro("rsh_coefficients", &gpu4dft::MolecularScf::rsh_coefficients)
+      .def("set_xc_grid_response", &gpu4dft::MolecularScf::set_xc_grid_response, "enabled"_a)
       .def(
           "setup",
           [](gpu4dft::MolecularScf& self) {
@@ -1202,13 +1694,9 @@ NB_MODULE(_core, m) {
           })
       .def(
           "run",
-          [](gpu4dft::MolecularScf& self, std::optional<ConstMat> dm0) {
-            std::span<const double> dm_span;
-            if (dm0.has_value()) {
-              check_square(*dm0, self.nao(), "dm0");
-              dm_span = std::span<const double>(
-                  dm0->data(), static_cast<std::size_t>(self.nao()) * self.nao());
-            }
+          [](gpu4dft::MolecularScf& self, std::optional<ConstAnyArray> dm0) {
+            const std::span<const double> dm_span =
+                extract_dm0_span(dm0, self.nao(), self.options().unrestricted);
             nb::gil_scoped_release release;
             return self.run(dm_span);
           },
@@ -1287,15 +1775,12 @@ NB_MODULE(_core, m) {
   m.def(
       "run_scf",
       [](const gpu4dft::Basis& basis, const std::vector<gpu4dft::Atom>& atoms, int n_elec,
-         const gpu4dft::WorkflowOptions& opts, std::optional<ConstMat> dm0,
+         const gpu4dft::WorkflowOptions& opts, std::optional<ConstAnyArray> dm0,
          std::optional<gpu4dft::Basis> aux_basis, std::optional<ConstMat> grid_coords,
          std::optional<ConstVec> grid_weights) {
-        std::span<const double> dm_span;
-        if (dm0.has_value()) {
-          check_square(*dm0, basis.nao(), "dm0");
-          dm_span =
-              std::span<const double>(dm0->data(), static_cast<std::size_t>(basis.nao()) * basis.nao());
-        }
+        const bool is_unrestricted = opts.unrestricted || opts.scf.unrestricted;
+        const std::span<const double> dm_span =
+            extract_dm0_span(dm0, basis.nao(), is_unrestricted);
         std::span<const double> c_span;
         std::span<const double> w_span;
         if (grid_coords.has_value() || grid_weights.has_value()) {
@@ -1323,7 +1808,8 @@ NB_MODULE(_core, m) {
       "run_grad",
       [](const gpu4dft::Basis& basis, const std::vector<gpu4dft::Atom>& atoms,
          const gpu4dft::ScfResult& scf_res, const gpu4dft::WorkflowOptions& opts,
-         std::optional<ConstMat> grid_coords, std::optional<ConstVec> grid_weights) {
+         std::optional<ConstMat> grid_coords, std::optional<ConstVec> grid_weights,
+         std::optional<gpu4dft::Basis> aux_basis) {
         std::span<const double> c_span;
         std::span<const double> w_span;
         if (grid_coords.has_value() || grid_weights.has_value()) {
@@ -1339,11 +1825,13 @@ NB_MODULE(_core, m) {
           c_span = std::span<const double>(grid_coords->data(), npts * 3);
           w_span = std::span<const double>(grid_weights->data(), npts);
         }
+        const gpu4dft::Basis* aux_ptr = aux_basis.has_value() ? &(*aux_basis) : nullptr;
         nb::gil_scoped_release release;
-        return gpu4dft::run_grad(basis, atoms, scf_res, opts, c_span, w_span);
+        return gpu4dft::run_grad(basis, atoms, scf_res, opts, c_span, w_span, aux_ptr);
       },
       "basis"_a, "atoms"_a, "scf_res"_a, "opts"_a = gpu4dft::WorkflowOptions{},
-      "grid_coords"_a = nb::none(), "grid_weights"_a = nb::none());
+      "grid_coords"_a = nb::none(), "grid_weights"_a = nb::none(),
+      "aux_basis"_a = nb::none());
 
   // -------------------------------------------------------------------------
   // Plane-Wave Kohn-Sham & Hybrid ACE DFT Submodule (`gpu4dft._core.pw`)

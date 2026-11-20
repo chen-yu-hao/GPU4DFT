@@ -217,6 +217,25 @@ inline double step_becke(double nu) {
   return 0.5 * (1.0 - f);
 }
 
+inline void step_becke_val_deriv(double nu, double& s_val, double& s_deriv) {
+  if (nu <= -1.0) {
+    s_val = 1.0;
+    s_deriv = 0.0;
+    return;
+  }
+  if (nu >= 1.0) {
+    s_val = 0.0;
+    s_deriv = 0.0;
+    return;
+  }
+  const double f0 = nu;
+  const double f1 = 0.5 * f0 * (3.0 - f0 * f0);
+  const double f2 = 0.5 * f1 * (3.0 - f1 * f1);
+  const double f3 = 0.5 * f2 * (3.0 - f2 * f2);
+  s_val = 0.5 * (1.0 - f3);
+  s_deriv = -(27.0 / 16.0) * (1.0 - f0 * f0) * (1.0 - f1 * f1) * (1.0 - f2 * f2);
+}
+
 inline double step_ssf(double nu) {
   constexpr double kA = 0.64;
   if (nu <= -kA) return 1.0;
@@ -225,6 +244,26 @@ inline double step_ssf(double nu) {
   const double z2 = z * z;
   const double g = (1.0 / 16.0) * z * (35.0 + z2 * (-35.0 + z2 * (21.0 - 5.0 * z2)));
   return 0.5 * (1.0 - g);
+}
+
+inline void step_ssf_val_deriv(double nu, double& s_val, double& s_deriv) {
+  constexpr double kA = 0.64;
+  if (nu <= -kA) {
+    s_val = 1.0;
+    s_deriv = 0.0;
+    return;
+  }
+  if (nu >= kA) {
+    s_val = 0.0;
+    s_deriv = 0.0;
+    return;
+  }
+  const double z = nu / kA;
+  const double z2 = z * z;
+  const double g = (1.0 / 16.0) * z * (35.0 + z2 * (-35.0 + z2 * (21.0 - 5.0 * z2)));
+  s_val = 0.5 * (1.0 - g);
+  const double one_m_z2 = 1.0 - z2;
+  s_deriv = -(35.0 / (32.0 * kA)) * one_m_z2 * one_m_z2 * one_m_z2;
 }
 
 void compute_partition_weights_host(const std::vector<double>& raw_coords,
@@ -487,7 +526,9 @@ std::vector<double> MolecularGrid::compute_shell_radii(const Basis& basis, doubl
 
 MolecularGrid::MolecularGrid(std::span<const XcAtom> atoms, const Basis& basis,
                              const GridOptions& opts)
-    : nao_(basis.nao()) {
+    : partition_scheme_(opts.partition),
+      becke_radii_adjust_(opts.becke_radii_adjust),
+      nao_(basis.nao()) {
   if (atoms.empty()) {
     throw std::invalid_argument("MolecularGrid requires at least one atom");
   }
@@ -590,29 +631,40 @@ MolecularGrid::MolecularGrid(std::span<const XcAtom> atoms, const Basis& basis,
   // Prune zero / negligible weight points
   std::vector<double> kept_coords;
   std::vector<double> kept_weights;
+  std::vector<int> kept_parent_atom;
   kept_coords.reserve(raw_coords.size());
   kept_weights.reserve(raw_weights.size());
+  kept_parent_atom.reserve(parent_atom.size());
   for (std::size_t i = 0; i < raw_weights.size(); ++i) {
     if (std::abs(raw_weights[i]) >= opts.weight_cutoff) {
       kept_coords.push_back(raw_coords[3 * i + 0]);
       kept_coords.push_back(raw_coords[3 * i + 1]);
       kept_coords.push_back(raw_coords[3 * i + 2]);
       kept_weights.push_back(raw_weights[i]);
+      kept_parent_atom.push_back(parent_atom[i]);
     }
   }
 
   finalize_spatial_batches(std::move(kept_coords), std::move(kept_weights),
-                           basis, opts.max_batch_points, opts.ao_cutoff);
+                           basis, opts.max_batch_points, opts.ao_cutoff,
+                           std::move(kept_parent_atom));
 }
 
 MolecularGrid MolecularGrid::from_points(std::span<const double> coords_xyz,
                                          std::span<const double> weights,
                                          const Basis& basis,
                                          int max_batch_points,
-                                         double ao_cutoff) {
+                                         double ao_cutoff,
+                                         std::span<const int> parent_atom,
+                                         PartitionScheme partition,
+                                         bool becke_radii_adjust) {
   if (coords_xyz.size() != weights.size() * 3) {
     throw std::invalid_argument(
         "MolecularGrid::from_points: coords_xyz.size() must equal 3 * weights.size()");
+  }
+  if (!parent_atom.empty() && parent_atom.size() != weights.size()) {
+    throw std::invalid_argument(
+        "MolecularGrid::from_points: parent_atom.size() must be empty or equal weights.size()");
   }
   if (max_batch_points <= 0) {
     throw std::invalid_argument("MolecularGrid::from_points: max_batch_points must be positive");
@@ -620,10 +672,13 @@ MolecularGrid MolecularGrid::from_points(std::span<const double> coords_xyz,
 
   MolecularGrid grid;
   grid.nao_ = basis.nao();
+  grid.partition_scheme_ = partition;
+  grid.becke_radii_adjust_ = becke_radii_adjust;
   std::vector<double> raw_c(coords_xyz.begin(), coords_xyz.end());
   std::vector<double> raw_w(weights.begin(), weights.end());
+  std::vector<int> raw_p(parent_atom.begin(), parent_atom.end());
   grid.finalize_spatial_batches(std::move(raw_c), std::move(raw_w), basis,
-                                max_batch_points, ao_cutoff);
+                                max_batch_points, ao_cutoff, std::move(raw_p));
   return grid;
 }
 
@@ -631,10 +686,17 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
                                              std::vector<double> raw_weights,
                                              const Basis& basis,
                                              int max_batch_points,
-                                             double ao_cutoff) {
+                                             double ao_cutoff,
+                                             std::vector<int> raw_parent_atom) {
   const std::size_t npts = raw_weights.size();
   coords_.resize(npts * 3);
   weights_.resize(npts);
+  const bool keep_parent = !raw_parent_atom.empty() && raw_parent_atom.size() == npts;
+  if (keep_parent) {
+    parent_atom_.resize(npts);
+  } else {
+    parent_atom_.clear();
+  }
   batches_.clear();
   if (npts == 0) return;
 
@@ -654,6 +716,9 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
     coords_[3 * new_i + 1] = raw_coords[3 * old_i + 1];
     coords_[3 * new_i + 2] = raw_coords[3 * old_i + 2];
     weights_[new_i] = raw_weights[old_i];
+    if (keep_parent) {
+      parent_atom_[new_i] = raw_parent_atom[old_i];
+    }
   }
 
   const std::vector<double> shell_radii = compute_shell_radii(basis, ao_cutoff);
@@ -784,5 +849,178 @@ void MolecularGrid::finalize_spatial_batches(std::vector<double> raw_coords,
   rebuild_aos(cur);
   batches_.push_back(std::move(cur));
 }
+
+namespace detail {
+
+void compute_partition_weight_grad_host(const MolecularGrid& grid,
+                                        std::span<const XcAtom> atoms,
+                                        std::span<const double> e_xc_point,
+                                        std::vector<double>& grad_io) {
+  const std::size_t npts = grid.npoints();
+  const int natom = static_cast<int>(atoms.size());
+  if (natom <= 1 || npts == 0 || !grid.has_grid_response_data()) return;
+  if (e_xc_point.size() != npts) {
+    throw std::invalid_argument(
+        "compute_partition_weight_grad_host: e_xc_point size mismatch");
+  }
+  if (grad_io.size() != static_cast<std::size_t>(natom) * 3) {
+    throw std::invalid_argument(
+        "compute_partition_weight_grad_host: grad_io size mismatch");
+  }
+
+  const auto& coords = grid.coords();
+  const auto& weights = grid.weights();
+  const auto& parent_atom = grid.parent_atoms();
+  const PartitionScheme scheme = grid.partition_scheme();
+  const bool radii_adjust = grid.becke_radii_adjust();
+
+  std::vector<double> atom_coords(static_cast<std::size_t>(natom) * 3);
+  std::vector<double> bragg_radii(static_cast<std::size_t>(natom));
+  for (int i = 0; i < natom; ++i) {
+    atom_coords[3 * i + 0] = atoms[static_cast<std::size_t>(i)].center[0];
+    atom_coords[3 * i + 1] = atoms[static_cast<std::size_t>(i)].center[1];
+    atom_coords[3 * i + 2] = atoms[static_cast<std::size_t>(i)].center[2];
+    bragg_radii[static_cast<std::size_t>(i)] =
+        bragg_slater_radius(atoms[static_cast<std::size_t>(i)].atomic_number);
+  }
+
+  std::vector<double> inv_rij(static_cast<std::size_t>(natom * natom), 0.0);
+  std::vector<double> a_ij(static_cast<std::size_t>(natom * natom), 0.0);
+  for (int i = 0; i < natom; ++i) {
+    for (int j = 0; j < natom; ++j) {
+      if (i == j) continue;
+      const double dx = atom_coords[3 * i + 0] - atom_coords[3 * j + 0];
+      const double dy = atom_coords[3 * i + 1] - atom_coords[3 * j + 1];
+      const double dz = atom_coords[3 * i + 2] - atom_coords[3 * j + 2];
+      const double d = std::sqrt(dx * dx + dy * dy + dz * dz);
+      inv_rij[i * natom + j] = (d > 1e-12) ? (1.0 / d) : 0.0;
+      if (radii_adjust) {
+        const double chi = bragg_radii[i] / bragg_radii[j];
+        const double u = (chi - 1.0) / (chi + 1.0);
+        const double a = u / (u * u - 1.0);
+        a_ij[i * natom + j] = std::clamp(a, -0.5, 0.5);
+      }
+    }
+  }
+
+#if defined(_OPENMP)
+#pragma omp parallel
+#endif
+  {
+    std::vector<double> dist(static_cast<std::size_t>(natom));
+    std::vector<double> ux(static_cast<std::size_t>(natom));
+    std::vector<double> uy(static_cast<std::size_t>(natom));
+    std::vector<double> uz(static_cast<std::size_t>(natom));
+    std::vector<double> cell_p(static_cast<std::size_t>(natom));
+    std::vector<double> local_grad(static_cast<std::size_t>(natom) * 3, 0.0);
+
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+    for (std::ptrdiff_t ig = 0; ig < static_cast<std::ptrdiff_t>(npts); ++ig) {
+      const std::size_t ug = static_cast<std::size_t>(ig);
+      const double e_g = e_xc_point[ug];
+      const double wg = weights[ug];
+      if (e_g == 0.0 || wg == 0.0) continue;
+      const int B = parent_atom[ug];
+      if (B < 0 || B >= natom) continue;
+
+      const double gx = coords[3 * ug + 0];
+      const double gy = coords[3 * ug + 1];
+      const double gz = coords[3 * ug + 2];
+
+      for (int b = 0; b < natom; ++b) {
+        const double dx = gx - atom_coords[3 * b + 0];
+        const double dy = gy - atom_coords[3 * b + 1];
+        const double dz = gz - atom_coords[3 * b + 2];
+        const double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+        dist[b] = r;
+        if (r > 1e-14) {
+          const double inv_r = 1.0 / r;
+          ux[b] = dx * inv_r;
+          uy[b] = dy * inv_r;
+          uz[b] = dz * inv_r;
+        } else {
+          ux[b] = 0.0;
+          uy[b] = 0.0;
+          uz[b] = 0.0;
+        }
+      }
+
+      double sum_p = 0.0;
+      for (int b = 0; b < natom; ++b) {
+        double pb = 1.0;
+        for (int c = 0; c < natom; ++c) {
+          if (b == c) continue;
+          const double mu = (dist[b] - dist[c]) * inv_rij[b * natom + c];
+          const double nu = mu + a_ij[b * natom + c] * (1.0 - mu * mu);
+          const double s = (scheme == PartitionScheme::Stratmann) ? step_ssf(nu) : step_becke(nu);
+          pb *= s;
+          if (pb == 0.0) break;
+        }
+        cell_p[b] = pb;
+        sum_p += pb;
+      }
+
+      if (sum_p <= 0.0 || cell_p[B] <= 0.0) continue;
+      const double W_B = cell_p[B] / sum_p;
+      const double pref_base = (wg / cell_p[B]) * e_g;
+
+      for (int b = 0; b < natom; ++b) {
+        if (cell_p[b] <= 0.0) continue;
+        const double delta_bB = (b == B) ? 1.0 : 0.0;
+        const double factor_b = pref_base * cell_p[b] * (delta_bB - W_B);
+        if (factor_b == 0.0) continue;
+
+        for (int c = 0; c < natom; ++c) {
+          if (b == c) continue;
+          const double inv_rbc = inv_rij[b * natom + c];
+          if (inv_rbc <= 0.0) continue;
+
+          const double mu = (dist[b] - dist[c]) * inv_rbc;
+          const double a_bc = a_ij[b * natom + c];
+          const double nu = mu + a_bc * (1.0 - mu * mu);
+          double s_val = 0.0;
+          double s_prime = 0.0;
+          if (scheme == PartitionScheme::Stratmann) {
+            step_ssf_val_deriv(nu, s_val, s_prime);
+          } else {
+            step_becke_val_deriv(nu, s_val, s_prime);
+          }
+          if (s_val <= 1e-30 || s_prime == 0.0) continue;
+
+          const double kappa_bc =
+              factor_b * (s_prime / s_val) * (1.0 - 2.0 * a_bc * mu) * inv_rbc;
+          const double ubc_x = (atom_coords[3 * b + 0] - atom_coords[3 * c + 0]) * inv_rbc;
+          const double ubc_y = (atom_coords[3 * b + 1] - atom_coords[3 * c + 1]) * inv_rbc;
+          const double ubc_z = (atom_coords[3 * b + 2] - atom_coords[3 * c + 2]) * inv_rbc;
+
+          local_grad[3 * b + 0] -= kappa_bc * (ux[b] + mu * ubc_x);
+          local_grad[3 * b + 1] -= kappa_bc * (uy[b] + mu * ubc_y);
+          local_grad[3 * b + 2] -= kappa_bc * (uz[b] + mu * ubc_z);
+
+          local_grad[3 * c + 0] += kappa_bc * (ux[c] + mu * ubc_x);
+          local_grad[3 * c + 1] += kappa_bc * (uy[c] + mu * ubc_y);
+          local_grad[3 * c + 2] += kappa_bc * (uz[c] + mu * ubc_z);
+
+          local_grad[3 * B + 0] += kappa_bc * (ux[b] - ux[c]);
+          local_grad[3 * B + 1] += kappa_bc * (uy[b] - uy[c]);
+          local_grad[3 * B + 2] += kappa_bc * (uz[b] - uz[c]);
+        }
+      }
+    }
+
+#if defined(_OPENMP)
+#pragma omp critical
+#endif
+    {
+      for (std::size_t k = 0; k < local_grad.size(); ++k) {
+        grad_io[k] += local_grad[k];
+      }
+    }
+  }
+}
+
+}  // namespace detail
 
 }  // namespace gpu4dft

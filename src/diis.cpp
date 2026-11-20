@@ -182,6 +182,9 @@ struct GpuDiis::Impl {
     if (nao <= 0 || nmo <= 0) {
       throw std::invalid_argument("GpuDiis: nao and nmo must be positive");
     }
+    if (opts.n_spin != 1 && opts.n_spin != 2) {
+      throw std::invalid_argument("GpuDiis: n_spin must be 1 or 2");
+    }
     opts.max_vec = std::max(1, opts.max_vec);
     h_B.assign(static_cast<std::size_t>(opts.max_vec) * opts.max_vec, 0.0);
     h_coeffs_pad.assign(static_cast<std::size_t>(opts.max_vec), 0.0);
@@ -194,21 +197,22 @@ struct GpuDiis::Impl {
     const std::size_t err_len = static_cast<std::size_t>(nmo) * nmo;
     const std::size_t nm_len = static_cast<std::size_t>(nao) * nmo;
     const std::size_t mv = static_cast<std::size_t>(opts.max_vec);
+    const std::size_t n_spin = static_cast<std::size_t>(opts.n_spin);
 
-    d_F_ring = pool->acquire_typed<double>(mv * fock_len, stream);
-    d_err_ring = pool->acquire_typed<double>(mv * err_len, stream);
-    d_err_tmp = pool->acquire_typed<double>(err_len, stream);
+    d_F_ring = pool->acquire_typed<double>(mv * n_spin * fock_len, stream);
+    d_err_ring = pool->acquire_typed<double>(mv * n_spin * err_len, stream);
+    d_err_tmp = pool->acquire_typed<double>(n_spin * err_len, stream);
     d_T1 = pool->acquire_typed<double>(fock_len, stream);
     d_M = pool->acquire_typed<double>(fock_len, stream);
     d_R = pool->acquire_typed<double>(fock_len, stream);
     d_RX = pool->acquire_typed<double>(nm_len, stream);
-    d_F_extrap = pool->acquire_typed<double>(fock_len, stream);
-    d_F_prev = pool->acquire_typed<double>(fock_len, stream);
+    d_F_extrap = pool->acquire_typed<double>(n_spin * fock_len, stream);
+    d_F_prev = pool->acquire_typed<double>(n_spin * fock_len, stream);
     d_coeffs = pool->acquire_typed<double>(mv, stream);
     d_dot_row = pool->acquire_typed<double>(mv, stream);
 
-    memset_zero_async(d_F_ring, mv * fock_len * sizeof(double), stream);
-    memset_zero_async(d_err_ring, mv * err_len * sizeof(double), stream);
+    memset_zero_async(d_F_ring, mv * n_spin * fock_len * sizeof(double), stream);
+    memset_zero_async(d_err_ring, mv * n_spin * err_len * sizeof(double), stream);
     memset_zero_async(d_coeffs, mv * sizeof(double), stream);
     gpu_initialized = true;
   }
@@ -256,11 +260,12 @@ void GpuDiis::reset(StreamHandle stream) {
   impl_->h_F_ring.clear();
   impl_->h_err_ring.clear();
   if (impl_->gpu_initialized) {
+    const std::size_t n_spin = static_cast<std::size_t>(impl_->opts.n_spin);
     const std::size_t fock_len = static_cast<std::size_t>(impl_->nao) * impl_->nao;
     const std::size_t err_len = static_cast<std::size_t>(impl_->nmo) * impl_->nmo;
     const std::size_t mv = static_cast<std::size_t>(impl_->opts.max_vec);
-    memset_zero_async(impl_->d_F_ring, mv * fock_len * sizeof(double), stream);
-    memset_zero_async(impl_->d_err_ring, mv * err_len * sizeof(double), stream);
+    memset_zero_async(impl_->d_F_ring, mv * n_spin * fock_len * sizeof(double), stream);
+    memset_zero_async(impl_->d_err_ring, mv * n_spin * err_len * sizeof(double), stream);
     memset_zero_async(impl_->d_coeffs, mv * sizeof(double), stream);
   }
 }
@@ -284,6 +289,9 @@ int GpuDiis::current_size() const noexcept { return impl_->count; }
 DiisStepInfo GpuDiis::update_device(GpuLinalgContext& ctx, const double* d_F_in, const double* d_D,
                                     const double* d_S, const double* d_X, double* d_F_out,
                                     StreamHandle stream) {
+  if (impl_->opts.n_spin != 1) {
+    throw std::invalid_argument("GpuDiis::update_device: requires DiisOptions::n_spin == 1");
+  }
 #if defined(GPU4DFT_HAVE_CUDA)
   const int nao = impl_->nao;
   const int nmo = impl_->nmo;
@@ -445,8 +453,199 @@ DiisStepInfo GpuDiis::update_device(GpuLinalgContext& ctx, const double* d_F_in,
 #endif
 }
 
+DiisStepInfo GpuDiis::update_device_uks(GpuLinalgContext& ctx, const double* d_Fa_in,
+                                        const double* d_Fb_in, const double* d_Da,
+                                        const double* d_Db, const double* d_S, const double* d_X,
+                                        double* d_Fa_out, double* d_Fb_out, StreamHandle stream) {
+  if (impl_->opts.n_spin != 2) {
+    throw std::invalid_argument("GpuDiis::update_device_uks: requires DiisOptions::n_spin == 2");
+  }
+#if defined(GPU4DFT_HAVE_CUDA)
+  const int nao = impl_->nao;
+  const int nmo = impl_->nmo;
+  const int mv = impl_->opts.max_vec;
+  const std::size_t fock_len = static_cast<std::size_t>(nao) * nao;
+  const std::size_t err_len = static_cast<std::size_t>(nmo) * nmo;
+  const std::size_t ring_fock_len = 2 * fock_len;
+  const std::size_t ring_err_len = 2 * err_len;
+
+  auto& graph_exec = ctx.graph_executor();
+  const bool use_graph = impl_->opts.use_cuda_graph;
+  StreamHandle work_stream = use_graph ? graph_exec.stream() : stream;
+
+  cudaEvent_t sync_ev = nullptr;
+  const bool bridge_streams = (use_graph && stream != work_stream);
+  if (bridge_streams) {
+    cudaEventCreateWithFlags(&sync_ev, cudaEventDisableTiming);
+    cudaEventRecord(sync_ev, stream);
+    cudaStreamWaitEvent(work_stream, sync_ev, 0);
+  }
+
+  impl_->ensure_gpu_buffers(ctx.pool(), work_stream);
+
+  auto compute_residual_uks_seq = [&](StreamHandle s) {
+    // Alpha residual -> d_err_tmp[0 .. err_len)
+    gemm_device(ctx, nao, nao, nao, 1.0, d_Da, nao, false, d_S, nao, false, 0.0, impl_->d_T1, nao,
+                impl_->opts.gemm_mode, s);
+    gemm_device(ctx, nao, nao, nao, 1.0, d_Fa_in, nao, false, impl_->d_T1, nao, false, 0.0,
+                impl_->d_M, nao, impl_->opts.gemm_mode, s);
+    detail::diis_antisymmetrize_cuda(nao, impl_->d_M, impl_->d_R, s);
+    gemm_device(ctx, nao, nmo, nao, 1.0, impl_->d_R, nao, false, d_X, nmo, false, 0.0, impl_->d_RX,
+                nmo, impl_->opts.gemm_mode, s);
+    gemm_device(ctx, nmo, nmo, nao, 1.0, d_X, nmo, true, impl_->d_RX, nmo, false, 0.0,
+                impl_->d_err_tmp, nmo, impl_->opts.gemm_mode, s);
+
+    // Beta residual -> d_err_tmp[err_len .. 2*err_len)
+    gemm_device(ctx, nao, nao, nao, 1.0, d_Db, nao, false, d_S, nao, false, 0.0, impl_->d_T1, nao,
+                impl_->opts.gemm_mode, s);
+    gemm_device(ctx, nao, nao, nao, 1.0, d_Fb_in, nao, false, impl_->d_T1, nao, false, 0.0,
+                impl_->d_M, nao, impl_->opts.gemm_mode, s);
+    detail::diis_antisymmetrize_cuda(nao, impl_->d_M, impl_->d_R, s);
+    gemm_device(ctx, nao, nmo, nao, 1.0, impl_->d_R, nao, false, d_X, nmo, false, 0.0, impl_->d_RX,
+                nmo, impl_->opts.gemm_mode, s);
+    gemm_device(ctx, nmo, nmo, nao, 1.0, d_X, nmo, true, impl_->d_RX, nmo, false, 0.0,
+                impl_->d_err_tmp + err_len, nmo, impl_->opts.gemm_mode, s);
+  };
+
+  if (use_graph) {
+    std::uint64_t res_key = 0x444949535F554B53ULL;  // "DIIS_UKS"
+    res_key = CudaGraphExecutor::hash_combine(res_key, static_cast<std::uint64_t>(nao));
+    res_key = CudaGraphExecutor::hash_combine(res_key, static_cast<std::uint64_t>(nmo));
+    res_key = CudaGraphExecutor::hash_combine(res_key, static_cast<std::uint64_t>(impl_->opts.gemm_mode));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_Fa_in));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_Fb_in));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_Da));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_Db));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_S));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(d_X));
+    res_key = CudaGraphExecutor::hash_combine(res_key, reinterpret_cast<std::uintptr_t>(impl_->d_err_tmp));
+    graph_exec.execute(res_key, compute_residual_uks_seq);
+  } else {
+    compute_residual_uks_seq(work_stream);
+  }
+
+  const int slot = impl_->head;
+  impl_->head = (impl_->head + 1) % mv;
+  if (impl_->count < mv) impl_->count += 1;
+  impl_->record_slot(slot);
+
+  double* slot_F_ptr = impl_->d_F_ring + static_cast<std::size_t>(slot) * ring_fock_len;
+  copy_d2d_async(slot_F_ptr, d_Fa_in, fock_len * sizeof(double), work_stream);
+  copy_d2d_async(slot_F_ptr + fock_len, d_Fb_in, fock_len * sizeof(double), work_stream);
+  copy_d2d_async(impl_->d_err_ring + static_cast<std::size_t>(slot) * ring_err_len,
+                 impl_->d_err_tmp, ring_err_len * sizeof(double), work_stream);
+
+  detail::diis_dot_row_cuda(ring_err_len, impl_->count, impl_->d_err_ring, slot, impl_->d_dot_row,
+                            work_stream);
+
+  std::vector<double> h_row(static_cast<std::size_t>(impl_->count), 0.0);
+  copy_d2h_async(h_row.data(), impl_->d_dot_row,
+                 static_cast<std::size_t>(impl_->count) * sizeof(double), work_stream);
+  synchronize_stream(work_stream);
+
+  for (int j = 0; j < impl_->count; ++j) {
+    impl_->h_B[static_cast<std::size_t>(slot) * mv + j] = h_row[j];
+    impl_->h_B[static_cast<std::size_t>(j) * mv + slot] = h_row[j];
+  }
+
+  const double norm_sq = std::max(0.0, h_row[slot]);
+  const double rms_err = std::sqrt(norm_sq / static_cast<double>(ring_err_len));
+
+  std::vector<double> B_active(static_cast<std::size_t>(impl_->count) * impl_->count, 0.0);
+  for (int i = 0; i < impl_->count; ++i) {
+    for (int j = 0; j < impl_->count; ++j) {
+      B_active[static_cast<std::size_t>(i) * impl_->count + j] =
+          impl_->h_B[static_cast<std::size_t>(i) * mv + j];
+    }
+  }
+  const std::vector<double> sub_weights =
+      solve_pulay_weights(impl_->count, B_active.data(), impl_->slot_age_order);
+
+  std::fill(impl_->h_coeffs_pad.begin(), impl_->h_coeffs_pad.end(), 0.0);
+  double max_abs_c = 0.0;
+  for (int k = 0; k < impl_->count; ++k) {
+    impl_->h_coeffs_pad[k] = sub_weights[k];
+    max_abs_c = std::max(max_abs_c, std::abs(sub_weights[k]));
+  }
+  copy_h2d_async(impl_->d_coeffs, impl_->h_coeffs_pad.data(),
+                 static_cast<std::size_t>(mv) * sizeof(double), work_stream);
+
+  auto extrapolate_uks_seq = [&](StreamHandle s) {
+    detail::diis_extrapolate_cuda(ring_fock_len, mv, impl_->d_F_ring, impl_->d_coeffs,
+                                  impl_->d_F_extrap, s);
+  };
+
+  if (use_graph) {
+    std::uint64_t ext_key = 0x444949535F455832ULL;  // "DIIS_EX2"
+    ext_key = CudaGraphExecutor::hash_combine(ext_key, ring_fock_len);
+    ext_key = CudaGraphExecutor::hash_combine(ext_key, static_cast<std::uint64_t>(mv));
+    ext_key = CudaGraphExecutor::hash_combine(ext_key, reinterpret_cast<std::uintptr_t>(impl_->d_F_ring));
+    ext_key = CudaGraphExecutor::hash_combine(ext_key, reinterpret_cast<std::uintptr_t>(impl_->d_coeffs));
+    ext_key = CudaGraphExecutor::hash_combine(ext_key, reinterpret_cast<std::uintptr_t>(impl_->d_F_extrap));
+    graph_exec.execute(ext_key, extrapolate_uks_seq);
+  } else {
+    extrapolate_uks_seq(work_stream);
+  }
+
+  copy_d2d_async(d_Fa_out, impl_->d_F_extrap, fock_len * sizeof(double), work_stream);
+  copy_d2d_async(d_Fb_out, impl_->d_F_extrap + fock_len, fock_len * sizeof(double), work_stream);
+
+  const double beta_damp = std::clamp(impl_->opts.damping, 0.0, 0.95);
+  if (beta_damp > 0.0 && impl_->d_has_prev && impl_->step_counter < impl_->opts.damping_steps) {
+    axpby_device(fock_len, beta_damp, impl_->d_F_prev, 1.0 - beta_damp, d_Fa_out, work_stream);
+    axpby_device(fock_len, beta_damp, impl_->d_F_prev + fock_len, 1.0 - beta_damp, d_Fb_out,
+                 work_stream);
+  }
+  copy_d2d_async(impl_->d_F_prev, d_Fa_out, fock_len * sizeof(double), work_stream);
+  copy_d2d_async(impl_->d_F_prev + fock_len, d_Fb_out, fock_len * sizeof(double), work_stream);
+  impl_->d_has_prev = true;
+
+  if (impl_->opts.level_shift != 0.0) {
+    apply_level_shift_ao_device(ctx, nao, impl_->opts.level_shift, d_S, d_Da, d_Fa_out,
+                                impl_->opts.gemm_mode, work_stream, 1.0);
+    apply_level_shift_ao_device(ctx, nao, impl_->opts.level_shift, d_S, d_Db, d_Fb_out,
+                                impl_->opts.gemm_mode, work_stream, 1.0);
+  }
+  symmetrize_matrix_device(nao, d_Fa_out, work_stream);
+  symmetrize_matrix_device(nao, d_Fb_out, work_stream);
+
+  if (bridge_streams) {
+    cudaEventRecord(sync_ev, work_stream);
+    cudaStreamWaitEvent(stream, sync_ev, 0);
+    cudaEventDestroy(sync_ev);
+  }
+
+  impl_->step_counter += 1;
+
+  DiisStepInfo info;
+  info.subspace_size = impl_->count;
+  info.rms_error = rms_err;
+  info.max_abs_coeff = max_abs_c;
+  info.coefficients.resize(static_cast<std::size_t>(impl_->count));
+  for (int idx = 0; idx < impl_->count; ++idx) {
+    info.coefficients[idx] = sub_weights[impl_->slot_age_order[idx]];
+  }
+  return info;
+#else
+  (void)ctx;
+  (void)d_Fa_in;
+  (void)d_Fb_in;
+  (void)d_Da;
+  (void)d_Db;
+  (void)d_S;
+  (void)d_X;
+  (void)d_Fa_out;
+  (void)d_Fb_out;
+  (void)stream;
+  throw std::runtime_error("GpuDiis::update_device_uks: built without CUDA");
+#endif
+}
+
 DiisHostResult GpuDiis::update(const double* F_in, const double* D, const double* S,
                                const double* X, Backend backend) {
+  if (impl_->opts.n_spin != 1) {
+    throw std::invalid_argument("GpuDiis::update: requires DiisOptions::n_spin == 1");
+  }
   const int nao = impl_->nao;
   const int nmo = impl_->nmo;
   const std::size_t fock_len = static_cast<std::size_t>(nao) * nao;
@@ -586,6 +785,199 @@ DiisHostResult GpuDiis::update(const double* F_in, const double* D, const double
       out.fock_extrapolated[static_cast<std::size_t>(j) * nao + i] = avg;
     }
   }
+
+  impl_->step_counter += 1;
+  out.info.subspace_size = impl_->count;
+  out.info.rms_error = rms_err;
+  out.info.max_abs_coeff = max_abs_c;
+  out.info.coefficients.resize(static_cast<std::size_t>(impl_->count));
+  for (int idx = 0; idx < impl_->count; ++idx) {
+    out.info.coefficients[idx] = sub_weights[impl_->slot_age_order[idx]];
+  }
+  return out;
+}
+
+DiisHostUksResult GpuDiis::update_uks(const double* Fa_in, const double* Fb_in, const double* Da,
+                                      const double* Db, const double* S, const double* X,
+                                      Backend backend) {
+  if (impl_->opts.n_spin != 2) {
+    throw std::invalid_argument("GpuDiis::update_uks: requires DiisOptions::n_spin == 2");
+  }
+  const int nao = impl_->nao;
+  const int nmo = impl_->nmo;
+  const std::size_t fock_len = static_cast<std::size_t>(nao) * nao;
+  const std::size_t err_len = static_cast<std::size_t>(nmo) * nmo;
+  const std::size_t ring_fock_len = 2 * fock_len;
+  const std::size_t ring_err_len = 2 * err_len;
+
+  DiisHostUksResult out;
+  out.fock_alpha_extrapolated.resize(fock_len, 0.0);
+  out.fock_beta_extrapolated.resize(fock_len, 0.0);
+  out.residual_alpha.resize(err_len, 0.0);
+  out.residual_beta.resize(err_len, 0.0);
+
+  if (backend == Backend::Cuda) {
+#if defined(GPU4DFT_HAVE_CUDA)
+    DeviceMemoryPool& pool = (impl_->pool != nullptr) ? *impl_->pool : default_device_pool();
+    GpuLinalgContext ctx(&pool);
+    PooledBuffer<double> d_Fa_in(pool, fock_len);
+    PooledBuffer<double> d_Fb_in(pool, fock_len);
+    PooledBuffer<double> d_Da(pool, fock_len);
+    PooledBuffer<double> d_Db(pool, fock_len);
+    PooledBuffer<double> d_S(pool, fock_len);
+    PooledBuffer<double> d_X(pool, static_cast<std::size_t>(nao) * nmo);
+    PooledBuffer<double> d_Fa_out(pool, fock_len);
+    PooledBuffer<double> d_Fb_out(pool, fock_len);
+
+    copy_h2d_async(d_Fa_in.data(), Fa_in, fock_len * sizeof(double));
+    copy_h2d_async(d_Fb_in.data(), Fb_in, fock_len * sizeof(double));
+    copy_h2d_async(d_Da.data(), Da, fock_len * sizeof(double));
+    copy_h2d_async(d_Db.data(), Db, fock_len * sizeof(double));
+    copy_h2d_async(d_S.data(), S, fock_len * sizeof(double));
+    copy_h2d_async(d_X.data(), X, static_cast<std::size_t>(nao) * nmo * sizeof(double));
+
+    out.info = update_device_uks(ctx, d_Fa_in.data(), d_Fb_in.data(), d_Da.data(), d_Db.data(),
+                                 d_S.data(), d_X.data(), d_Fa_out.data(), d_Fb_out.data());
+
+    copy_d2h_async(out.fock_alpha_extrapolated.data(), d_Fa_out.data(), fock_len * sizeof(double));
+    copy_d2h_async(out.fock_beta_extrapolated.data(), d_Fb_out.data(), fock_len * sizeof(double));
+    copy_d2h_async(out.residual_alpha.data(), impl_->d_err_tmp, err_len * sizeof(double));
+    copy_d2h_async(out.residual_beta.data(), impl_->d_err_tmp + err_len, err_len * sizeof(double));
+    synchronize_stream(nullptr);
+    return out;
+#else
+    throw std::runtime_error("GpuDiis::update_uks: CUDA backend requested, built without CUDA");
+#endif
+  }
+
+  if (backend != Backend::Host) {
+    throw NotImplemented("GpuDiis::update_uks: unsupported backend");
+  }
+
+  const int mv = impl_->opts.max_vec;
+  if (impl_->h_F_ring.empty()) {
+    impl_->h_F_ring.assign(static_cast<std::size_t>(mv), std::vector<double>(ring_fock_len, 0.0));
+    impl_->h_err_ring.assign(static_cast<std::size_t>(mv), std::vector<double>(ring_err_len, 0.0));
+  }
+
+  auto compute_res_host = [&](const double* F_s, const double* D_s, double* res_out) {
+    std::vector<double> DS(fock_len, 0.0);
+    std::vector<double> FDS(fock_len, 0.0);
+    std::vector<double> R(fock_len, 0.0);
+    std::vector<double> RX(static_cast<std::size_t>(nao) * nmo, 0.0);
+
+    gemm(nao, nao, nao, 1.0, D_s, false, S, false, 0.0, DS.data(), Backend::Host,
+         impl_->opts.gemm_mode);
+    gemm(nao, nao, nao, 1.0, F_s, false, DS.data(), false, 0.0, FDS.data(), Backend::Host,
+         impl_->opts.gemm_mode);
+    for (int i = 0; i < nao; ++i) {
+      for (int j = 0; j < nao; ++j) {
+        R[static_cast<std::size_t>(i) * nao + j] =
+            FDS[static_cast<std::size_t>(i) * nao + j] - FDS[static_cast<std::size_t>(j) * nao + i];
+      }
+    }
+    gemm(nao, nmo, nao, 1.0, R.data(), false, X, false, 0.0, RX.data(), Backend::Host,
+         impl_->opts.gemm_mode);
+    gemm(nmo, nmo, nao, 1.0, X, true, RX.data(), false, 0.0, res_out, Backend::Host,
+         impl_->opts.gemm_mode);
+  };
+
+  compute_res_host(Fa_in, Da, out.residual_alpha.data());
+  compute_res_host(Fb_in, Db, out.residual_beta.data());
+
+  const int slot = impl_->head;
+  impl_->head = (impl_->head + 1) % mv;
+  if (impl_->count < mv) impl_->count += 1;
+  impl_->record_slot(slot);
+
+  std::copy(Fa_in, Fa_in + fock_len, impl_->h_F_ring[slot].begin());
+  std::copy(Fb_in, Fb_in + fock_len, impl_->h_F_ring[slot].begin() + fock_len);
+  std::copy(out.residual_alpha.begin(), out.residual_alpha.end(), impl_->h_err_ring[slot].begin());
+  std::copy(out.residual_beta.begin(), out.residual_beta.end(),
+            impl_->h_err_ring[slot].begin() + err_len);
+
+  for (int j = 0; j < impl_->count; ++j) {
+    double dot = 0.0;
+    for (std::size_t idx = 0; idx < ring_err_len; ++idx) {
+      dot += impl_->h_err_ring[slot][idx] * impl_->h_err_ring[j][idx];
+    }
+    impl_->h_B[static_cast<std::size_t>(slot) * mv + j] = dot;
+    impl_->h_B[static_cast<std::size_t>(j) * mv + slot] = dot;
+  }
+
+  const double norm_sq = std::max(0.0, impl_->h_B[static_cast<std::size_t>(slot) * mv + slot]);
+  const double rms_err = std::sqrt(norm_sq / static_cast<double>(ring_err_len));
+
+  std::vector<double> B_active(static_cast<std::size_t>(impl_->count) * impl_->count, 0.0);
+  for (int i = 0; i < impl_->count; ++i) {
+    for (int j = 0; j < impl_->count; ++j) {
+      B_active[static_cast<std::size_t>(i) * impl_->count + j] =
+          impl_->h_B[static_cast<std::size_t>(i) * mv + j];
+    }
+  }
+  const std::vector<double> sub_weights =
+      solve_pulay_weights(impl_->count, B_active.data(), impl_->slot_age_order);
+
+  std::fill(out.fock_alpha_extrapolated.begin(), out.fock_alpha_extrapolated.end(), 0.0);
+  std::fill(out.fock_beta_extrapolated.begin(), out.fock_beta_extrapolated.end(), 0.0);
+  double max_abs_c = 0.0;
+  for (int k = 0; k < impl_->count; ++k) {
+    const double c = sub_weights[k];
+    max_abs_c = std::max(max_abs_c, std::abs(c));
+    if (c != 0.0) {
+      for (std::size_t idx = 0; idx < fock_len; ++idx) {
+        out.fock_alpha_extrapolated[idx] += c * impl_->h_F_ring[k][idx];
+        out.fock_beta_extrapolated[idx] += c * impl_->h_F_ring[k][fock_len + idx];
+      }
+    }
+  }
+
+  const double beta_damp = std::clamp(impl_->opts.damping, 0.0, 0.95);
+  if (beta_damp > 0.0 && impl_->h_has_prev && impl_->step_counter < impl_->opts.damping_steps) {
+    for (std::size_t idx = 0; idx < fock_len; ++idx) {
+      out.fock_alpha_extrapolated[idx] =
+          (1.0 - beta_damp) * out.fock_alpha_extrapolated[idx] + beta_damp * impl_->h_F_prev[idx];
+      out.fock_beta_extrapolated[idx] =
+          (1.0 - beta_damp) * out.fock_beta_extrapolated[idx] +
+          beta_damp * impl_->h_F_prev[fock_len + idx];
+    }
+  }
+  impl_->h_F_prev.resize(ring_fock_len);
+  std::copy(out.fock_alpha_extrapolated.begin(), out.fock_alpha_extrapolated.end(),
+            impl_->h_F_prev.begin());
+  std::copy(out.fock_beta_extrapolated.begin(), out.fock_beta_extrapolated.end(),
+            impl_->h_F_prev.begin() + fock_len);
+  impl_->h_has_prev = true;
+
+  if (impl_->opts.level_shift != 0.0) {
+    auto apply_ls = [&](const double* D_s, std::vector<double>& F_s) {
+      std::vector<double> SD(fock_len, 0.0);
+      std::vector<double> SDS(fock_len, 0.0);
+      gemm(nao, nao, nao, 1.0, S, false, D_s, false, 0.0, SD.data(), Backend::Host,
+           impl_->opts.gemm_mode);
+      gemm(nao, nao, nao, 1.0, SD.data(), false, S, false, 0.0, SDS.data(), Backend::Host,
+           impl_->opts.gemm_mode);
+      const double ls = impl_->opts.level_shift;
+      for (std::size_t idx = 0; idx < fock_len; ++idx) {
+        F_s[idx] += ls * (S[idx] - 1.0 * SDS[idx]);
+      }
+    };
+    apply_ls(Da, out.fock_alpha_extrapolated);
+    apply_ls(Db, out.fock_beta_extrapolated);
+  }
+
+  auto sym_host = [&](std::vector<double>& M) {
+    for (int i = 0; i < nao; ++i) {
+      for (int j = i + 1; j < nao; ++j) {
+        const double avg = 0.5 * (M[static_cast<std::size_t>(i) * nao + j] +
+                                  M[static_cast<std::size_t>(j) * nao + i]);
+        M[static_cast<std::size_t>(i) * nao + j] = avg;
+        M[static_cast<std::size_t>(j) * nao + i] = avg;
+      }
+    }
+  };
+  sym_host(out.fock_alpha_extrapolated);
+  sym_host(out.fock_beta_extrapolated);
 
   impl_->step_counter += 1;
   out.info.subspace_size = impl_->count;

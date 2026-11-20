@@ -675,7 +675,8 @@ CanonicalOrthoResult canonical_orthogonalization(int nao, const double* S, doubl
 }
 
 FockDiagResult solve_fock_diag(int nao, int nmo, int n_occ, const double* F, const double* X,
-                               Backend backend, GemmMode gemm_mode, int ozaki_slices) {
+                               Backend backend, GemmMode gemm_mode, int ozaki_slices,
+                               double occ_weight) {
   if (nao <= 0 || nmo <= 0) {
     throw std::invalid_argument("solve_fock_diag: nao and nmo must be positive");
   }
@@ -708,7 +709,7 @@ FockDiagResult solve_fock_diag(int nao, int nmo, int n_occ, const double* F, con
     copy_h2d_async(d_X.data(), X, nm * sizeof(double));
 
     solve_fock_diag_device(ctx, nao, nmo, n_occ, d_F.data(), d_X.data(), d_eps.data(), d_C.data(),
-                           d_D.data(), d_W.data(), gemm_mode, nullptr, ozaki_slices);
+                           d_D.data(), d_W.data(), gemm_mode, nullptr, ozaki_slices, occ_weight);
 
     copy_d2h_async(res.mo_energies.data(), d_eps.data(),
                    static_cast<std::size_t>(nmo) * sizeof(double));
@@ -752,9 +753,9 @@ FockDiagResult solve_fock_diag(int nao, int nmo, int n_occ, const double* F, con
         C_scaled[static_cast<std::size_t>(i) * n_occ + a] = c * res.mo_energies[a];
       }
     }
-    gemm(nao, nao, n_occ, 2.0, C_occ.data(), false, C_occ.data(), true, 0.0, res.dm.data(),
+    gemm(nao, nao, n_occ, occ_weight, C_occ.data(), false, C_occ.data(), true, 0.0, res.dm.data(),
          Backend::Host, gemm_mode, ozaki_slices);
-    gemm(nao, nao, n_occ, 2.0, C_occ.data(), false, C_scaled.data(), true, 0.0,
+    gemm(nao, nao, n_occ, occ_weight, C_occ.data(), false, C_scaled.data(), true, 0.0,
          res.energy_dm.data(), Backend::Host, gemm_mode, ozaki_slices);
     symmetrize_host(nao, res.dm);
     symmetrize_host(nao, res.energy_dm);
@@ -763,7 +764,7 @@ FockDiagResult solve_fock_diag(int nao, int nmo, int n_occ, const double* F, con
 }
 
 Sp2Result solve_fock_sp2(int nao, int nmo, int n_occ, const double* F, const double* X,
-                         Backend backend, const Sp2Options& opts) {
+                         Backend backend, const Sp2Options& opts, double occ_weight) {
   if (nao <= 0 || nmo <= 0) {
     throw std::invalid_argument("solve_fock_sp2: nao and nmo must be positive");
   }
@@ -795,7 +796,7 @@ Sp2Result solve_fock_sp2(int nao, int nmo, int n_occ, const double* F, const dou
 
     const DeviceSp2Stats d_stats =
         solve_fock_sp2_device(ctx, nao, nmo, n_occ, d_F.data(), d_X.data(), d_P.data(), d_D.data(),
-                              d_W.data(), opts, nullptr);
+                              d_W.data(), opts, nullptr, occ_weight);
 
     copy_d2h_async(res.dm.data(), d_D.data(), n2 * sizeof(double));
     copy_d2h_async(res.energy_dm.data(), d_W.data(), n2 * sizeof(double));
@@ -912,14 +913,15 @@ Sp2Result solve_fock_sp2(int nao, int nmo, int n_occ, const double* F, const dou
 
   gemm(nao, nmo, nmo, 1.0, X, false, P.data(), false, 0.0, FX.data(), Backend::Host, opts.gemm_mode,
        opts.ozaki_slices);
-  gemm(nao, nao, nmo, 2.0, FX.data(), false, X, true, 0.0, res.dm.data(), Backend::Host,
+  gemm(nao, nao, nmo, occ_weight, FX.data(), false, X, true, 0.0, res.dm.data(), Backend::Host,
        opts.gemm_mode, opts.ozaki_slices);
   symmetrize_host(nao, res.dm);
 
+  const double w_scale = (occ_weight > 0.0) ? (1.0 / occ_weight) : 0.0;
   std::vector<double> DF(static_cast<std::size_t>(nao) * nao, 0.0);
   gemm(nao, nao, nao, 1.0, res.dm.data(), false, F, false, 0.0, DF.data(), Backend::Host,
        opts.gemm_mode, opts.ozaki_slices);
-  gemm(nao, nao, nao, 0.5, DF.data(), false, res.dm.data(), false, 0.0, res.energy_dm.data(),
+  gemm(nao, nao, nao, w_scale, DF.data(), false, res.dm.data(), false, 0.0, res.energy_dm.data(),
        Backend::Host, opts.gemm_mode, opts.ozaki_slices);
   symmetrize_host(nao, res.energy_dm);
   return res;
@@ -1023,11 +1025,12 @@ void syevd_device(GpuLinalgContext&, int, const double*, double*, double*, Strea
   throw std::runtime_error("syevd_device: built without CUDA");
 }
 void solve_fock_diag_device(GpuLinalgContext&, int, int, int, const double*, const double*, double*,
-                            double*, double*, double*, GemmMode, StreamHandle, int) {
+                            double*, double*, double*, GemmMode, StreamHandle, int, double) {
   throw std::runtime_error("solve_fock_diag_device: built without CUDA");
 }
 DeviceSp2Stats solve_fock_sp2_device(GpuLinalgContext&, int, int, int, const double*, const double*,
-                                     double*, double*, double*, const Sp2Options&, StreamHandle) {
+                                     double*, double*, double*, const Sp2Options&, StreamHandle,
+                                     double) {
   throw std::runtime_error("solve_fock_sp2_device: built without CUDA");
 }
 void symmetrize_matrix_device(int, double*, StreamHandle) {}
@@ -1037,8 +1040,12 @@ void compute_delta_and_norm_device(std::size_t, const double*, const double*, do
 void assemble_fock_and_traces_device(int, const double*, const double*, const double*,
                                      const double*, double, const double*, double*, double*,
                                      StreamHandle) {}
+void assemble_fock_and_traces_uks_device(int, const double*, const double*, const double*,
+                                         const double*, const double*, const double*, double,
+                                         const double*, const double*, double*, double*, double*,
+                                         StreamHandle) {}
 void apply_level_shift_ao_device(GpuLinalgContext&, int, double, const double*, const double*,
-                                 double*, GemmMode, StreamHandle) {}
+                                 double*, GemmMode, StreamHandle, double) {}
 void permute_ri_chunk_pair_device(int, int, const double*, const double*, double*, double*,
                                   StreamHandle) {}
 

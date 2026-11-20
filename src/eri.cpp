@@ -83,7 +83,7 @@ bool backend_available(Backend backend) {
 }
 
 std::vector<double> eri_pair_block(const ShellPairData& bra, const ShellPairData& ket,
-                                   Backend backend, Precision precision) {
+                                   Backend backend, Precision precision, double omega) {
   const int la = bra.la, lb = bra.lb, lc = ket.la, ld = ket.lb;
   if (la < 0 || lb < 0 || lc < 0 || ld < 0 || la > kMaxSupportedL || lb > kMaxSupportedL ||
       lc > kMaxSupportedL || ld > kMaxSupportedL) {
@@ -95,6 +95,32 @@ std::vector<double> eri_pair_block(const ShellPairData& bra, const ShellPairData
       static_cast<std::size_t>(n_sph(la)) * n_sph(lb) * n_sph(lc) * n_sph(ld);
   std::vector<double> out(static_cast<std::size_t>(bra.npair()) * ket.npair() * nsph, 0.0);
   if (out.empty()) return out;
+
+  if (omega > 0.0) {
+    switch (backend) {
+      case Backend::Host:
+        if (!generated::eri_general_omega_dispatch(la, lb, lc, ld, Backend::Host, eval_prec,
+                                                   bra.view(), ket.view(), omega, out.data(),
+                                                   nullptr)) {
+          throw std::runtime_error("host general omega ERI kernel is unavailable");
+        }
+        break;
+      case Backend::Cuda:
+#if defined(GPU4DFT_HAVE_CUDA)
+        {
+          const auto fn = (eval_prec == Precision::FP64) ? &generated::eri_general_cuda_fp64_omega
+                                                         : &generated::eri_general_cuda_fp32_omega;
+          detail::run_eri_general_omega_cuda(fn, la, lb, lc, ld, bra, ket, omega, out);
+        }
+        break;
+#else
+        throw std::runtime_error("gpu4dft was built without CUDA");
+#endif
+      case Backend::Hip:
+        throw std::runtime_error("gpu4dft was built without HIP");
+    }
+    return out;
+  }
 
   const EriKernel* spec = find_specialized_eri_kernel(la, lb, lc, ld, backend, eval_prec);
 
@@ -126,7 +152,8 @@ std::vector<double> eri_pair_block(const ShellPairData& bra, const ShellPairData
   return out;
 }
 
-std::vector<double> eri_tensor(const Basis& basis, Backend backend, Precision precision) {
+std::vector<double> eri_tensor(const Basis& basis, Backend backend, Precision precision,
+                               double omega) {
   if (basis.max_l() > kMaxSupportedL) {
     throw NotImplemented("eri_tensor supports up to g shells (l <= 4); basis has l = " +
                          std::to_string(basis.max_l()));
@@ -139,7 +166,7 @@ std::vector<double> eri_tensor(const Basis& basis, Backend backend, Precision pr
   std::vector<ShellPairData> pair_lists;
   for (int la = 0; la <= max_l; ++la) {
     for (int lb = 0; lb <= la; ++lb) {
-      ShellPairData pd = build_shell_pairs(basis, la, lb);
+      ShellPairData pd = build_shell_pairs(basis, la, lb, 0.0, omega);
       if (pd.npair() > 0) {
         pair_lists.push_back(std::move(pd));
       }
@@ -164,7 +191,7 @@ std::vector<double> eri_tensor(const Basis& basis, Backend backend, Precision pr
       const std::size_t nsph = static_cast<std::size_t>(nsa) * nsb * nsc * nsd;
       const std::size_t nket = static_cast<std::size_t>(ket.npair());
 
-      const std::vector<double> block = eri_pair_block(bra, ket, backend, precision);
+      const std::vector<double> block = eri_pair_block(bra, ket, backend, precision, omega);
 
       for (std::size_t P = 0; P < static_cast<std::size_t>(bra.npair()); ++P) {
         const std::size_t i0 = static_cast<std::size_t>(bra.ao_i[P]);
