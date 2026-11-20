@@ -2,7 +2,7 @@
 
 **GPU4DFT** 是一个面向现代异构加速器（NVIDIA Ampere / Hopper / Blackwell 与 AMD Instinct MI300 系列）从零构建的 **GPU 原生第一性原理量子化学与凝聚态密度泛函理论（DFT）计算框架**，在同一 C++20/CUDA 代码库内统一涵盖**分子高斯原子轨道（GTO）自洽场、解析梯度、线性响应激发态（CIS / TDA / TDDFT / RI-TDDFT）、分子振动 Hessian** 以及**周期性平面波赝势与自适应压缩交换杂化泛函（Plane-Wave Kohn–Sham & Lin's ACE Hybrid DFT）**。
 
-不同于将传统 CPU 代码局部移植到 GPU 的混合模式，GPU4DFT 采用**生成式单一算术真源（Codegen-First）**与**全显存零拷贝常驻流水线（Zero-Copy GPU-Resident Pipeline）**设计：在计算热路径中彻底消除 Python 解释器介入与主机—设备矩阵往返，并针对新一代 GPU（如 NVIDIA Blackwell）原生标量 FP64 受限而 FP32 / INT8 Tensor Core 算力充沛的硬件特征，引入**动态混合精度四元组路由**与 **Ozaki INT8 Tensor Core 无损双精度矩阵乘法仿真**，在严格保证相对 `PySCF`/`libcint` 机器级数值精度的同时充分释放张量核心算力。
+不同于将传统 CPU 代码局部移植到 GPU 的混合模式，GPU4DFT 采用**生成式单一算术真源（Codegen-First）** 与**全显存零拷贝常驻流水线（Zero-Copy GPU-Resident Pipeline）** 设计：在计算热路径中彻底消除 Python 解释器介入与主机—设备矩阵往返，并针对新一代 GPU（如 NVIDIA Blackwell）原生标量 FP64 受限而 FP32 / INT8 Tensor Core 算力充沛的硬件特征，引入**动态混合精度四元组路由**与 **Ozaki INT8 Tensor Core 无损双精度矩阵乘法仿真**，在严格保证相对 `PySCF`/`libcint` 机器级数值精度的同时充分释放张量核心算力。
 
 - 架构与数学设计规范详见：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 精度门禁与性能基准方案详见：[docs/BENCHMARK_PLAN.md](docs/BENCHMARK_PLAN.md)
@@ -13,15 +13,15 @@
 
 ## 核心特性
 
-- **五层解耦 GPU 原生分子与周期性统一架构**：`nanobind` 零拷贝前端（PySCF 兼容 `RHF`/`RKS`、`.TDA()`/`.TDDFT()`/`.Hessian()`、`gpu4dft.pw` 平面波子模块与 ASE `Calculator`）$\to$ C++20 全显存常驻驱动（`DeviceMemoryPool` + `CudaGraphExecutor` 全步图固化 + `GpuDiis`，稳态迭代零 `cudaMalloc` 分配）$\to$ 高斯与平面波计算引擎层 $\to$ 双代码生成器与自动调优器 $\to$ 多 GPU 原子动态调度与集合通信层。
+- **五层解耦 GPU 原生分子与周期性统一架构**：`nanobind` 零拷贝前端（PySCF 兼容 `RHF`/`RKS`、`.TDA()`/`.TDDFT()`/`.Hessian()`、`gpu4dft.pw` 平面波子模块与 ASE `Calculator`） $\to$ C++20 全显存常驻驱动（`DeviceMemoryPool` + `CudaGraphExecutor` 全步图固化 + `GpuDiis`，稳态迭代零 `cudaMalloc` 分配） $\to$ 高斯与平面波计算引擎层 $\to$ 双代码生成器与自动调优器 $\to$ 多 GPU 原子动态调度与集合通信层。
 - **双代码生成器、跨厂商三后端（Host / CUDA / HIP）与 `libxc` 泛函集成**：
-  - `gpu4dft_codegen`：将任意角动量（$s, p, d, f, g$）纯库仑 $1/r_{12}$ 与长程衰减 $\text{erf}(\omega r_{12})/r_{12}$ 单/双电子积分及导数（`deriv_order = 0, 1, 2`）生成为跨平台 `GPU4DFT_HD` 头文件，同步发射 OpenMP **Host**（`.cpp`）、NVIDIA **CUDA**（`.cu`）与 AMD ROCm **HIP**（`.hip`）驱动。
-  - `xc_codegen` + **`Libxc::xc` 双引擎**：既支持零外部依赖符号 AST 自动微分内核，也原生链接 `libxc` 支持非极化（`RKS`）/ 自旋极化（`UKS`）泛函、范围分离杂化泛函（**`CAM-B3LYP`**、**`wB97X`**）、求积格点权重核导数（`grid_response=True`，严格满足平移不变性 $|\sum_A \mathbf{g}_A| \le 10^{-6}\ E_\text{h}/a_0$）及 **Grimme `DFT-D3(BJ)`** 色散能量与解析核梯度。
+  - `gpu4dft_codegen`：将任意角动量（ $s, p, d, f, g$）纯库仑 $1/r_{12}$ 与长程衰减 $\text{erf}(\omega r_{12})/r_{12}$ 单/双电子积分及导数（`deriv_order = 0, 1, 2`）生成为跨平台 `GPU4DFT_HD` 头文件，同步发射 OpenMP **Host**（`.cpp`）、NVIDIA **CUDA**（`.cu`）与 AMD ROCm **HIP**（`.hip`）驱动。
+  - `xc_codegen` + **`Libxc::xc` 双引擎**：既支持零外部依赖符号 AST 自动微分内核，也原生链接 `libxc` 支持非极化（`RKS`）/ 自旋极化（`UKS`）泛函、范围分离杂化泛函（**`CAM-B3LYP`**、**`wB97X`**）、求积格点权重核导数（`grid_response=True`，严格满足平移不变性 $|\sum_A \mathbf g_A| \le 10^{-6}\ E_\text{h}/a_0$）及 **Grimme `DFT-D3(BJ)`** 色散能量与解析核梯度。
 - **闭壳层与开壳层全栈量子化学（`RHF`/`RKS`/`UHF`/`UKS`）及几何构型优化**：
-  - 完整支持开壳层自由基/三重态 `UHF`/`UKS`（联合 $\alpha/\beta$ GPU CDIIS、$\langle S^2\rangle$ 监控、开壳层 `minao` 初猜及 Direct / `RI-JK` 解析核梯度），并提供 PySCF 兼容 `.as_scanner()`（`SCFScanner` / `GradScanner`）与支持热启动 `dm0` 复用及 `trim_device_pool()` 显存自动回收的 ASE `GPU4DFTCalculator`。
+  - 完整支持开壳层自由基/三重态 `UHF`/`UKS`（联合 $\alpha/\beta$ GPU CDIIS、 $\langle S^2\rangle$ 监控、开壳层 `minao` 初猜及 Direct / `RI-JK` 解析核梯度），并提供 PySCF 兼容 `.as_scanner()`（`SCFScanner` / `GradScanner`）与支持热启动 `dm0` 复用及 `trim_device_pool()` 显存自动回收的 ASE `GPU4DFTCalculator`。
 - **全显存零拷贝 J/K 算法谱系（Direct JK / 占优轨道空间 GPU `RI-JK` 及解析梯度 / 渐近筛选 `sn-K`）**：
-  - **Direct J/K (`DirectJKEngine`)**：零主机往返 `compute_jk_device` + GPU 原生笛卡尔$\leftrightarrow$实球谐变换，低角动量采用 **McMurchie–Davidson + Hermite J-Engine**，高角动量采用 **Rys 求积 + 寄存器 2D VRR**，支持闭壳层/开壳层、范围分离算符 $\omega$ 以及对称（SCF）/ 精确非对称（TDDFT/CPHF，`symmetrize_dm=false`）密度收缩；**在 Blackwell 上全部 `15/15` 组 Direct DFT 基准全面超越 `GPU4PySCF`（端到端快 `1.35x–5.43x`，SCF 循环快达 `6.22x`）**。
-  - **显存受控占优轨道空间 `RI-J` / `RI-K` 与 `RI-JK` 解析核梯度 (`RIJKEngine`)**：采用辅助基分块占优轨道收缩 $O(N_{\text{aux}} N_{\text{AO}}^2 N_{\text{occ}})$ 与二/三中心度量导数（`auxbasis_response=True`），在 15 GiB 显存卡上即可流畅运行 `Valinomycin`（$N_{\text{AO}}=1272$）与 `(H2O)_80`（$N_{\text{AO}}=1920$）解析核梯度（主机峰值 RSS 仅 `1.265 GiB`）。
+  - **Direct J/K (`DirectJKEngine`)**：零主机往返 `compute_jk_device` + GPU 原生笛卡尔 $\leftrightarrow$ 实球谐变换，低角动量采用 **McMurchie–Davidson + Hermite J-Engine**，高角动量采用 **Rys 求积 + 寄存器 2D VRR**，支持闭壳层/开壳层、范围分离算符 $\omega$ 以及对称（SCF）/ 精确非对称（TDDFT/CPHF，`symmetrize_dm=false`）密度收缩；**在 Blackwell 上全部 `15/15` 组 Direct DFT 基准全面超越 `GPU4PySCF`（端到端快 `1.35x–5.43x`，SCF 循环快达 `6.22x`）**。
+  - **显存受控占优轨道空间 `RI-J` / `RI-K` 与 `RI-JK` 解析核梯度 (`RIJKEngine`)**：采用辅助基分块占优轨道收缩 $O(N_{\text{aux}} N_{\text{AO}}^2 N_{\text{occ}})$ 与二/三中心度量导数（`auxbasis_response=True`），在 15 GiB 显存卡上即可流畅运行 `Valinomycin`（ $N_{\text{AO}}=1272$）与 `(H2O)_80`（ $N_{\text{AO}}=1920$）解析核梯度（主机峰值 RSS 仅 `1.265 GiB`）。
   - **4 流超批缓存 `XcEngine` 与渐近筛选 `SemiNumericalK` (COSX)**：空间八叉树活性 AO 显存常驻缓存与 4 流并发 cuBLAS GEMM 使 XC 评估提速 **`14.7x–22x`**，同时提供机器精度二阶核收缩 `eval_fxc_device`（误差 $1.39\times 10^{-16}$）；渐近静电筛选使半数值交换 `sn-K` 提速 **`10.6x–14.2x`**。
 - **GPU 线性响应激发态（CIS / TDA / TDHF / TDDFT / RI-TDDFT）、CPHF 极化率与分子振动 Hessian (`response.hpp`)**：
   - 全显存常驻块 Davidson 求解器与对称平方形式（SSF）Casida RPA 方程求解，无缝支持 Direct 与 `.density_fit()` **GPU RI-TDA / RI-TDDFT** 及 `OzakiInt8` Tensor Core GEMM，输出激发能、跃迁偶极矩与振子强度 $f_{\text{osc}}$（相对 48 核 CPU PySCF 加速 **`13.3x–32.1x`**，最高较 `GPU4PySCF` 快 **`2.77x`**）。
@@ -85,7 +85,7 @@ GPU4DFT/
 ## 构建与测试
 
 ### 依赖环境
-- **编译工具链**：CMake $\ge 3.24$、支持 C++20 的编译器（GCC $\ge 11$ / Clang $\ge 14$）、`libxc-dev`（$\ge 5.2$，如 Ubuntu `apt-get install -y libxc-dev`）、Ninja（推荐）、OpenMP（可选，加速 Host 后端）。
+- **编译工具链**：CMake $\ge 3.24$、支持 C++20 的编译器（GCC $\ge 11$ / Clang $\ge 14$）、`libxc-dev`（ $\ge 5.2$，如 Ubuntu `apt-get install -y libxc-dev`）、Ninja（推荐）、OpenMP（可选，加速 Host 后端）。
 - **GPU 工具链（可选）**：NVIDIA CUDA Toolkit $\ge 12.0$（含 `cudart`, `cublas`, `cusolver`, `cufft`；Blackwell 推荐 CUDA 12.8 / 13.0）或 AMD ROCm HIP 工具链。无 GPU 时自动退回纯 CPU OpenMP 参考后端（含内置 Stockham / Bluestein 三维 FFT）。
 - **Python 环境**：Python $\ge 3.10$、`nanobind >= 2.0`、`numpy`；运行验证测试需安装 `pytest` 与 `pyscf`。
 
@@ -203,7 +203,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 ### 1. Ozaki INT8 Tensor Core 无损仿真与求解器/CUDA Graphs 消融
 
-在原生标量 FP64 受限（~1.54 TFLOPS）的 Blackwell 架构上，8 切片 `OzakiInt8` 借助 INT8 Tensor Core 达 **9.73 TFLOPS（相对原生 `cublasDgemm` 加速 `6.31x`，相对误差 `2.14e-15`）**；在 `C12H26/def2-svp`（$N_{\text{AO}}=298$，RI-RHF）上，`Diag (OzakiInt8 + Graph)`（**1259.5 ms**）与无对角化 `SP2 (OzakiInt8 + Graph)`（**1277.5 ms**，59 次图重放）均显著超越原生 `Diag (FP64)`（**1687.3 ms**），能量差 $|\Delta E| \le 9.09 \times 10^{-13}\ E_\text{h}$：
+在原生标量 FP64 受限（~1.54 TFLOPS）的 Blackwell 架构上，8 切片 `OzakiInt8` 借助 INT8 Tensor Core 达 **9.73 TFLOPS（相对原生 `cublasDgemm` 加速 `6.31x`，相对误差 `2.14e-15`）**；在 `C12H26/def2-svp`（ $N_{\text{AO}}=298$，RI-RHF）上，`Diag (OzakiInt8 + Graph)`（**1259.5 ms**）与无对角化 `SP2 (OzakiInt8 + Graph)`（**1277.5 ms**，59 次图重放）均显著超越原生 `Diag (FP64)`（**1687.3 ms**），能量差 $|\Delta E| \le 9.09 \times 10^{-13}\ E_\text{h}$：
 
 | 矩阵维度 $N$ | 原生 `FP64` (TFLOPS) | **`OzakiInt8` (TFLOPS)** | 相对 `FP64` 加速比 | `FP32` TC (TFLOPS) | Ozaki 相对 Frobenius 误差 |
 | ---: | ---: | ---: | ---: | ---: | :--- |
@@ -214,9 +214,9 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 ### 2. 端到端分子 SCF 与解析核梯度对标（15/15 组 Direct SCF 全面超越 GPU4PySCF！）
 
-在全部 15 组基准分子/基组（$N_{\text{AO}} = 36 \dots 384$，`conv_tol = 1e-9`）上，GPU4DFT 收敛能量与 `PySCF` 偏差严格落在 **$3.98\times 10^{-13} \sim 2.08\times 10^{-10}\ E_\text{h}$**，其中 **`Direct_FP64` 在全部 `15/15` 组算例上端到端全面超越 `GPU4PySCF`（快 `1.35x–5.43x`）**，100% GPU 原生 `RI-JK` 预处理最高提速 **`77.4x`**：
+在全部 15 组基准分子/基组（ $N_{\text{AO}} = 36 \dots 384$，`conv_tol = 1e-9`）上，GPU4DFT 收敛能量与 `PySCF` 偏差严格落在 **$3.98\times 10^{-13} \sim 2.08\times 10^{-10}\ E_\text{h}$**，其中 **`Direct_FP64` 在全部 `15/15` 组算例上端到端全面超越 `GPU4PySCF`（快 `1.35x–5.43x`）**，100% GPU 原生 `RI-JK` 预处理最高提速 **`77.4x`**：
 
-| 评测项目与代表体系 | 基组 / 方法 ($N_{\text{AO}}$) | GPU4DFT $T_{\text{E2E}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 精度 ($|\Delta E|$ 或 $\max|\Delta\mathbf{g}|$) | 加速亮点 |
+| 评测项目与代表体系 | 基组 / 方法 ($N_{\text{AO}}$) | GPU4DFT $T_{\text{E2E}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 精度 ($\lvert\Delta E\rvert$ 或 $\max\lvert\Delta\mathbf{g}\rvert$) | 加速亮点 |
 | :--- | :--- | ---: | ---: | ---: | :--- | :--- |
 | **`(H2O)_2` Direct SCF** | `6-31g*` / B3LYP (36) | **0.495** | 2.455 | 2.686 | `2.96e-12` $E_\text{h}$ | **5.43x E2E (6.22x SCF) vs GPU4PySCF** / 5.0x vs CPU |
 | **`C6H6` Direct SCF** | `def2-svp` / B3LYP (114) | **1.223** | 6.797 | 4.195 | `1.71e-12` $E_\text{h}$ | **3.43x E2E (3.49x SCF) vs GPU4PySCF** / 5.6x vs CPU |
@@ -225,7 +225,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 | **`C6H6` RI-JK SCF** | `def2-svp` / B3LYP (114) | **0.265** | 9.115 | 0.332 | `1.65e-12` $E_\text{h}$ | **34.4x vs CPU** / **1.25x E2E (2.04x SCF) vs GPU4PySCF** |
 | **`(H2O)_8` RI-JK SCF** | `6-31g*` / B3LYP (144) | **0.438** | 13.622 | 0.586 | `1.12e-10` $E_\text{h}$ | **31.1x vs CPU** / **1.34x E2E (1.94x SCF) vs GPU4PySCF** |
 | **`(H2O)_8` RI-JK (`OzakiInt8`)** | `def2-tzvp` / PBE (344) | **0.916** | 21.562 | 1.598 | `4.32e-12` $E_\text{h}$ | **23.6x vs CPU** / **1.75x E2E (2.64x SCF) vs GPU4PySCF** |
-| **`(H2O)_16` RI-JK (`OzakiInt8`)** | `def2-svp` / B3LYP (384) | **4.254** *($T_{\text{setup}}=0.634\text{s}$)* | 37.624 | 3.034 | `5.30e-11` $E_\text{h}$ | **8.8x vs CPU**（GPU 原生 2c/3c 预处理提速 **77.4x**） |
+| **`(H2O)_16` RI-JK (`OzakiInt8`)** | `def2-svp` / B3LYP (384) | **4.254** ($T_{\text{setup}}$ = 0.634 s) | 37.624 | 3.034 | `5.30e-11` $E_\text{h}$ | **8.8x vs CPU**（GPU 原生 2c/3c 预处理提速 **77.4x**） |
 | **`C6H6` 解析核梯度** | `def2-svp` / RHF (114) | **0.182** | 1.860 | 0.425 | `3.48e-07` $E_\text{h}/a_0$ | **10.2x vs CPU** / **2.34x vs GPU4PySCF** |
 | **`C6H6` 解析核梯度** | `def2-svp` / B3LYP (114) | **0.209** | 2.046 | 0.478 | `8.94e-08` $E_\text{h}/a_0$ | **9.8x vs CPU** / **2.29x vs GPU4PySCF** |
 | **`(H2O)_8` 解析核梯度** | `6-31g*` / B3LYP (144) | **0.370** | 2.994 | 0.668 | `2.32e-07` $E_\text{h}/a_0$ | **8.1x vs CPU** / **1.80x vs GPU4PySCF** |
@@ -234,7 +234,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 求解最低 5 个单重激发态及振子强度 $f_{\text{osc}}$，激发能与 `PySCF` 最大偏差 $2.15\times 10^{-10} \sim 5.97\times 10^{-7}\ E_\text{h}$，相对 48 核 CPU PySCF 加速 **`13.3x–32.1x`**，并在纯泛函及 TDA 场景超越 `GPU4PySCF` 最高达 **`2.77x`**：
 
-| 体系 (`def2-svp`) | $N_{\text{AO}}$ | 泛函 / 响应模式 | $E_1$ (eV) | $\max|\Delta\omega|$ ($E_\text{h}$) | GPU4DFT $T_{\text{TD}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 加速亮点 |
+| 体系 (`def2-svp`) | $N_{\text{AO}}$ | 泛函 / 响应模式 | $E_1$ (eV) | $\max\lvert\Delta\omega\rvert$ ($E_\text{h}$) | GPU4DFT $T_{\text{TD}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 加速亮点 |
 | :--- | ---: | :--- | ---: | :--- | ---: | ---: | ---: | :--- |
 | **`C6H6`** | 114 | `B3LYP` / `RI_TDDFT_fp64` | 5.479 | `2.15e-10` | **1.980** | 63.520 | 1.449 | **32.1x TD / 32.4x E2E vs CPU** |
 | **`C6H6`** | 114 | `B3LYP` / `RI_TDA_ozaki_int8` | 5.504 | `2.82e-08` | **1.066** | 26.228 | 1.571 | **24.6x vs CPU** / **1.47x vs GPU4PySCF** |
@@ -245,7 +245,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 ### 4. 周期性平面波赝势 Kohn–Sham 与 Lin's ACE 杂化泛函对标 (`gpu4dft.pw`)
 
-| 晶体超晶胞 | 泛函 | $E_{\text{cut}}$ (Ha) | FFT 网格 ($N_{\text{PW}}$) | $|\Delta E|$ ($E_\text{h}$) | **GPU CUDA (ms)** | 48 核 Host (ms) | 未压缩 GPU (ms) | PySCF-PBC (ms) | 加速亮点 |
+| 晶体超晶胞 | 泛函 | $E_{\text{cut}}$ (Ha) | FFT 网格 ($N_{\text{PW}}$) | $\lvert\Delta E\rvert$ ($E_\text{h}$) | **GPU CUDA (ms)** | 48 核 Host (ms) | 未压缩 GPU (ms) | PySCF-PBC (ms) | 加速亮点 |
 | :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
 | **`Diamond Si2`** | `PBE` | 10.0 | `24x24x24` (411) | `3.82e-14` | **30.99** | 91.4 | — | 5990.7 | **193.3x vs PySCF-PBC** / 2.95x vs Host |
 | **`Diamond Si2`** | `PBE0` | 10.0 | `24x24x24` (411) | `1.08e-08` | **58.20** | 184.7 | 50.62 | 9472.1 | **162.7x vs PySCF-PBC** / 3.17x vs Host |
