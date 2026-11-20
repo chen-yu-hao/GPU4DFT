@@ -2,7 +2,7 @@
 
 **GPU4DFT** 是一个面向现代异构加速器（NVIDIA Ampere / Hopper / Blackwell 与 AMD Instinct MI300 系列）从零构建的 **GPU 原生第一性原理量子化学与凝聚态密度泛函理论（DFT）计算框架**，在同一 C++20/CUDA 代码库内统一涵盖**分子高斯原子轨道（GTO）自洽场、解析梯度、线性响应激发态（CIS / TDA / TDDFT / RI-TDDFT）、分子振动 Hessian** 以及**周期性平面波赝势与自适应压缩交换杂化泛函（Plane-Wave Kohn–Sham & Lin's ACE Hybrid DFT）**。
 
-不同于将传统 CPU 代码局部移植到 GPU 的混合模式，GPU4DFT 采用**生成式单一算术真源（Codegen-First）**与**全显存零拷贝常驻流水线（Zero-Copy GPU-Resident Pipeline）**设计：在计算热路径中彻底消除 Python 解释器介入与主机—设备矩阵往返，并针对新一代 GPU（如 NVIDIA Blackwell）原生标量 FP64 受限而 FP32 / INT8 Tensor Core 算力充沛的硬件特征，引入**动态混合精度四元组路由**与 **Ozaki INT8 Tensor Core 无损双精度矩阵乘法仿真**，在严格保证相对 `PySCF`/`libcint` 机器级数值精度的同时充分释放张量核心算力。
+不同于将传统 CPU 代码局部移植到 GPU 的混合模式，GPU4DFT 采用**生成式单一算术真源（Codegen-First）** 与**全显存零拷贝常驻流水线（Zero-Copy GPU-Resident Pipeline）** 设计：在计算热路径中彻底消除 Python 解释器介入与主机—设备矩阵往返，并针对新一代 GPU（如 NVIDIA Blackwell）原生标量 FP64 受限而 FP32 / INT8 Tensor Core 算力充沛的硬件特征，引入**动态混合精度四元组路由**与 **Ozaki INT8 Tensor Core 无损双精度矩阵乘法仿真**，在严格保证相对 `PySCF`/`libcint` 机器级数值精度的同时充分释放张量核心算力。
 
 - 架构与数学设计规范详见：[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - 精度门禁与性能基准方案详见：[docs/BENCHMARK_PLAN.md](docs/BENCHMARK_PLAN.md)
@@ -216,7 +216,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 在全部 15 组基准分子/基组（$N_{\text{AO}} = 36 \dots 384$，`conv_tol = 1e-9`）上，GPU4DFT 收敛能量与 `PySCF` 偏差严格落在 **$3.98\times 10^{-13} \sim 2.08\times 10^{-10}\ E_\text{h}$**，其中 **`Direct_FP64` 在全部 `15/15` 组算例上端到端全面超越 `GPU4PySCF`（快 `1.35x–5.43x`）**，100% GPU 原生 `RI-JK` 预处理最高提速 **`77.4x`**：
 
-| 评测项目与代表体系 | 基组 / 方法 ($N_{\text{AO}}$) | GPU4DFT $T_{\text{E2E}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 精度 ($|\Delta E|$ 或 $\max|\Delta\mathbf{g}|$) | 加速亮点 |
+| 评测项目与代表体系 | 基组 / 方法 ($N_{\text{AO}}$) | GPU4DFT $T_{\text{E2E}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 精度 ($\lvert\Delta E\rvert$ 或 $\max\lvert\Delta\mathbf{g}\rvert$) | 加速亮点 |
 | :--- | :--- | ---: | ---: | ---: | :--- | :--- |
 | **`(H2O)_2` Direct SCF** | `6-31g*` / B3LYP (36) | **0.495** | 2.455 | 2.686 | `2.96e-12` $E_\text{h}$ | **5.43x E2E (6.22x SCF) vs GPU4PySCF** / 5.0x vs CPU |
 | **`C6H6` Direct SCF** | `def2-svp` / B3LYP (114) | **1.223** | 6.797 | 4.195 | `1.71e-12` $E_\text{h}$ | **3.43x E2E (3.49x SCF) vs GPU4PySCF** / 5.6x vs CPU |
@@ -234,7 +234,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 求解最低 5 个单重激发态及振子强度 $f_{\text{osc}}$，激发能与 `PySCF` 最大偏差 $2.15\times 10^{-10} \sim 5.97\times 10^{-7}\ E_\text{h}$，相对 48 核 CPU PySCF 加速 **`13.3x–32.1x`**，并在纯泛函及 TDA 场景超越 `GPU4PySCF` 最高达 **`2.77x`**：
 
-| 体系 (`def2-svp`) | $N_{\text{AO}}$ | 泛函 / 响应模式 | $E_1$ (eV) | $\max|\Delta\omega|$ ($E_\text{h}$) | GPU4DFT $T_{\text{TD}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 加速亮点 |
+| 体系 (`def2-svp`) | $N_{\text{AO}}$ | 泛函 / 响应模式 | $E_1$ (eV) | $\max\lvert\Delta\omega\rvert$ ($E_\text{h}$) | GPU4DFT $T_{\text{TD}}$ (s) | 48 核 PySCF (s) | GPU4PySCF (s) | 加速亮点 |
 | :--- | ---: | :--- | ---: | :--- | ---: | ---: | ---: | :--- |
 | **`C6H6`** | 114 | `B3LYP` / `RI_TDDFT_fp64` | 5.479 | `2.15e-10` | **1.980** | 63.520 | 1.449 | **32.1x TD / 32.4x E2E vs CPU** |
 | **`C6H6`** | 114 | `B3LYP` / `RI_TDA_ozaki_int8` | 5.504 | `2.82e-08` | **1.066** | 26.228 | 1.571 | **24.6x vs CPU** / **1.47x vs GPU4PySCF** |
@@ -245,7 +245,7 @@ PYTHONPATH=codegen python -m xc_codegen --backends host,cuda,hip --out-dir build
 
 ### 4. 周期性平面波赝势 Kohn–Sham 与 Lin's ACE 杂化泛函对标 (`gpu4dft.pw`)
 
-| 晶体超晶胞 | 泛函 | $E_{\text{cut}}$ (Ha) | FFT 网格 ($N_{\text{PW}}$) | $|\Delta E|$ ($E_\text{h}$) | **GPU CUDA (ms)** | 48 核 Host (ms) | 未压缩 GPU (ms) | PySCF-PBC (ms) | 加速亮点 |
+| 晶体超晶胞 | 泛函 | $E_{\text{cut}}$ (Ha) | FFT 网格 ($N_{\text{PW}}$) | $\lvert\Delta E\rvert$ ($E_\text{h}$) | **GPU CUDA (ms)** | 48 核 Host (ms) | 未压缩 GPU (ms) | PySCF-PBC (ms) | 加速亮点 |
 | :--- | :--- | ---: | :--- | :--- | ---: | ---: | ---: | ---: | :--- |
 | **`Diamond Si2`** | `PBE` | 10.0 | `24x24x24` (411) | `3.82e-14` | **30.99** | 91.4 | — | 5990.7 | **193.3x vs PySCF-PBC** / 2.95x vs Host |
 | **`Diamond Si2`** | `PBE0` | 10.0 | `24x24x24` (411) | `1.08e-08` | **58.20** | 184.7 | 50.62 | 9472.1 | **162.7x vs PySCF-PBC** / 3.17x vs Host |
